@@ -56,6 +56,7 @@ export type ServerMessage =
 const RECONNECT_BASE_MS = 500;
 const RECONNECT_MAX_MS = 8_000;
 const MAX_RETRIES = 20;
+const CLIENT_REPLACED_CLOSE_CODE = 4001;
 
 export class TerminalSocket {
   private ws: WebSocket | null = null;
@@ -86,6 +87,19 @@ export class TerminalSocket {
 
   /** Open (or re-open) the WebSocket connection. */
   connect(): void {
+    // `disconnect()` stops automatic retries, but a later explicit connect
+    // starts a fresh retry budget. React Strict Mode intentionally runs effect
+    // cleanup/setup twice in development, so disconnect cannot be permanent.
+    this._disconnected = false;
+    this.retryCount = 0;
+    if (this.retryTimeout) {
+      clearTimeout(this.retryTimeout);
+      this.retryTimeout = null;
+    }
+    this.openSocket();
+  }
+
+  private openSocket(): void {
     if (this._disconnected) return;
     if (
       this.ws &&
@@ -99,15 +113,18 @@ export class TerminalSocket {
 
     const protocol = location.protocol === "https:" ? "wss" : "ws";
     const url = `${protocol}://${location.host}/ws`;
-    this.ws = new WebSocket(url);
+    const ws = new WebSocket(url);
+    this.ws = ws;
 
-    this.ws.onopen = () => {
+    ws.onopen = () => {
+      if (this.ws !== ws) return;
       this.retryCount = 0;
       this.setConnectionState("connected");
       this.dispatch("_open", {});
     };
 
-    this.ws.onmessage = (event: MessageEvent) => {
+    ws.onmessage = (event: MessageEvent) => {
+      if (this.ws !== ws) return;
       try {
         const msg: ServerMessage = JSON.parse(event.data);
         this.dispatch(msg.type, msg);
@@ -116,13 +133,24 @@ export class TerminalSocket {
       }
     };
 
-    this.ws.onclose = () => {
+    ws.onclose = (event: CloseEvent) => {
+      // React Strict Mode and explicit reconnects can retire a socket before
+      // its close event arrives. A stale socket must not disconnect or retry
+      // over the newer connection that replaced it.
+      if (this.ws !== ws) return;
+      this.ws = null;
+      const replaced = event.code === CLIENT_REPLACED_CLOSE_CODE;
+      if (replaced) this._disconnected = true;
       this.setConnectionState("disconnected");
-      this.dispatch("_close", {});
+      this.dispatch("_close", {
+        code: event.code,
+        reason: event.reason,
+        replaced,
+      });
       if (!this._disconnected) this.scheduleReconnect();
     };
 
-    this.ws.onerror = () => {
+    ws.onerror = () => {
       // onclose fires after onerror, so reconnect is handled there.
     };
   }
@@ -184,6 +212,9 @@ export class TerminalSocket {
     this.retryCount++;
     this.setConnectionState("connecting");
     this.dispatch("_connecting", {});
-    this.retryTimeout = setTimeout(() => this.connect(), delay);
+    this.retryTimeout = setTimeout(() => {
+      this.retryTimeout = null;
+      this.openSocket();
+    }, delay);
   }
 }

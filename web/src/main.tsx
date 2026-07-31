@@ -27,6 +27,7 @@ function App() {
   const colsRef = useRef(80);
   const rowsCountRef = useRef(24);
   const isClosedRef = useRef(false);
+  const wasReplacedRef = useRef(false);
 
   /* ── React state for overlays ──────────────────────────────────────── */
   const [notify, setNotify] = useState<{
@@ -38,6 +39,7 @@ function App() {
     title: string;
     options: string[];
   } | null>(null);
+  const notifyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   /* ── Refs for overlays (keyboard handler reads these) ──────────────── */
   const selectReqRef = useRef(selectReq);
@@ -62,7 +64,11 @@ function App() {
 
     const unsubNotify = s.on("notify", (msg) => {
       setNotify({ level: msg.level, message: msg.message });
-      setTimeout(() => setNotify(null), 4000);
+      if (notifyTimerRef.current) clearTimeout(notifyTimerRef.current);
+      notifyTimerRef.current = setTimeout(() => {
+        notifyTimerRef.current = null;
+        setNotify(null);
+      }, 4000);
     });
 
     const unsubSelect = s.on("select_request", (msg: SelectRequestMessage) => {
@@ -77,16 +83,25 @@ function App() {
 
     const unsubOpen = s.on("_open", () => {
       connectionStateRef.current = "connected";
+      wasReplacedRef.current = false;
+      // The first viewport measurement can happen while the socket is still
+      // connecting, in which case sendResize() is intentionally a no-op.
+      // Re-send the latest dimensions on every open so a fresh connection or
+      // reconnect always asks the backend for a frame.
+      s.sendResize(colsRef.current, rowsCountRef.current);
       forceUpdate();
     });
 
-    const unsubClose = s.on("_close", () => {
+    const unsubClose = s.on("_close", (event) => {
       connectionStateRef.current = "disconnected";
+      wasReplacedRef.current = Boolean(event.replaced);
+      if (event.replaced) rowsRef.current = [];
       forceUpdate();
     });
 
     const unsubConnecting = s.on("_connecting", () => {
       connectionStateRef.current = "connecting";
+      wasReplacedRef.current = false;
       forceUpdate();
     });
 
@@ -100,6 +115,10 @@ function App() {
       unsubOpen();
       unsubClose();
       unsubConnecting();
+      if (notifyTimerRef.current) {
+        clearTimeout(notifyTimerRef.current);
+        notifyTimerRef.current = null;
+      }
       s.disconnect();
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
@@ -220,6 +239,25 @@ function App() {
   /* ── Render ──────────────────────────────────────────────────────────────── */
 
   const cs = connectionStateRef.current;
+  const hasFrame = rowsRef.current.length > 0;
+  const wasReplaced = wasReplacedRef.current;
+
+  const emptyTitle =
+    cs === "connected"
+      ? "Preparing market map"
+      : cs === "connecting"
+        ? "Connecting to market session"
+        : wasReplaced
+          ? "Session opened in another tab"
+          : "Market session unavailable";
+  const emptyDetail =
+    cs === "connected"
+      ? "The Pi bridge is online. Waiting for the first terminal frame…"
+      : cs === "connecting"
+        ? "Opening the live renderer and restoring terminal state…"
+        : wasReplaced
+          ? "This tab stopped reconnecting to avoid competing for the singleton session. Retry to take control here."
+          : "The web bridge could not be reached. Check the server, then retry.";
 
   return (
     <div className="terminal" ref={containerRef}>
@@ -234,6 +272,22 @@ function App() {
 
       {/* Terminal grid */}
       <TerminalFrame rows={rowsRef.current} />
+
+      {/* Actionable startup / terminal-less reconnect state */}
+      {!hasFrame && !isClosedRef.current && (
+        <div className="connection-empty" role="status" aria-live="polite">
+          <div className="connection-copy">
+            <div className="connection-brand">SIGNAL // MARKET ARCADE</div>
+            <div className="connection-title">{emptyTitle}</div>
+            <div className="connection-detail">{emptyDetail}</div>
+            {cs === "disconnected" && (
+              <button className="connection-retry" onClick={() => socket.connect()}>
+                Retry connection
+              </button>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Status line */}
       <div className="status-line" aria-live="polite">

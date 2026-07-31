@@ -14,3 +14,6 @@ venv/
 *.log
 .pi/market-research-archive.json
 .pi/market-research-archive.json.tmp-*
+node_modules/
+dist-web/
+dist-server/

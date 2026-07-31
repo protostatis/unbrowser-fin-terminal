@@ -15,6 +15,10 @@ body,
   overflow: hidden;
 }
 
+#root {
+  container-type: inline-size;
+}
+
 /* ── Terminal container ──────────────────────────────────────────────────── */
 
 .terminal {
@@ -54,6 +58,69 @@ body,
   visibility: hidden;
   pointer-events: none;
   z-index: -1;
+}
+
+/* ── Startup / reconnect state ───────────────────────────────────────────── */
+
+.connection-empty {
+  position: absolute;
+  inset: 0 0 24px;
+  z-index: 40;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background:
+    linear-gradient(90deg, transparent 49.9%, #21262d55 50%, transparent 50.1%),
+    linear-gradient(#0b0e14ee, #0b0e14);
+}
+
+.connection-copy {
+  width: min(440px, 100%);
+  padding-left: 18px;
+  border-left: 2px solid #1f6feb;
+}
+
+.connection-brand {
+  margin-bottom: 14px;
+  color: #58a6ff;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+.connection-title {
+  color: #c9d1d9;
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.connection-detail {
+  margin-top: 8px;
+  color: #8b949e;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.connection-retry {
+  margin-top: 18px;
+  padding: 8px 12px;
+  color: #c9d1d9;
+  background: #0d1117;
+  border: 1px solid #30363d;
+  border-radius: 4px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.connection-retry:hover {
+  color: #fff;
+  border-color: #58a6ff;
+}
+
+.connection-retry:focus-visible {
+  outline: 2px solid #58a6ff;
+  outline-offset: 3px;
 }
 
 /* ── Theme color palette ────────────────────────────────────────────────────
@@ -200,12 +267,14 @@ strong {
   display: flex;
   align-items: center;
   justify-content: center;
+  padding: 12px;
   background: rgba(0, 0, 0, 0.6);
   z-index: 200;
 }
 
 .select-modal {
-  min-width: 300px;
+  width: min(100%, 480px);
+  min-width: 0;
   max-width: 480px;
   max-height: 70vh;
   background: #161b22;
@@ -319,4 +388,52 @@ strong {
 .closed-reopen:focus-visible {
   outline: 2px solid #58a6ff;
   outline-offset: 2px;
+}
+
+/* ── Narrow containers ─────────────────────────────────────────────────────
+ *
+ * The extension's compact layout requires at least 54 columns. Scale the
+ * character cell—not the rendered frame—so those columns remain visible on a
+ * typical 360px+ phone without horizontal clipping. A container query also
+ * makes embedded/split-pane deployments behave correctly.
+ */
+
+@container (max-width: 600px) {
+  .terminal {
+    font-size: 10.5px;
+    line-height: 1.25;
+  }
+
+  .terminal-frame {
+    padding: 6px 8px;
+  }
+
+  .term-row {
+    line-height: 1.25;
+    min-height: calc(1em * 1.25);
+  }
+
+  .status-line {
+    padding-inline: 8px;
+    font-size: 10px;
+  }
+
+  .toast {
+    inset-inline: 8px;
+    top: 8px;
+    max-width: none;
+  }
+}
+
+@container (max-width: 340px) {
+  .terminal {
+    font-size: 9px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .status-dot.connecting,
+  .toast {
+    animation: none;
+  }
 }
