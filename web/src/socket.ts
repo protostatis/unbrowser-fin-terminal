@@ -1,8 +1,8 @@
 /**
  * WebSocket client for the Pi market-terminal backend.
  *
- * Connects to `${wsProtocol}://${host}/ws` — the Vite dev proxy handles /ws
- * in development; the same path works behind a production reverse proxy.
+ * Connects under Vite's configured BASE_URL. The dev build uses /ws, while a
+ * subpath deployment can use (for example) /unbrowser/fin-terminal/ws.
  *
  * Uses an event-emitter pattern: call .on(type, handler) and receive parsed
  * message objects. Built-in event types mirror the server→client protocol:
@@ -112,7 +112,10 @@ export class TerminalSocket {
     this.dispatch("_connecting", {});
 
     const protocol = location.protocol === "https:" ? "wss" : "ws";
-    const url = `${protocol}://${location.host}/ws`;
+    const basePath = import.meta.env.BASE_URL === "/"
+      ? ""
+      : import.meta.env.BASE_URL.replace(/\/$/, "");
+    const url = `${protocol}://${location.host}${basePath}/ws`;
     const ws = new WebSocket(url);
     this.ws = ws;
 

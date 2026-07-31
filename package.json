@@ -8,8 +8,10 @@
     "dev": "concurrently -n server,web -c blue,green \"npm run dev:server\" \"npm run dev:web\"",
     "dev:server": "tsx watch server/index.ts",
     "dev:web": "vite",
+    "start": "node dist-server/server/index.js",
     "build": "tsc -p tsconfig.server.json && vite build",
-    "typecheck": "tsc -p tsconfig.extension.json --noEmit && tsc -p tsconfig.server.json --noEmit && tsc -p web/tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.extension.json --noEmit && tsc -p tsconfig.server.json --noEmit && tsc -p web/tsconfig.json --noEmit",
+    "test": "tsx --test tests/*.test.ts"
   },
   "dependencies": {
     "@earendil-works/pi-ai": "0.83.0",

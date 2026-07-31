@@ -25,17 +25,36 @@ import {
   SessionManager,
   type AgentSession,
 } from "@earendil-works/pi-coding-agent";
+import {
+  assertMarketAgentTools,
+  createAgentModelRuntime,
+  MARKET_AGENT_TOOLS,
+  validateUnbrowserRuntime,
+} from "./agent-config.js";
 import { ansiToHtml } from "./theme.js";
 import { createWebUi, type Panel } from "./web-ui.js";
+import {
+  matchesProxyToken,
+  normalizePrincipal,
+  PrincipalLease,
+  singleHeader,
+} from "./proxy-auth.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const CWD = path.resolve(__dirname, "..");
+const CWD = path.resolve(process.env.MARKET_ROOT?.trim() || path.resolve(__dirname, ".."));
 
 const PORT = Number(process.env.PORT ?? 8787);
 const HOST = process.env.HOST?.trim() || "127.0.0.1";
+const PROXY_TOKEN = process.env.MARKET_PROXY_TOKEN?.trim() || "";
+const PROXY_TOKEN_HEADER = "x-fin-terminal-proxy-token";
+const PRINCIPAL_HEADER = "x-fin-terminal-user";
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 const CLIENT_REPLACED_CLOSE_CODE = 4001;
+
+if (process.env.NODE_ENV === "production" && !PROXY_TOKEN) {
+  throw new Error("MARKET_PROXY_TOKEN is required in production");
+}
 
 function parseAllowedOrigins(raw: string | undefined): Set<string> | null {
   if (raw === undefined) return null;
@@ -94,6 +113,10 @@ function isAllowedWebSocketRequest(req: IncomingMessage): boolean {
   return LOOPBACK_HOSTS.has(parsed.hostname);
 }
 
+function requestPrincipal(req: IncomingMessage): string | undefined {
+  return normalizePrincipal(singleHeader(req, PRINCIPAL_HEADER), Boolean(PROXY_TOKEN));
+}
+
 // ==========================================================================
 // 1. Connection state (single active web client; the session is a singleton)
 // ==========================================================================
@@ -148,23 +171,46 @@ function cancelPendingSelects(): void {
 // 2. Create the REAL Pi agent session and bind our UI
 // ==========================================================================
 
+let session: AgentSession | undefined;
+let panelOpening = false;
+let sessionBootState: "starting" | "ready" | "failed" = "starting";
+const principalLease = new PrincipalLease();
+
 async function bootSession(): Promise<AgentSession> {
   console.log("[server] cwd:", CWD);
-  const loader = new DefaultResourceLoader({ cwd: CWD, agentDir: getAgentDir() });
+  validateUnbrowserRuntime();
+  const agentDir = getAgentDir();
+  const { modelRuntime, model, config } = await createAgentModelRuntime(agentDir);
+  const loader = new DefaultResourceLoader({ cwd: CWD, agentDir });
   await loader.reload();
 
   console.log("[server] creating agent session...");
   const { session, extensionsResult } = await createAgentSession({
     cwd: CWD,
+    agentDir,
+    modelRuntime,
+    ...(model ? { model } : {}),
+    noTools: "builtin",
+    tools: [...MARKET_AGENT_TOOLS],
     resourceLoader: loader,
     sessionManager: SessionManager.inMemory(CWD),
   });
+  if (extensionsResult.errors.length) {
+    session.dispose();
+    throw new Error(`Market extension failed to load: ${extensionsResult.errors.map((error) => String(error)).join(" | ")}`);
+  }
+  try {
+    assertMarketAgentTools(session);
+  } catch (error) {
+    session.dispose();
+    throw error;
+  }
   console.log(
     "[server] session ready. model:",
     session.model ? `${session.model.provider}/${session.model.id}` : "(none — research will fail until a model is configured)",
   );
-  if (extensionsResult.errors.length) {
-    console.warn("[server] extension load errors:", extensionsResult.errors);
+  if (config.provider && config.modelId) {
+    console.log(`[server] model policy: ${config.provider}/${config.modelId}, max output ${config.maxOutputTokens} tokens`);
   }
 
   await session.bindExtensions({
@@ -182,8 +228,19 @@ async function bootSession(): Promise<AgentSession> {
 
 const app = express();
 app.get("/api/health", (_req, res) => res.json({ status: "ok", uptime: process.uptime() }));
+app.get("/api/ready", (_req, res) => {
+  const ready = sessionBootState === "ready" && Boolean(session);
+  res.status(ready ? 200 : 503).json({ status: ready ? "ready" : sessionBootState });
+});
+app.use((req, res, next) => {
+  if (!matchesProxyToken(PROXY_TOKEN, singleHeader(req, PROXY_TOKEN_HEADER))) {
+    res.status(403).type("text").send("Forbidden");
+    return;
+  }
+  next();
+});
 
-const webDist = path.resolve(__dirname, "..", "dist-web");
+const webDist = path.join(CWD, "dist-web");
 if (existsSync(webDist)) {
   app.use(express.static(webDist));
   app.get(/^(?!\/api|\/ws).*/, (_req, res) => res.sendFile(path.join(webDist, "index.html")));
@@ -205,20 +262,30 @@ const server = app.listen(PORT, HOST, async () => {
 // 4. WebSocket — drive the panel
 // ==========================================================================
 
-let session: AgentSession | undefined;
-let panelOpening = false;
-
 const wss = new WebSocketServer({
   server,
   path: "/ws",
   maxPayload: 64 * 1024,
   verifyClient: ({ req }, done) => {
-    if (isAllowedWebSocketRequest(req)) {
-      done(true);
+    if (!matchesProxyToken(PROXY_TOKEN, singleHeader(req, PROXY_TOKEN_HEADER))) {
+      done(false, 403, "Forbidden");
       return;
     }
-    console.warn("[ws] rejected connection with invalid or disallowed Origin");
-    done(false, 403, "Forbidden");
+    const principal = requestPrincipal(req);
+    if (!principal) {
+      done(false, 403, "Forbidden");
+      return;
+    }
+    if (!isAllowedWebSocketRequest(req)) {
+      console.warn("[ws] rejected connection with invalid or disallowed Origin");
+      done(false, 403, "Forbidden");
+      return;
+    }
+    if (!principalLease.claim(principal)) {
+      done(false, 409, "Terminal session is assigned to another principal");
+      return;
+    }
+    done(true);
   },
 });
 
@@ -328,24 +395,47 @@ function openMarket(args = ""): void {
 bootSession()
   .then((s) => {
     session = s;
+    sessionBootState = "ready";
     // A browser can connect before the agent session finishes booting. Its
     // first openMarket() call is then a no-op, so retry once the session exists.
     if (wss.clients.size > 0) openMarket();
   })
   .catch((err) => {
+    sessionBootState = "failed";
     console.error("[server] FAILED to boot agent session:", err instanceof Error ? err.stack ?? err.message : err);
-    console.error("[server] Research will not work. Browsing still works only after a successful boot.");
+    if (process.env.NODE_ENV === "production") {
+      console.error("[server] Fatal production startup failure; exiting.");
+      wss.close();
+      server.close(() => process.exit(1));
+      return;
+    }
+    console.error("[server] Research is unavailable; fix the configuration and restart.");
   });
 
-process.on("SIGINT", () => {
-  console.log("[server] shutting down...");
+let shuttingDown = false;
+async function shutdown(signal: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[server] shutting down (${signal})...`);
+  const forceExit = setTimeout(() => process.exit(1), 30_000);
+  forceExit.unref();
+  for (const client of wss.clients) client.close(1012, "Server shutting down");
+  wss.close();
+  try {
+    await session?.abort();
+  } catch {
+    /* ignore abort failures during shutdown */
+  }
   try {
     session?.dispose();
   } catch {
-    /* ignore */
+    /* ignore disposal failures during shutdown */
   }
-  wss.close();
-  server.close();
-  process.exit(0);
-});
-process.on("SIGTERM", () => process.emit("SIGINT"));
+  server.close(() => {
+    clearTimeout(forceExit);
+    process.exit(0);
+  });
+}
+
+process.on("SIGINT", () => void shutdown("SIGINT"));
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
