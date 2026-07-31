@@ -1,0 +1,322 @@
+/* ── Reset & full-height layout ──────────────────────────────────────────── */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+/* ── Terminal container ──────────────────────────────────────────────────── */
+
+.terminal {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: #0b0e14;
+  color: #c9d1d9;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 14px;
+  line-height: 1.2;
+  user-select: none;
+  cursor: text;
+}
+
+/* ── Terminal frame grid ─────────────────────────────────────────────────── */
+
+.terminal-frame {
+  flex: 1;
+  overflow: hidden;
+  padding: 8px 12px;
+}
+
+.term-row {
+  white-space: pre;
+  line-height: 1.2;
+  overflow: hidden;
+  min-height: calc(1em * 1.2);
+}
+
+/* Hidden ruler used for character-cell measurement */
+.term-row.ruler {
+  position: absolute;
+  top: 0;
+  left: 0;
+  visibility: hidden;
+  pointer-events: none;
+  z-index: -1;
+}
+
+/* ── Theme color palette ────────────────────────────────────────────────────
+ *
+ * Every token the extension emits (via the web theme's fg/bg helpers).
+ * The backend wraps text in <span class="tc tc-{color}"> or
+ * <span class="tc tc-bg-{color}">.
+ */
+
+/* Foreground colours */
+.tc-accent {
+  color: #58a6ff;
+}
+.tc-text {
+  color: #c9d1d9;
+}
+.tc-muted {
+  color: #8b949e;
+}
+.tc-dim {
+  color: #6e7681;
+}
+.tc-success {
+  color: #3fb950;
+}
+.tc-error {
+  color: #f85149;
+}
+.tc-warning {
+  color: #d29922;
+}
+.tc-borderMuted {
+  color: #30363d;
+}
+
+/* Background colours */
+.tc-bg-selectedBg {
+  background-color: #1f6feb;
+  border-radius: 2px;
+}
+
+/* Bold text (the backend's bold() helper wraps text in <strong>) */
+.tc strong,
+strong {
+  font-weight: 700;
+}
+
+/* ── Status line ──────────────────────────────────────────────────────────── */
+
+.status-line {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 12px;
+  font-size: 11px;
+  color: #8b949e;
+  background: rgba(11, 14, 20, 0.88);
+  border-top: 1px solid #21262d;
+  pointer-events: none;
+}
+
+.status-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #6e7681;
+}
+
+.status-dot.connected {
+  background: #3fb950;
+  box-shadow: 0 0 4px #3fb95080;
+}
+
+.status-dot.connecting {
+  background: #d29922;
+  animation: pulse 1s ease-in-out infinite;
+}
+
+.status-dot.disconnected {
+  background: #f85149;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.4;
+  }
+}
+
+/* ── Toast notifications ─────────────────────────────────────────────────── */
+
+.toast {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  max-width: 420px;
+  padding: 10px 16px;
+  border-radius: 6px;
+  font-size: 13px;
+  line-height: 1.4;
+  animation: toast-in 0.2s ease-out;
+  z-index: 100;
+}
+
+.toast-info {
+  background: #1c2a3a;
+  color: #c9d1d9;
+  border: 1px solid #30363d;
+}
+
+.toast-warning {
+  background: #2d2410;
+  color: #d29922;
+  border: 1px solid #5c4400;
+}
+
+.toast-error {
+  background: #2d1010;
+  color: #f85149;
+  border: 1px solid #5c0000;
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* ── Select modal ────────────────────────────────────────────────────────── */
+
+.select-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.6);
+  z-index: 200;
+}
+
+.select-modal {
+  min-width: 300px;
+  max-width: 480px;
+  max-height: 70vh;
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow-y: auto;
+}
+
+.select-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: #c9d1d9;
+  margin-bottom: 8px;
+}
+
+.select-options {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.select-option {
+  padding: 8px 12px;
+  background: #0d1117;
+  color: #c9d1d9;
+  border: 1px solid #30363d;
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.select-option:hover,
+.select-option:focus-visible {
+  background: #1f6feb22;
+  border-color: #1f6feb;
+  outline: none;
+}
+
+.select-option:focus-visible {
+  box-shadow: 0 0 0 2px #1f6feb66;
+}
+
+.select-cancel {
+  margin-top: 12px;
+  padding: 6px 12px;
+  background: transparent;
+  color: #8b949e;
+  border: 1px solid #21262d;
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  align-self: flex-end;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.select-cancel:hover {
+  color: #c9d1d9;
+  border-color: #30363d;
+}
+
+/* ── Closed overlay ──────────────────────────────────────────────────────── */
+
+.closed-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.7);
+  z-index: 150;
+}
+
+.closed-modal {
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.closed-title {
+  font-size: 18px;
+  font-weight: 700;
+  color: #8b949e;
+}
+
+.closed-reopen {
+  padding: 10px 24px;
+  background: #1f6feb;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.closed-reopen:hover {
+  background: #388bfd;
+}
+
+.closed-reopen:focus-visible {
+  outline: 2px solid #58a6ff;
+  outline-offset: 2px;
+}
