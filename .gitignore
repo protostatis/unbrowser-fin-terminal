@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+.DS_Store
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.idea/
+.vscode/
+*.log
+.pi/market-research-archive.json
+.pi/market-research-archive.json.tmp-*
