@@ -3,7 +3,7 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, Theme } f
 import { matchesKey, truncateToWidth, visibleWidth, type OverlayHandle } from "@earendil-works/pi-tui";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { Type } from "typebox";
 import {
 	ResearchCandidateRegistry,
@@ -2482,7 +2482,13 @@ async function archiveCompletedCanvas(canvas: Canvas, question?: string): Promis
 }
 
 async function readProjectArchive(cwd: string): Promise<ArchivedResearch[]> {
-	const target = join(cwd, ".pi", "market-research-archive.json");
+	const configuredDataDir = process.env.MARKET_DATA_DIR?.trim();
+	if (configuredDataDir && !isAbsolute(configuredDataDir)) {
+		throw new Error("MARKET_DATA_DIR must be an absolute path");
+	}
+	const target = configuredDataDir
+		? join(configuredDataDir, "market-research-archive.json")
+		: join(cwd, ".pi", "market-research-archive.json");
 	archivePath = target;
 	let text: string;
 	try {

@@ -71,6 +71,28 @@ production deployment should use a dedicated Docker-internal isolated endpoint,
 such as `http://unbrowser-mcp:8767/mcp`. Production startup fails closed when
 `UNBROWSER_MCP_URL` is missing.
 
+### Container deployment
+
+The included multi-stage image accepts `PUBLIC_BASE_PATH` at build time. For a
+subpath deployment, build with a trailing slash:
+
+```bash
+docker build \
+  --build-arg PUBLIC_BASE_PATH=/unbrowser/fin-terminal/ \
+  -t unbrowser-fin-terminal .
+```
+
+Production requires `MARKET_PROXY_TOKEN`; the trusted reverse proxy must
+overwrite `X-Fin-Terminal-Proxy-Token` on every HTTP and WebSocket request. It
+must also provide an authenticated, opaque `X-Fin-Terminal-User` value. The
+first WebSocket principal owns the singleton terminal session until the process
+restarts, preventing state transfer between users.
+
+Set `MARKET_ROOT=/app`, `MARKET_DATA_DIR=/data`, and mount `/data` as the only
+persistent volume. `/api/health` is liveness-only; use `/api/ready` for the
+container health check. A dedicated, provider-capped OpenRouter key is strongly
+recommended rather than sharing another service's key.
+
 Run `npm run typecheck` to validate the extension, backend, and browser client,
 or `npm run build` for a production browser bundle.
 
