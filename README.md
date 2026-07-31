@@ -8,10 +8,11 @@ A keyboard-first market terminal for the [Pi coding agent](https://github.com/ea
 - DAY charts with extended-hours PRE / REG / POST session markers
 - Deterministic Wilder RSI, EMA, MACD, momentum, and rolling-range analysis
 - ASCII price, close-vs-SMA trend, RSI 70/50/30, and MACD-histogram charts
-- Automatic MOVERS watch ranks liquid US names by price movement and dollar volume
+- Automatic MOVERS watch ranks up to 100 liquid US names by price movement and dollar volume
 - Agent research through `unbrowser`, rendered as structured charts, metrics, tables, news, risks, and sources
 - On-demand EVENTS catalyst monitor for earnings, macro, and global handoff research (not a live calendar feed)
-- Incremental background research with cancellation and honest status labels
+- Independently keyed background research jobs with a visible FIFO queue, contextual cancellation, and honest status labels
+- Scope-aware snapshot age, quote coverage, stale/sync state, mover eligibility, and watchlist coverage
 - Project-local research history with explicit `AS OF` timestamps
 - Full-height layouts for narrow and wide terminals
 
@@ -69,14 +70,14 @@ and TLS; `ALLOWED_ORIGINS` alone is not authentication.
 | Key | Action |
 |---|---|
 | `1`–`5` | Change chart scope (DAY / WEEK / MONTH / YEAR / TOTAL) |
-| `A` / `D` | Switch screens or tabs |
-| `W` / `S` | Select or scroll |
-| `Tab` | Switch SIGNALS focus between headlines and Market Story |
+| `A` / `D` | Switch top-level screens or ticker tabs |
+| `W` / `S` | Select in lists, or scroll the focused research pane |
+| `Tab` | Switch pane focus in SIGNALS and EVENTS; single-pane screens keep focus in place |
 | `J` | Open a ticker, or build a source-verified factual BRIEF |
 | `K` | Build a WHY analysis with causal channels, scenarios, and disconfirming evidence |
 | `E` | Add or remove a ticker from the watchlist |
 | `[` / `]` | Browse older or newer research |
-| `C` | Cancel active background research |
+| `C` | Cancel research for the currently selected lane, headline, or ticker context |
 | `B` / `Esc` | Return from a ticker to the Market Map |
 | `Q` | Close the UI without cancelling research |
 
@@ -86,12 +87,23 @@ The default cross-asset watchlist includes `SPY`, `QQQ`, `AAPL`, `MSFT`,
 `NVDA`, `AMZN`, `GOOGL`, `TSLA`, `JPM`, `XLE`, `TLT`, `GLD`, and `BTC-USD`.
 Changes made with `E` remain session-scoped.
 
-The MOVERS screen is regenerated on each market refresh. It ranks up to eight
-eligible names from a maintained liquid-US universe using a transparent score:
+The MOVERS screen is regenerated on each market refresh. It ranks up to 100
+eligible names from a maintained 117-ticker liquid-US universe using a transparent score:
 65% absolute price-move percentile plus 35% dollar-volume percentile. It is a
 delayed liquid-universe monitor—not an exchange-wide real-time scanner. Press
 `R` to rescore and `E` to add or remove the selected mover from the session
 watchlist.
+
+Changing screens, selections, pane focus, or chart scope does not stop research.
+Each symbol/scope/BRIEF-or-WHY context gets its own job and canvas identity. The
+terminal keeps one model turn running at a time and queues additional jobs FIFO,
+so multiple requests can remain active without mixing their tool writes or
+locking navigation. Queued jobs can be cancelled without interrupting the
+running job; cancelling the running context aborts only that model turn. The
+footer and EVENTS lanes expose contextual RUNNING/QUEUED state.
+
+Cached-research choices are modal: choose `U` to use the cache, `F` to refresh,
+or `Esc` to cancel the prompt before navigating elsewhere.
 
 ## How research works
 

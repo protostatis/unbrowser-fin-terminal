@@ -202,6 +202,7 @@ type MarketSnapshot = { quotes: Quote[]; movers: RankedMover[]; headlines: Headl
 type MarketHubNavigationState = {
 	screen: number;
 	selected: number;
+	selectedByScreen?: number[];
 	signalsFocus: "headlines" | "story";
 	signalStoryScroll: number;
 	archivedCanvas?: Canvas;
@@ -217,6 +218,7 @@ type TerminalResult =
 type ResearchRequest = Extract<TerminalResult, { action: "research" }>;
 type ResearchOutcome = "queued" | "running" | "partial" | "complete" | "failed" | "cancelled";
 type ResearchActivity = "seeding" | "fetching" | "extracting" | "synthesizing";
+type ResearchSchedulerPhase = "queued" | "dispatched" | "running" | "cancelling" | "settled";
 type ResearchJob = {
 	id: string;
 	symbol: string;
@@ -227,6 +229,7 @@ type ResearchJob = {
 	startedAt: number;
 	updatedAt: number;
 	slotHeld: boolean;
+	phase: ResearchSchedulerPhase;
 	settledAt?: number;
 	toolName?: string;
 	error?: string;
@@ -236,7 +239,7 @@ type ResearchJob = {
 type ResearchActionResponse = { accepted: boolean; status: string; job?: ResearchJob };
 type ResearchActions = {
 	start: (request: ResearchRequest) => ResearchActionResponse;
-	cancel: () => ResearchActionResponse;
+	cancel: (jobId?: string) => ResearchActionResponse;
 	promptForCache?: boolean;
 };
 type CacheDecision = { request: ResearchRequest; cached: Canvas };
@@ -371,11 +374,13 @@ const canvases = new Map<string, Canvas>();
 const researchArchive = new Map<string, ArchivedResearch[]>();
 const researchJobs = new Map<string, ResearchJob>();
 const latestResearchBySymbol = new Map<string, string>();
+const researchQueue: string[] = [];
+const toolResearchJobs = new Map<string, string>();
 let archiveCwd: string | undefined;
 let archivePath: string | undefined;
 let archiveReady: Promise<void> | undefined;
 let archiveWriteQueue: Promise<void> = Promise.resolve();
-let activeResearchId: string | undefined;
+let runningResearchId: string | undefined;
 let researchSequence = 0;
 let activeTerminal: MarketTerminal | MarketHub | undefined;
 
@@ -424,16 +429,19 @@ const MARKET_BOARDS = [
 ] as const;
 const MOVER_UNIVERSE = [
 	"AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AMD", "AVGO", "NFLX", "ORCL", "CRM", "PLTR", "INTC", "MU", "QCOM",
-	"JPM", "BAC", "GS", "V", "MA", "COIN",
-	"XOM", "CVX",
-	"LLY", "UNH", "JNJ", "PFE",
-	"WMT", "COST", "HD", "DIS", "NKE", "MCD", "F", "GM",
-	"BA", "CAT", "GE", "T", "VZ",
+	"ADBE", "NOW", "PANW", "CRWD", "AMAT", "LRCX", "KLAC", "ADI", "TXN", "MRVL", "ARM", "SMCI", "DELL", "IBM", "CSCO", "UBER", "ABNB", "SNOW",
+	"JPM", "BAC", "GS", "V", "MA", "COIN", "BRK-B", "MS", "C", "WFC", "AXP", "SCHW", "BLK", "COF", "HOOD", "PYPL", "SOFI",
+	"XOM", "CVX", "COP", "SLB", "EOG", "OXY", "MPC", "VLO",
+	"LLY", "UNH", "JNJ", "PFE", "ABBV", "MRK", "AMGN", "GILD", "TMO", "ABT", "MDT", "BMY", "CVS", "HCA",
+	"WMT", "COST", "HD", "DIS", "NKE", "MCD", "F", "GM", "TGT", "LOW", "SBUX", "CMG", "BKNG", "MAR", "RCL", "CCL", "DAL", "UAL", "LULU", "ROST", "TJX", "KO", "PEP", "PM",
+	"BA", "CAT", "GE", "T", "VZ", "DE", "RTX", "LMT", "HON", "UPS", "FDX", "ETN", "CMCSA", "TMUS", "SNAP", "PINS", "ROKU", "NEE", "FCX", "NEM",
 ] as const;
-const MOVER_LIMIT = 8;
+const MOVER_LIMIT = 100;
 const MOVER_MOVEMENT_WEIGHT = 0.65;
 const MOVER_VOLUME_WEIGHT = 0.35;
 const QUOTE_FETCH_CONCURRENCY = 8;
+const SNAPSHOT_STALE_AFTER_MS = 5 * 60_000;
+const MAX_SETTLED_RESEARCH_JOBS = 50;
 const DEFAULT_WATCHLIST = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "TSLA", "JPM", "XLE", "TLT", "GLD", "BTC-USD"] as const;
 const MARKET_SCREEN_NAMES = ["MARKET", "SIGNALS", "EVENTS", "MOVERS", "WATCH"] as const;
 const MARKET_SCREEN = {
@@ -457,9 +465,9 @@ function percentileScore(values: number[], value: number): number {
 	return (below + Math.max(0, equal - 1) / 2) / (values.length - 1);
 }
 
-function rankMovers(quotes: Quote[], limit = MOVER_LIMIT): RankedMover[] {
+function eligibleMoverQuotes(quotes: Quote[]): Quote[] {
 	const eligibleSymbols = new Set<string>(MOVER_UNIVERSE);
-	const candidates = quotes.filter((quote) =>
+	return quotes.filter((quote) =>
 		eligibleSymbols.has(quote.symbol)
 		&& typeof quote.changePercent === "number"
 		&& Number.isFinite(quote.changePercent)
@@ -469,6 +477,10 @@ function rankMovers(quotes: Quote[], limit = MOVER_LIMIT): RankedMover[] {
 		&& Number.isFinite(quote.price)
 		&& quote.price > 0,
 	);
+}
+
+function rankMovers(quotes: Quote[], limit = MOVER_LIMIT): RankedMover[] {
+	const candidates = eligibleMoverQuotes(quotes);
 	const movements = candidates.map((quote) => Math.abs(quote.changePercent!));
 	const dollarVolumes = candidates.map((quote) => quote.price * quote.volume!);
 	return candidates
@@ -635,6 +647,19 @@ function relativeAge(updatedAt: number | null): string {
 	const hours = Math.floor(minutes / 60);
 	if (hours < 24) return minutes % 60 ? `${hours}h ${minutes % 60}m` : `${hours}h`;
 	return `${Math.floor(hours / 24)}d`;
+}
+
+function recencyLabel(updatedAt: number | null): string {
+	if (!updatedAt || !Number.isFinite(updatedAt)) return "AGE —";
+	const age = relativeAge(updatedAt);
+	return Date.now() - updatedAt > SNAPSHOT_STALE_AFTER_MS ? `STALE ${age}` : `AGE ${age}`;
+}
+
+function isViewportNavigationInput(data: string): boolean {
+	return matchesKey(data, "up") || matchesKey(data, "down")
+		|| matchesKey(data, "pageUp") || matchesKey(data, "pageDown")
+		|| matchesKey(data, "home") || matchesKey(data, "end")
+		|| data === "w" || data === "W" || data === "s" || data === "S";
 }
 
 // Turn raw unbrowser bot-wall telemetry into a calm, user-facing note.
@@ -937,29 +962,54 @@ function computeLayoutMetrics(
 	};
 }
 
-// Shared arcade controller footer (2 lines). Used by BOTH terminal modes so the
-// gamepad identity is consistent across the whole app. Keeps the playful flavor.
-function renderArcadeController(lines: string[], width: number, th: Theme, fit: (text: string) => string, opts: { search?: boolean; watch?: boolean; cancel?: boolean; back?: boolean; jLabel?: "OPEN" | "BRIEF" }): void {
-	const jLabel = opts.jLabel ?? "OPEN";
-	if (width < 72) {
-		const row1 = opts.cancel
-			? th.fg("warning", width < 64 ? "[A/D] screen  [W/S] scroll  RESEARCH ACTIVE" : "[A/D] screen  [W/S] select/scroll  RESEARCH ACTIVE")
-			: th.fg("dim", width < 64 ? `[A/D][W/S]  [J] ${jLabel.toLowerCase()}  [K] why` : `[A/D] screen  [W/S] select/scroll  [J] ${jLabel.toLowerCase()}  [K] why`);
-		let row2 = `${th.fg("dim", "[R] sync")}`;
-		if (opts.search) row2 += `  ${th.fg("dim", "[/] search")}`;
-		if (opts.watch) row2 += `  ${th.fg("dim", "[E] watch")}`;
-		if (opts.back) row2 += `  ${th.fg("dim", "[B] back")}`;
-		row2 += `  ${th.fg("dim", "[Q] quit")}`;
-		if (opts.cancel) row2 += `  ${th.fg("warning", "[C] cancel")}`;
-		lines.push(fit(row1));
-		lines.push(fit(row2));
-	} else {
-		const row1 = `${th.fg("dim", "      [W]        ")}${th.fg("accent", "D-PAD")}${opts.cancel ? th.fg("warning", "       RESEARCH ACTIVE") : th.fg("dim", `       [J] ${jLabel.padEnd(5)}  [K] WHY?`)}`;
-		const extras = `${opts.cancel ? th.fg("warning", "   [C] CANCEL") : ""}${opts.search ? th.fg("dim", "   [/] SEARCH") : ""}${opts.watch ? th.fg("dim", "   [E] WATCH") : ""}${opts.back ? th.fg("dim", "   [B] BACK") : ""}`;
-		const row2 = `${th.fg("dim", "  [A] [S] [D]   ")}${th.fg("muted", "navigate")}${th.fg("dim", "   [R] SYNC   [Q] QUIT")}${extras}`;
-		lines.push(fit(row1));
-		lines.push(fit(row2));
+type ArcadeControllerOptions = {
+	search?: boolean;
+	searching?: boolean;
+	watch?: boolean;
+	cancel?: boolean;
+	back?: boolean;
+	cache?: boolean;
+	jLabel?: "OPEN" | "BRIEF";
+	horizontalLabel?: "SCREEN" | "TAB";
+	verticalLabel?: "SELECT" | "SCROLL" | "IDLE";
+	tabLabel?: string;
+};
+
+// Shared two-line controller footer. Navigation labels describe the active
+// screen instead of advertising one ambiguous global behavior.
+function renderArcadeController(lines: string[], width: number, th: Theme, fit: (text: string) => string, opts: ArcadeControllerOptions): void {
+	if (opts.cache) {
+		lines.push(fit(th.fg("warning", "CACHE DECISION · NAVIGATION LOCKED")));
+		lines.push(fit(`${th.fg("accent", "[U] USE CACHED")}  ${th.fg("dim", "[F] REFRESH")}  ${th.fg("dim", "[ESC] CANCEL")}  ${th.fg("dim", "[Q] QUIT")}`));
+		return;
 	}
+	if (opts.searching) {
+		lines.push(fit(th.fg("accent", "SEARCH ACTIVE · TYPE A SYMBOL")));
+		lines.push(fit(th.fg("dim", "[ENTER] OPEN  [BACKSPACE] EDIT  [ESC] CANCEL")));
+		return;
+	}
+
+	const horizontal = opts.horizontalLabel ?? "SCREEN";
+	const vertical = opts.verticalLabel ?? "SELECT";
+	const tab = opts.tabLabel ?? "ONE PANE";
+	const jLabel = opts.jLabel ?? "OPEN";
+	const compact = width < 72;
+	const separator = compact ? " " : "  ";
+	const nav = compact
+		? `[A/D] ${horizontal.toLowerCase()}  [W/S] ${vertical.toLowerCase()}  [Tab] ${tab.toLowerCase()}`
+		: `D-PAD  [A/D] ${horizontal}  [W/S] ${vertical}  [TAB] ${tab.toUpperCase()}`;
+	const actions = [
+		...(opts.back ? ["[B] BACK"] : []),
+		"[Q] QUIT",
+		...(opts.cancel ? ["[C] CANCEL"] : []),
+		`[J] ${jLabel}`,
+		"[K] WHY",
+		...(opts.watch ? ["[E] WATCH"] : []),
+		"[R] SYNC",
+		...(opts.search ? ["[/] SEARCH"] : []),
+	];
+	lines.push(fit(th.fg(opts.cancel ? "warning" : "dim", nav)));
+	lines.push(fit(th.fg(opts.cancel ? "warning" : "dim", actions.join(separator))));
 }
 
 async function fetchQuote(symbol: string, scope: ChartScope = DEFAULT_CHART_SCOPE, signal?: AbortSignal): Promise<Quote> {
@@ -2093,23 +2143,41 @@ function canvasHasRenderableContent(canvas: Canvas): boolean {
 	return cleanText(canvas.content).trim().length > 0 || normalizeCanvasBlocks(canvas.blocks).length > 0;
 }
 
-function activeResearchJob(): ResearchJob | undefined {
-	return activeResearchId ? researchJobs.get(activeResearchId) : undefined;
+function researchIdentityKey(value: Pick<ResearchRequest | ResearchJob, "symbol" | "chartScope" | "researchKey">): string {
+	return canvasKey(value.symbol, value.chartScope, value.researchKey);
 }
 
-function researchJobFor(symbol: string): ResearchJob | undefined {
-	const active = activeResearchJob();
-	if (active?.symbol === symbol) return active;
+function runningResearchJob(): ResearchJob | undefined {
+	return runningResearchId ? researchJobs.get(runningResearchId) : undefined;
+}
+
+function activeResearchJobs(): ResearchJob[] {
+	return [...researchJobs.values()].filter(researchSlotHeld).sort((a, b) => a.startedAt - b.startedAt);
+}
+
+function activeResearchJobForIdentity(value: Pick<ResearchRequest | ResearchJob, "symbol" | "chartScope" | "researchKey">): ResearchJob | undefined {
+	const identity = researchIdentityKey(value);
+	return activeResearchJobs().find((job) => researchIdentityKey(job) === identity);
+}
+
+function researchJobFor(symbol: string, scope?: ChartScope, researchKey?: string): ResearchJob | undefined {
+	if (scope && researchKey) {
+		const identity = canvasKey(symbol, scope, researchKey);
+		const matches = [...researchJobs.values()]
+			.filter((job) => researchIdentityKey(job) === identity)
+			.sort((a, b) => b.startedAt - a.startedAt || b.updatedAt - a.updatedAt);
+		return matches.find(researchSlotHeld) ?? matches[0];
+	}
 	const id = latestResearchBySymbol.get(symbol);
 	return id ? researchJobs.get(id) : undefined;
 }
 
 function researchSlotHeld(job: ResearchJob | undefined): boolean {
-	return Boolean(job?.slotHeld && job.settledAt === undefined);
+	return Boolean(job?.slotHeld && job.phase !== "settled" && job.settledAt === undefined);
 }
 
 function createResearchJob(request: ResearchRequest): ResearchJob | undefined {
-	if (activeResearchJob()) return undefined;
+	if (activeResearchJobForIdentity(request)) return undefined;
 	const now = Date.now();
 	const id = `market-${now.toString(36)}-${(++researchSequence).toString(36)}`;
 	const job: ResearchJob = {
@@ -2122,6 +2190,7 @@ function createResearchJob(request: ResearchRequest): ResearchJob | undefined {
 		startedAt: now,
 		updatedAt: now,
 		slotHeld: true,
+		phase: "queued",
 		publishedBlocks: 0,
 		chartScope: request.chartScope,
 		researchKey: normalizeResearchKey(request.researchKey),
@@ -2130,7 +2199,7 @@ function createResearchJob(request: ResearchRequest): ResearchJob | undefined {
 	};
 	researchJobs.set(id, job);
 	latestResearchBySymbol.set(job.symbol, id);
-	activeResearchId = id;
+	researchQueue.push(id);
 	activeTerminal?.setResearchJob(job);
 	return job;
 }
@@ -2140,25 +2209,62 @@ function updateResearchJob(id: string, patch: Partial<Omit<ResearchJob, "id" | "
 	if (!previous) return undefined;
 	const next: ResearchJob = { ...previous, ...patch, updatedAt: Date.now() };
 	researchJobs.set(id, next);
-	latestResearchBySymbol.set(next.symbol, id);
+	const latest = latestResearchBySymbol.get(next.symbol);
+	if (!latest || (researchJobs.get(latest)?.startedAt ?? 0) <= next.startedAt) latestResearchBySymbol.set(next.symbol, id);
 	activeTerminal?.setResearchJob(next);
 	return next;
 }
 
+function removeQueuedResearch(id: string): void {
+	for (let index = researchQueue.length - 1; index >= 0; index--) {
+		if (researchQueue[index] === id) researchQueue.splice(index, 1);
+	}
+}
+
+function pruneSettledResearchJobs(store: Map<string, ResearchJob>, keep = MAX_SETTLED_RESEARCH_JOBS): string[] {
+	const settled = [...store.values()]
+		.filter((job) => job.phase === "settled")
+		.sort((a, b) => b.updatedAt - a.updatedAt || b.startedAt - a.startedAt);
+	const removed: string[] = [];
+	for (const job of settled.slice(Math.max(0, keep))) {
+		store.delete(job.id);
+		removed.push(job.id);
+	}
+	return removed;
+}
+
 function settleResearchJob(id: string, patch: Partial<Omit<ResearchJob, "id" | "startedAt">> = {}): ResearchJob | undefined {
 	const job = researchJobs.get(id);
-	if (!job) return undefined;
+	if (!job || job.phase === "settled") return job;
+	removeQueuedResearch(id);
 	const settledAt = Date.now();
-	const next = updateResearchJob(id, { ...patch, slotHeld: false, settledAt });
-	if (activeResearchId === id) activeResearchId = undefined;
-	if (next) activeTerminal?.setResearchJob(next);
+	const next = updateResearchJob(id, { ...patch, phase: "settled", slotHeld: false, settledAt });
+	if (runningResearchId === id) runningResearchId = undefined;
+	const removed = new Set(pruneSettledResearchJobs(researchJobs));
+	if (removed.size > 0) {
+		for (const [symbol, latestId] of latestResearchBySymbol) {
+			if (!removed.has(latestId)) continue;
+			const latest = [...researchJobs.values()].filter((job) => job.symbol === symbol).sort((a, b) => b.startedAt - a.startedAt || b.updatedAt - a.updatedAt)[0];
+			if (latest) latestResearchBySymbol.set(symbol, latest.id);
+			else latestResearchBySymbol.delete(symbol);
+		}
+	}
 	return next;
 }
 
 function resetResearchJobs(): void {
 	researchJobs.clear();
 	latestResearchBySymbol.clear();
-	activeResearchId = undefined;
+	researchQueue.splice(0, researchQueue.length);
+	toolResearchJobs.clear();
+	runningResearchId = undefined;
+}
+
+function researchQueueLabel(): string {
+	const active = activeResearchJobs();
+	const running = active.filter((job) => job.phase === "running" || job.phase === "dispatched" || job.phase === "cancelling").length;
+	const queued = active.filter((job) => job.phase === "queued").length;
+	return `${active.length} JOB${active.length === 1 ? "" : "S"} · ${running} RUNNING · ${queued} QUEUED`;
 }
 
 function researchStatusLine(job: ResearchJob | undefined): string | undefined {
@@ -2167,9 +2273,13 @@ function researchStatusLine(job: ResearchJob | undefined): string | undefined {
 	const scope = ` · ${CHART_SCOPE_CONFIGS[job.chartScope].label}`;
 	const blocks = job.publishedBlocks > 0 ? ` · ${job.publishedBlocks} BLOCK${job.publishedBlocks === 1 ? "" : "S"}` : "";
 	if (researchSlotHeld(job)) {
-		if (job.outcome === "cancelled") return `RESEARCH ${label}${scope} · CANCELLING…`;
+		if (job.phase === "cancelling" || job.outcome === "cancelled") return `RESEARCH ${label}${scope} · CANCELLING…`;
 		if (job.outcome === "complete") return `RESEARCH ${label}${scope} · CANVAS COMPLETE${blocks} · WRAPPING UP`;
-		if (job.outcome === "queued") return `RESEARCH ${label}${scope} · QUEUED · [C] CANCEL`;
+		if (job.phase === "queued") {
+			const position = researchQueue.indexOf(job.id);
+			return `RESEARCH ${label}${scope} · QUEUED${position >= 0 ? ` #${position + 1}` : ""} · [C] CANCEL`;
+		}
+		if (job.phase === "dispatched") return `RESEARCH ${label}${scope} · STARTING · [C] CANCEL`;
 		const outcome = job.outcome === "partial" ? "PARTIAL · " : "";
 		return `RESEARCH ${label}${scope} · ${outcome}${job.activity.toUpperCase()}${blocks} · [C] CANCEL`;
 	}
@@ -2372,6 +2482,7 @@ class MarketTerminal {
 	private archivePosition: number | undefined;
 	private cacheDecision: CacheDecision | undefined;
 	private researchJob: ResearchJob | undefined;
+	private researchJobCache = new Map<string, ResearchJob>();
 	private canvasScroll = 0;
 	private canvasRows = 0;
 	private canvasViewportRows = 0;
@@ -2399,6 +2510,7 @@ class MarketTerminal {
 		this.quote = initialQuote;
 		this.canvas = initialCanvas;
 		this.researchJob = initialResearch;
+		if (initialResearch) this.researchJobCache.set(initialResearch.id, initialResearch);
 		this.chartScope = initialCanvas?.chartScope ?? initialQuote?.chartScope ?? initialScope;
 		this.researchKey = initialResearch?.researchKey ?? (initialCanvas ? canvasResearchKey(initialCanvas) : this.researchKey);
 		if (initialResearch && !researchSlotHeld(initialResearch)) this.status = researchStatusLine(initialResearch) || this.status;
@@ -2471,8 +2583,12 @@ class MarketTerminal {
 	}
 
 	setResearchJob(job: ResearchJob): void {
-		this.researchJob = job;
-		if (!researchSlotHeld(job)) this.status = researchStatusLine(job) || this.status;
+		this.researchJobCache.set(job.id, job);
+		pruneSettledResearchJobs(this.researchJobCache);
+		if (job.symbol === this.symbol && job.chartScope === this.chartScope && job.researchKey === this.researchKey) {
+			this.researchJob = job;
+			if (!researchSlotHeld(job)) this.status = researchStatusLine(job) || this.status;
+		}
 		this.tui.requestRender();
 	}
 
@@ -2495,13 +2611,42 @@ class MarketTerminal {
 		}
 	}
 
+	private currentResearchJob(): ResearchJob | undefined {
+		const stored = researchJobFor(this.symbol, this.chartScope, this.researchKey);
+		if (stored) return stored;
+		const cached = [...this.researchJobCache.values()]
+			.filter((job) => job.symbol === this.symbol && job.chartScope === this.chartScope && job.researchKey === this.researchKey)
+			.sort((a, b) => b.startedAt - a.startedAt)[0];
+		if (cached) return cached;
+		return this.researchJob?.symbol === this.symbol
+			&& this.researchJob.chartScope === this.chartScope
+			&& this.researchJob.researchKey === this.researchKey
+			? this.researchJob : undefined;
+	}
+
+	private quoteScopeStatus(): string {
+		const shown = this.quote?.chartScope;
+		const requested = this.chartScope;
+		if (!shown) return `SYNCING ${CHART_SCOPE_CONFIGS[requested].label}`;
+		const shownLabel = CHART_SCOPE_CONFIGS[shown].label;
+		const requestedLabel = CHART_SCOPE_CONFIGS[requested].label;
+		if (shown !== requested) return this.loading
+			? `SHOWING ${shownLabel} · SYNCING ${requestedLabel}`
+			: `SHOWING ${shownLabel} · ${requestedLabel} UNAVAILABLE`;
+		return this.loading ? `SHOWING ${shownLabel} · REFRESHING` : `${shownLabel} QUOTE`;
+	}
+
 	private dispatchResearch(request: ResearchRequest): void {
 		if (!this.researchActions) {
 			this.done(request);
 			return;
 		}
 		const response = this.researchActions.start(request);
-		if (!response.job) this.status = response.status;
+		if (response.job) {
+			this.researchJobCache.set(response.job.id, response.job);
+			this.researchJob = response.job;
+		}
+		this.status = response.status;
 		if (response.accepted) {
 			this.tab = 1;
 			this.canvasScroll = 0;
@@ -2509,19 +2654,23 @@ class MarketTerminal {
 	}
 
 	private research(question: string, intent: ResearchIntent): void {
-		if (researchSlotHeld(this.researchJob)) {
-			this.status = `${this.researchJob!.contextLabel} ALREADY ACTIVE · [C] CANCEL`;
-			return;
-		}
 		const identity = tickerResearchIdentity(this.symbol, intent);
 		const request: ResearchRequest = { action: "research", symbol: this.symbol, question, returnTo: "quote", chartScope: this.chartScope, ...identity };
+		const existing = activeResearchJobForIdentity(request);
+		if (existing) {
+			this.researchKey = identity.researchKey;
+			this.researchJob = existing;
+			this.status = `${existing.contextLabel} ALREADY ${existing.phase.toUpperCase()} · [C] CANCEL`;
+			return;
+		}
 		this.researchKey = identity.researchKey;
+		this.researchJob = researchJobFor(this.symbol, this.chartScope, this.researchKey);
 		this.canvas = canvasForResearch(this.symbol, this.chartScope, this.researchKey);
 		this.archivedCanvas = undefined;
 		this.archivePosition = undefined;
 		this.canvasScroll = 0;
 		const cached = latestArchivedCanvasExact(request);
-		if (this.researchActions?.promptForCache && !activeResearchJob() && cached) {
+		if (this.researchActions?.promptForCache && cached) {
 			this.cacheDecision = { request, cached };
 			this.tab = 1;
 			this.status = cacheChoiceStatus(request, cached);
@@ -2550,8 +2699,9 @@ class MarketTerminal {
 
 	private cancelResearch(): void {
 		if (!this.researchActions) return;
-		const response = this.researchActions.cancel();
-		if (!response.job) this.status = response.status;
+		const job = this.currentResearchJob();
+		const response = this.researchActions.cancel(job?.id);
+		this.status = response.status;
 	}
 
 	private async refresh(): Promise<void> {
@@ -2571,7 +2721,8 @@ class MarketTerminal {
 			this.status = "QUOTE SYNCED";
 		} catch (error) {
 			if (gen !== this.quoteGeneration) return;
-			this.status = `QUOTE UNAVAILABLE: ${error instanceof Error ? error.message : String(error)}`;
+			const shown = this.quote && this.quote.chartScope !== scope ? ` · SHOWING ${CHART_SCOPE_CONFIGS[this.quote.chartScope].label}` : "";
+			this.status = `${CHART_SCOPE_CONFIGS[scope].label} QUOTE UNAVAILABLE${shown}: ${error instanceof Error ? error.message : String(error)}`;
 		} finally {
 			if (gen === this.quoteGeneration) this.loading = false;
 			this.tui.requestRender();
@@ -2580,14 +2731,9 @@ class MarketTerminal {
 
 	private setScope(scope: ChartScope): void {
 		if (scope === this.chartScope) return;
-		if (researchSlotHeld(this.researchJob)) {
-			this.status = `CHART SCOPE LOCKED · RESEARCH ${this.researchJob!.symbol} ACTIVE · [C] CANCEL`;
-			this.tui.requestRender();
-			return;
-		}
 		this.chartScope = scope;
-		this.quote = undefined;
 		this.canvas = canvasForResearch(this.symbol, scope, this.researchKey);
+		this.researchJob = researchJobFor(this.symbol, scope, this.researchKey);
 		this.archivedCanvas = undefined;
 		this.archivePosition = undefined;
 		this.canvasScroll = 0;
@@ -2601,28 +2747,12 @@ class MarketTerminal {
 				this.done({ action: "close" });
 				return;
 			}
-			if (data === "b" || data === "B") {
-				this.cacheDecision = undefined;
-				this.done({ action: "back", chartScope: this.chartScope });
-				return;
-			}
-			const navigationInput = matchesKey(data, "left") || matchesKey(data, "right")
-				|| matchesKey(data, "up") || matchesKey(data, "down") || matchesKey(data, "tab")
-				|| data === "a" || data === "A" || data === "d" || data === "D"
-				|| data === "h" || data === "H" || data === "l" || data === "L"
-				|| data === "w" || data === "W" || data === "s" || data === "S";
-			if (navigationInput) {
-				this.cacheDecision = undefined;
-				this.status = "CACHE CHOICE CANCELLED · NAVIGATION RESTORED";
-			} else {
-				// While cache choice is active, scope keys are ignored.
-				if (matchesKey(data, "escape")) this.resolveCacheDecision("cancel");
-				else if (data === "u" || data === "U") this.resolveCacheDecision("use");
-				else if (data === "f" || data === "F") this.resolveCacheDecision("refresh");
-				else this.status = cacheChoiceStatus(this.cacheDecision.request, this.cacheDecision.cached);
-				this.tui.requestRender();
-				return;
-			}
+			if (matchesKey(data, "escape")) this.resolveCacheDecision("cancel");
+			else if (data === "u" || data === "U") this.resolveCacheDecision("use");
+			else if (data === "f" || data === "F") this.resolveCacheDecision("refresh");
+			else this.status = `${cacheChoiceStatus(this.cacheDecision.request, this.cacheDecision.cached)} · NAVIGATION LOCKED`;
+			this.tui.requestRender();
+			return;
 		}
 		// Scope keys (1–5): only switch scope when not in search/cache modes
 		if (data === "1" || data === "2" || data === "3" || data === "4" || data === "5") {
@@ -2639,12 +2769,14 @@ class MarketTerminal {
 			this.done({ action: "back", chartScope: this.chartScope });
 			return;
 		}
-		// Tab switching: A/D or ←/→; Tab cycles. W/S no longer switch tabs.
-		if (matchesKey(data, "left") || data === "a" || data === "A" || data === "h" || data === "H") this.tab = 0;
-		else if (matchesKey(data, "right") || data === "d" || data === "D" || data === "l" || data === "L") this.tab = 1;
-		else if (matchesKey(data, "tab")) this.tab = (this.tab + 1) % 2;
+		// A/D owns top-level tabs. Tab is reserved for pane focus on split views.
+		if (matchesKey(data, "left") || data === "a" || data === "A") this.tab = 0;
+		else if (matchesKey(data, "right") || data === "d" || data === "D") this.tab = 1;
+		else if (matchesKey(data, "tab")) this.status = `TAB FOCUS IS UNCHANGED · A/D SWITCH ${this.tab === 0 ? "QUOTE → RESEARCH" : "RESEARCH → QUOTE"}`;
 		else if (this.tab === 1 && data === "[") this.browseArchive("older");
 		else if (this.tab === 1 && data === "]") this.browseArchive("newer");
+		else if (this.tab === 1 && !this.displayedCanvas() && isViewportNavigationInput(data))
+			this.status = "RESEARCH HAS NO CANVAS YET · J BRIEF · K WHY";
 		// Canvas scrolling when on RESEARCH tab with a canvas.
 		else if (this.tab === 1 && this.displayedCanvas() && (matchesKey(data, "up") || data === "w" || data === "W"))
 			this.canvasScroll = Math.max(0, this.canvasScroll - 1);
@@ -2668,14 +2800,31 @@ class MarketTerminal {
 			this.research(`Explain why ${this.symbol} is moving and what matters next: separate evidence from inference, map causal drivers, give bull/base/bear scenarios, and identify triggers and disconfirming evidence.`, "why");
 		}
 		else if (data === "?") this.status = this.researchActions
-			? "A/D TAB · W/S SCROLL · 1–5 SCOPE · [ OLDER · ] NEWER · J BRIEF · K WHY · E WATCH · C CANCEL · B BACK · Q QUIT"
-			: "A/D TAB · W/S SCROLL · 1–5 SCOPE · [ OLDER · ] NEWER · J BRIEF · K WHY · E WATCH · B BACK · Q QUIT";
+			? "A/D TABS · W/S RESEARCH SCROLL · TAB ONE PANE · 1–5 SCOPE · [ OLDER · ] NEWER · J BRIEF · K WHY · E WATCH · C CANCEL · B BACK · Q QUIT"
+			: "A/D TABS · W/S RESEARCH SCROLL · TAB ONE PANE · 1–5 SCOPE · [ OLDER · ] NEWER · J BRIEF · K WHY · E WATCH · B BACK · Q QUIT";
 		this.tui.requestRender();
 	}
 
 	render(width: number): string[] {
 		const th = this.theme;
 		const fit = (text: string) => truncateToWidth(text, width);
+		const researchJob = this.currentResearchJob();
+		const activeCount = activeResearchJobs().length;
+		const statusLine = this.cacheDecision
+			? this.status
+			: researchSlotHeld(researchJob)
+				? `${activeCount > 1 ? `${researchQueueLabel()} · ` : ""}${researchStatusLine(researchJob)!}`
+				: this.loading ? this.quoteScopeStatus() : this.status;
+		const controller: ArcadeControllerOptions = {
+			watch: true,
+			cancel: researchSlotHeld(researchJob),
+			back: true,
+			cache: Boolean(this.cacheDecision),
+			jLabel: "BRIEF",
+			horizontalLabel: "TAB",
+			verticalLabel: this.tab === 1 && this.displayedCanvas() ? "SCROLL" : "IDLE",
+			tabLabel: "ONE PANE",
+		};
 		// Narrow warning: still a full-height composed screen, not a one-liner.
 		if (width < 54) {
 			const header: string[] = [];
@@ -2684,8 +2833,8 @@ class MarketTerminal {
 			];
 			const footer: string[] = [];
 			footer.push(fit(th.fg("borderMuted", "─".repeat(width))));
-			footer.push(fit(th.fg("dim", researchSlotHeld(this.researchJob) ? researchStatusLine(this.researchJob)! : this.status)));
-			renderArcadeController(footer, width, th, fit, { search: false, watch: true, cancel: researchSlotHeld(this.researchJob), back: true, jLabel: "BRIEF" });
+			footer.push(fit(th.fg("dim", statusLine)));
+			renderArcadeController(footer, width, th, fit, controller);
 			const totalRows = terminalRows(this.tui);
 			const output = composeScreen(header, body, footer, totalRows);
 			this.layoutMetrics = computeLayoutMetrics(
@@ -2714,7 +2863,7 @@ class MarketTerminal {
 		let tabs = ["QUOTE", "RESEARCH"]
 			.map((name, index) => (index === this.tab ? th.bg("selectedBg", th.bold(th.fg("accent", ` ${name} `))) : th.fg("dim", ` ${name} `)))
 			.join(" ");
-		if (totalRows < 20) tabs += th.fg("dim", `  CHART ${CHART_SCOPE_CONFIGS[this.chartScope].label} [1–5]`);
+		if (totalRows < 20) tabs += th.fg("dim", `  CHART ${CHART_SCOPE_CONFIGS[this.chartScope].label} [1–5] · ${this.quoteScopeStatus()}`);
 		header.push(fit(tabs));
 		// Chart scope selector row (only on QUOTE tab, or always if enough room)
 		if (totalRows >= 20) {
@@ -2725,15 +2874,15 @@ class MarketTerminal {
 					? th.bg("selectedBg", th.bold(th.fg("accent", ` ${cfg.key}:${cfg.label} `)))
 					: th.fg("dim", ` ${cfg.key}:${cfg.label} `);
 			}).join("");
-			header.push(fit(scopeRow));
+			header.push(fit(`${scopeRow}${th.fg("dim", `  ${this.quoteScopeStatus()}`)}`));
 		}
 		// Blank line only if terminal is tall enough.
 		if (totalRows >= 20) header.push("");
 
 		const footer: string[] = [];
 		footer.push(fit(th.fg("borderMuted", "─".repeat(width))));
-		footer.push(fit(th.fg("dim", researchSlotHeld(this.researchJob) ? researchStatusLine(this.researchJob)! : this.status)));
-		renderArcadeController(footer, width, th, fit, { search: false, watch: true, cancel: researchSlotHeld(this.researchJob), back: true, jLabel: "BRIEF" });
+		footer.push(fit(th.fg("dim", statusLine)));
+		renderArcadeController(footer, width, th, fit, controller);
 
 		const bodyRows = Math.max(1, totalRows - header.length - footer.length);
 		const body: string[] = [];
@@ -2769,14 +2918,14 @@ class MarketTerminal {
 		blocks.push([
 			fit(`${th.bold(th.fg("text", quote.symbol))}  ${th.fg("muted", quote.name)}  ${th.fg("dim", quote.exchange)}${watchBadge}`),
 			fit(`${th.bold(th.fg("text", dollars(quote.price, quote.currency)))}  ${th.bold(th.fg(direction, `${directionGlyph(quote.change)} ${dollars(quote.change, quote.currency)}  ${percent(quote.changePercent)}`))}`),
-			fit(th.fg("dim", `${th.fg(_meta.tone, "● " + _meta.label)}  ${th.fg("dim", "DELAYED " + relativeAge(quote.updatedAt))}  ${quoteTimestampLabel(quote.updatedAt, quote.timezone)}`)),
+			fit(th.fg("dim", `${th.fg(_meta.tone, "● " + _meta.label)}  ${th.fg("dim", "DELAYED " + relativeAge(quote.updatedAt))}  ${quoteTimestampLabel(quote.updatedAt, quote.timezone)}  · ${this.quoteScopeStatus()}`)),
 		]);
 
 		// Chart block when bodyRows >= 8. Reserve two rows for the session legend and time axis.
 		if (bodyRows >= 8) {
 			const chartHg = Math.max(2, Math.min(26, bodyRows - 12));
 			const chartRows: string[] = [];
-			for (const row of chartLines(quote.points, width, (text) => th.fg(chartDirection, text), (text) => th.fg("dim", text), this.chartScope === "day" ? quote.previousClose : undefined, chartHg, quote.pointTimes, quote.pointSessions, quote.timezone, quote.interval, (value) => dollars(value, quote.currency), undefined, undefined, this.chartScope)) {
+			for (const row of chartLines(quote.points, width, (text) => th.fg(chartDirection, text), (text) => th.fg("dim", text), quote.chartScope === "day" ? quote.previousClose : undefined, chartHg, quote.pointTimes, quote.pointSessions, quote.timezone, quote.interval, (value) => dollars(value, quote.currency), undefined, undefined, quote.chartScope)) {
 				chartRows.push(fit(row));
 			}
 			blocks.push(chartRows);
@@ -2826,11 +2975,11 @@ class MarketTerminal {
 		const archiveCount = archivedResearchFor(this.symbol, this.chartScope, this.researchKey).length;
 		const structuredBlocks = canvas ? normalizeCanvasBlocks(canvas.blocks) : [];
 		const isStructured = structuredBlocks.length > 0;
+		const researchJob = this.currentResearchJob();
 		const isPreviousResult = Boolean(
 			canvas
-			&& this.researchJob?.symbol === this.symbol
-			&& researchSlotHeld(this.researchJob)
-			&& canvas.researchId !== this.researchJob.id,
+			&& researchSlotHeld(researchJob)
+			&& canvas.researchId !== researchJob!.id,
 		);
 
 		const heading: string[] = [];
@@ -2853,9 +3002,9 @@ class MarketTerminal {
 				heading.push(fit(th.bold(th.fg("text", canvas.title))));
 				heading.push(fit(th.fg("dim", `${viewingArchive ? `ARCHIVE ${this.archivePosition! + 1}/${archiveCount} · AS OF ` : isPreviousResult ? "PREVIOUS RESULT · Updated " : "Updated "}${new Date(canvas.updatedAt).toLocaleString()}`)));
 			} else {
-				const activeForSymbol = this.researchJob?.symbol === this.symbol && researchSlotHeld(this.researchJob);
+				const activeForSymbol = researchSlotHeld(researchJob);
 				heading.push(fit(th.fg("muted", activeForSymbol ? "Discovery is running; real blocks will appear here." : "No canvas yet.")));
-				heading.push(fit(th.fg("dim", activeForSymbol ? `${this.researchJob!.activity.toUpperCase()} · no discovery blocks published yet` : "J = verified factual brief · K = causal/scenario analysis")));
+				heading.push(fit(th.fg("dim", activeForSymbol ? `${researchJob!.phase === "queued" ? "QUEUED" : researchJob!.activity.toUpperCase()} · no discovery blocks published yet` : "J = verified factual brief · K = causal/scenario analysis")));
 			}
 		}
 		// Rule or blank depending on row budget.
@@ -2893,7 +3042,7 @@ class MarketTerminal {
 				for (const row of stretched) lines.push(row);
 			}
 			// Action row.
-			const activeForSymbol = this.researchJob?.symbol === this.symbol && researchSlotHeld(this.researchJob);
+			const activeForSymbol = researchSlotHeld(researchJob);
 			lines.push(fit(th.fg("accent", activeForSymbol ? "  Live discovery blocks appear here · C cancels research" : "  Press J for BRIEF · K for WHY")));
 			return;
 		}
@@ -3269,6 +3418,7 @@ class MarketTerminal {
 	}
 
 	debugState() {
+		const researchJob = this.currentResearchJob();
 		return {
 			mode: "ticker" as const,
 			symbol: this.symbol,
@@ -3289,17 +3439,21 @@ class MarketTerminal {
 				count: archivedResearchFor(this.symbol, this.chartScope, this.researchKey).length,
 				asOf: this.archivedCanvas?.updatedAt,
 			} : undefined,
-			research: this.researchJob ? {
-				id: this.researchJob.id,
-				symbol: this.researchJob.symbol,
-				outcome: this.researchJob.outcome,
-				activity: this.researchJob.activity,
-				active: researchSlotHeld(this.researchJob),
-				publishedBlocks: this.researchJob.publishedBlocks,
-				chartScope: this.researchJob.chartScope,
-				researchKey: this.researchJob.researchKey,
-				intent: this.researchJob.intent,
+			research: researchJob ? {
+				id: researchJob.id,
+				symbol: researchJob.symbol,
+				outcome: researchJob.outcome,
+				phase: researchJob.phase,
+				activity: researchJob.activity,
+				active: researchSlotHeld(researchJob),
+				publishedBlocks: researchJob.publishedBlocks,
+				chartScope: researchJob.chartScope,
+				researchKey: researchJob.researchKey,
+				intent: researchJob.intent,
 			} : undefined,
+			researchQueue: [...new Map([...this.researchJobCache.values(), ...activeResearchJobs()].map((job) => [job.id, job])).values()]
+				.filter(researchSlotHeld)
+				.map((job) => ({ id: job.id, contextLabel: job.contextLabel, phase: job.phase })),
 		};
 	}
 
@@ -3313,6 +3467,7 @@ class MarketTerminal {
 class MarketHub {
 	private screen: number = MARKET_SCREEN.market;
 	private selected = 0;
+	private selectedByScreen = Array<number>(MARKET_SCREEN_NAMES.length).fill(0);
 	private signalsFocus: "headlines" | "story" = "headlines";
 	private eventsFocus: "lanes" | "briefing" = "lanes";
 	private signalStoryScroll = 0;
@@ -3331,6 +3486,7 @@ class MarketHub {
 	private archivePosition: number | undefined;
 	private cacheDecision: CacheDecision | undefined;
 	private researchJob: ResearchJob | undefined;
+	private researchJobCache = new Map<string, ResearchJob>();
 	private layoutMetrics: LayoutMetrics | undefined;
 	private chartScope: ChartScope = DEFAULT_CHART_SCOPE;
 	private marketResearchKey = LEGACY_RESEARCH_KEY;
@@ -3355,6 +3511,7 @@ class MarketHub {
 		this.screen = Math.max(0, Math.min(MARKET_SCREEN_NAMES.length - 1, initialScreen));
 		this.marketCanvas = initialCanvas && isSignalsResearchKey(canvasResearchKey(initialCanvas)) ? initialCanvas : undefined;
 		this.researchJob = initialResearch;
+		if (initialResearch) this.researchJobCache.set(initialResearch.id, initialResearch);
 		this.chartScope = initialNavigation?.chartScope ?? normalizeChartScope(initialCanvas?.chartScope ?? initialSnapshot.chartScope);
 		if (this.marketCanvas) this.marketResearchKey = canvasResearchKey(this.marketCanvas);
 		if (initialCanvas && isEventResearchKey(canvasResearchKey(initialCanvas))) {
@@ -3375,7 +3532,13 @@ class MarketHub {
 		}
 		if (initialNavigation) {
 			this.screen = Math.max(0, Math.min(MARKET_SCREEN_NAMES.length - 1, initialNavigation.screen));
+			if (Array.isArray(initialNavigation.selectedByScreen)) {
+				for (let index = 0; index < MARKET_SCREEN_NAMES.length; index++) {
+					this.selectedByScreen[index] = Math.max(0, Math.floor(initialNavigation.selectedByScreen[index] ?? 0));
+				}
+			}
 			this.selected = Math.max(0, initialNavigation.selected);
+			this.selectedByScreen[this.screen] = this.selected;
 			this.signalsFocus = initialNavigation.signalsFocus;
 			this.signalStoryScroll = Math.max(0, initialNavigation.signalStoryScroll);
 			this.eventsFocus = initialNavigation.eventsFocus ?? "lanes";
@@ -3391,6 +3554,7 @@ class MarketHub {
 				}
 			}
 		}
+		this.selectedByScreen[this.screen] = this.selected;
 		if (initialResearch && !researchSlotHeld(initialResearch)) this.status = researchStatusLine(initialResearch) || this.status;
 	}
 
@@ -3400,7 +3564,9 @@ class MarketHub {
 		if (isEventResearchKey(researchKey)) {
 			const laneId = eventLaneIdFromResearchKey(researchKey);
 			if (laneId && this.eventResearchKeys.get(laneId) === researchKey) {
-				this.status = canvas.stage === "partial" ? `${canvas.contextLabel || "EVENT"} PARTIALLY UPDATED` : `${canvas.contextLabel || "EVENT"} READY`;
+				if (this.screen === MARKET_SCREEN.events && this.selectedEventLane()?.id === laneId) {
+					this.status = canvas.stage === "partial" ? `${canvas.contextLabel || "EVENT"} PARTIALLY UPDATED` : `${canvas.contextLabel || "EVENT"} READY`;
+				}
 				this.tui.requestRender();
 			}
 			return;
@@ -3409,7 +3575,7 @@ class MarketHub {
 		const sameStream = Boolean(canvas.researchId && this.marketCanvas?.researchId === canvas.researchId);
 		this.marketCanvas = canvas;
 		if (!sameStream) this.signalStoryScroll = 0;
-		this.status = canvas.stage === "partial" ? "MARKET BRIEFING PARTIALLY UPDATED" : "MARKET BRIEFING READY";
+		if (this.screen === MARKET_SCREEN.signals) this.status = canvas.stage === "partial" ? "MARKET BRIEFING PARTIALLY UPDATED" : "MARKET BRIEFING READY";
 		this.tui.requestRender();
 	}
 
@@ -3419,6 +3585,43 @@ class MarketHub {
 
 	private selectedEventLane(): EventLane | undefined {
 		return EVENT_LANES[this.selected];
+	}
+
+	private knownResearchJobs(): ResearchJob[] {
+		const jobs = new Map<string, ResearchJob>(this.researchJobCache);
+		for (const job of researchJobs.values()) jobs.set(job.id, job);
+		return [...jobs.values()].sort((a, b) => b.startedAt - a.startedAt);
+	}
+
+	private latestJobFor(symbol: string, researchKeys: string[]): ResearchJob | undefined {
+		const keys = new Set(researchKeys.map(normalizeResearchKey));
+		const matches = this.knownResearchJobs().filter((job) => job.symbol === symbol && job.chartScope === this.chartScope && keys.has(job.researchKey));
+		return matches.find(researchSlotHeld) ?? matches[0];
+	}
+
+	private visibleResearchJob(): ResearchJob | undefined {
+		const entry = this.entries()[this.selected];
+		if (this.screen === MARKET_SCREEN.signals) {
+			if (this.signalsFocus === "headlines" && entry?.type === "headline") {
+				const keys = [headlineResearchIdentity(entry.headline, "brief").researchKey, headlineResearchIdentity(entry.headline, "why").researchKey];
+				return keys.includes(this.marketResearchKey) ? this.latestJobFor("MARKET", [this.marketResearchKey]) : this.latestJobFor("MARKET", keys);
+			}
+			const keys = this.knownResearchJobs().filter((job) => job.symbol === "MARKET" && job.chartScope === this.chartScope && isSignalsResearchKey(job.researchKey)).map((job) => job.researchKey);
+			return this.latestJobFor("MARKET", [this.marketResearchKey]) ?? this.latestJobFor("MARKET", keys);
+		}
+		if (this.screen === MARKET_SCREEN.events && entry?.type === "event") {
+			const preferred = this.eventResearchKeys.get(entry.lane.id);
+			return preferred
+				? this.latestJobFor("MARKET", [preferred])
+				: this.latestJobFor("MARKET", [eventResearchIdentity(entry.lane, "brief").researchKey, eventResearchIdentity(entry.lane, "why").researchKey]);
+		}
+		if ((this.screen === MARKET_SCREEN.market || this.screen === MARKET_SCREEN.movers) && entry?.type === "quote") {
+			return this.latestJobFor("MARKET", [marketMoverIdentity(entry.quote.symbol).researchKey]);
+		}
+		if (this.screen === MARKET_SCREEN.watch && entry?.type === "quote") {
+			return this.latestJobFor(entry.quote.symbol, [tickerResearchIdentity(entry.quote.symbol, "brief").researchKey, tickerResearchIdentity(entry.quote.symbol, "why").researchKey]);
+		}
+		return undefined;
 	}
 
 	private displayedEventCanvas(lane: EventLane | undefined = this.selectedEventLane()): Canvas | undefined {
@@ -3433,7 +3636,7 @@ class MarketHub {
 			?? canvasForResearch("MARKET", this.chartScope, eventResearchIdentity(lane, "why").researchKey);
 	}
 
-	private eventViewport(rows: string[], maxRows: number, th: Theme): string[] {
+	private eventViewport(rows: string[], maxRows: number, width: number, th: Theme): string[] {
 		const available = Math.max(1, maxRows);
 		const showStatus = rows.length > available && available >= 2;
 		const contentRows = Math.max(1, available - (showStatus ? 1 : 0));
@@ -3445,15 +3648,17 @@ class MarketHub {
 		if (showStatus) {
 			const start = this.eventBriefingScroll + 1;
 			const end = this.eventBriefingScroll + result.length;
-			result.push(truncateToWidth(th.fg(this.eventsFocus === "briefing" ? "accent" : "dim", `CANVAS ${start}–${end} / ${rows.length}  ${this.eventsFocus === "briefing" ? "[W/S] scroll  [PgUp/PgDn] page" : "[Tab] focus briefing"}`), 160));
+			result.push(truncateToWidth(th.fg(this.eventsFocus === "briefing" ? "accent" : "dim", `CANVAS ${start}–${end} / ${rows.length}  ${this.eventsFocus === "briefing" ? "[W/S] scroll  [PgUp/PgDn] page" : "[Tab] focus briefing"}`), width));
 		}
 		return result;
 	}
 
 	private navigationState(): MarketHubNavigationState {
+		this.selectedByScreen[this.screen] = this.selected;
 		return {
 			screen: this.screen,
 			selected: this.selected,
+			selectedByScreen: [...this.selectedByScreen],
 			signalsFocus: this.signalsFocus,
 			signalStoryScroll: this.signalStoryScroll,
 			eventsFocus: this.eventsFocus,
@@ -3464,6 +3669,7 @@ class MarketHub {
 	}
 
 	showArchivedCanvas(canvas: Canvas): void {
+		this.selectedByScreen[this.screen] = this.selected;
 		this.chartScope = canvasScope(canvas);
 		const researchKey = canvasResearchKey(canvas);
 		const history = archivedResearchFor("MARKET", this.chartScope, researchKey);
@@ -3478,11 +3684,13 @@ class MarketHub {
 				this.selected = Math.max(0, EVENT_LANES.findIndex((lane) => lane.id === laneId));
 			}
 			this.screen = MARKET_SCREEN.events;
+			this.selectedByScreen[this.screen] = this.selected;
 			this.eventsFocus = "briefing";
 			this.eventBriefingScroll = 0;
 		} else {
 			this.marketResearchKey = researchKey;
 			this.screen = MARKET_SCREEN.signals;
+			this.selected = this.selectedByScreen[this.screen] ?? 0;
 			this.signalsFocus = "story";
 			this.signalStoryScroll = 0;
 		}
@@ -3531,8 +3739,12 @@ class MarketHub {
 	}
 
 	setResearchJob(job: ResearchJob): void {
-		this.researchJob = job;
-		if (!researchSlotHeld(job)) this.status = researchStatusLine(job) || this.status;
+		this.researchJobCache.set(job.id, job);
+		pruneSettledResearchJobs(this.researchJobCache);
+		if (this.visibleResearchJob()?.id === job.id) {
+			this.researchJob = job;
+			if (!researchSlotHeld(job)) this.status = researchStatusLine(job) || this.status;
+		}
 		this.tui.requestRender();
 	}
 
@@ -3554,6 +3766,34 @@ class MarketHub {
 
 	private clampSelection(): void {
 		this.selected = Math.max(0, Math.min(this.selected, Math.max(0, this.entries().length - 1)));
+		this.selectedByScreen[this.screen] = this.selected;
+	}
+
+	private changeScreen(direction: -1 | 1): void {
+		this.selectedByScreen[this.screen] = this.selected;
+		this.screen = (this.screen + direction + MARKET_SCREEN_NAMES.length) % MARKET_SCREEN_NAMES.length;
+		this.selected = this.selectedByScreen[this.screen] ?? 0;
+		this.clampSelection();
+		this.status = `${MARKET_SCREEN_NAMES[this.screen]} · W/S SELECT · A/D SWITCH SCREENS`;
+	}
+
+	private selectIndex(index: number): void {
+		this.selected = Math.max(0, Math.min(index, Math.max(0, this.entries().length - 1)));
+		this.selectedByScreen[this.screen] = this.selected;
+	}
+
+	private snapshotStatus(): string {
+		const shown = CHART_SCOPE_CONFIGS[this.snapshot.chartScope].label;
+		const requested = CHART_SCOPE_CONFIGS[this.chartScope].label;
+		const quoteCount = this.snapshot.quotes.length;
+		const age = recencyLabel(this.snapshot.updatedAt);
+		if (this.loading) {
+			if (quoteCount > 0 && this.snapshot.chartScope !== this.chartScope) return `SHOWING ${shown} · SYNCING ${requested} · ${quoteCount} QUOTES · ${age}`;
+			if (quoteCount > 0) return `SHOWING ${shown} · REFRESHING · ${quoteCount} QUOTES · ${age}`;
+			return `SYNCING ${requested} · 0 QUOTES`;
+		}
+		if (this.snapshot.chartScope !== this.chartScope) return `SHOWING ${shown} · ${requested} UNAVAILABLE · ${quoteCount} QUOTES · ${age}`;
+		return `${shown} SNAPSHOT · ${quoteCount} QUOTES · ${age}`;
 	}
 
 	startRefresh(): void {
@@ -3562,13 +3802,7 @@ class MarketHub {
 
 	private setScope(scope: ChartScope): void {
 		if (scope === this.chartScope) return;
-		if (researchSlotHeld(this.researchJob)) {
-			this.status = `CHART SCOPE LOCKED · RESEARCH ${this.researchJob!.symbol} ACTIVE · [C] CANCEL`;
-			this.tui.requestRender();
-			return;
-		}
 		this.chartScope = scope;
-		this.snapshot = { ...this.snapshot, quotes: [], movers: [], chartScope: scope, updatedAt: Date.now() };
 		this.marketCanvas = canvasForResearch("MARKET", scope, this.marketResearchKey)
 			?? latestCanvasForDisplay("MARKET", scope, (canvas) => isSignalsResearchKey(canvasResearchKey(canvas)));
 		if (this.marketCanvas) this.marketResearchKey = canvasResearchKey(this.marketCanvas);
@@ -3598,7 +3832,8 @@ class MarketHub {
 			this.clampSelection();
 		} catch (error) {
 			if (generation !== this.snapshotGeneration) return;
-			this.status = `MARKET MAP UNAVAILABLE: ${error instanceof Error ? error.message : String(error)}`;
+			const shown = this.snapshot.quotes.length > 0 && this.snapshot.chartScope !== scope ? ` · SHOWING ${CHART_SCOPE_CONFIGS[this.snapshot.chartScope].label}` : "";
+			this.status = `${CHART_SCOPE_CONFIGS[scope].label} MARKET MAP UNAVAILABLE${shown}: ${error instanceof Error ? error.message : String(error)}`;
 		} finally {
 			if (generation === this.snapshotGeneration) this.loading = false;
 			this.tui.requestRender();
@@ -3611,8 +3846,11 @@ class MarketHub {
 			return;
 		}
 		const response = this.researchActions.start(request);
-		if (!response.job) this.status = response.status;
-		if (response.accepted) this.status = response.status;
+		if (response.job) {
+			this.researchJobCache.set(response.job.id, response.job);
+			this.researchJob = response.job;
+		}
+		this.status = response.status;
 	}
 
 	private activateResearchContext(request: ResearchRequest): void {
@@ -3622,26 +3860,23 @@ class MarketHub {
 		if (isEventResearchKey(request.researchKey)) {
 			const laneId = eventLaneIdFromResearchKey(request.researchKey);
 			if (laneId) this.eventResearchKeys.set(laneId, request.researchKey);
-			this.screen = MARKET_SCREEN.events;
-			this.eventsFocus = "briefing";
-			this.eventBriefingScroll = 0;
 			return;
 		}
 		this.marketResearchKey = request.researchKey;
 		this.marketCanvas = canvasForResearch("MARKET", this.chartScope, request.researchKey);
-		this.screen = MARKET_SCREEN.signals;
-		this.signalsFocus = "story";
-		this.signalStoryScroll = 0;
 	}
 
 	private requestResearch(request: ResearchRequest): void {
-		if (researchSlotHeld(this.researchJob)) {
-			this.status = `${this.researchJob!.contextLabel} ALREADY ACTIVE · [C] CANCEL`;
+		this.activateResearchContext(request);
+		const existing = activeResearchJobForIdentity(request)
+			?? this.knownResearchJobs().find((job) => researchSlotHeld(job) && researchIdentityKey(job) === researchIdentityKey(request));
+		if (existing) {
+			this.researchJob = existing;
+			this.status = `${existing.contextLabel} ALREADY ${existing.phase.toUpperCase()} · [C] CANCEL`;
 			return;
 		}
-		this.activateResearchContext(request);
 		const cached = latestArchivedCanvasExact(request);
-		if (this.researchActions?.promptForCache && !activeResearchJob() && cached) {
+		if (this.researchActions?.promptForCache && cached) {
 			this.cacheDecision = { request, cached };
 			this.status = cacheChoiceStatus(request, cached);
 			return;
@@ -3677,8 +3912,8 @@ class MarketHub {
 
 	private cancelResearch(): void {
 		if (!this.researchActions) return;
-		const response = this.researchActions.cancel();
-		if (!response.job) this.status = response.status;
+		const response = this.researchActions.cancel(this.visibleResearchJob()?.id);
+		this.status = response.status;
 	}
 
 	private why(): void {
@@ -3712,23 +3947,12 @@ class MarketHub {
 				this.done({ action: "close" });
 				return;
 			}
-			// Keep cache choice explicit, but never trap screen/selection navigation.
-			const navigationInput = matchesKey(data, "left") || matchesKey(data, "right")
-				|| matchesKey(data, "up") || matchesKey(data, "down") || matchesKey(data, "tab")
-				|| data === "a" || data === "A" || data === "d" || data === "D"
-				|| data === "h" || data === "H" || data === "l" || data === "L"
-				|| data === "w" || data === "W" || data === "s" || data === "S";
-			if (navigationInput) {
-				this.cacheDecision = undefined;
-				this.status = "CACHE CHOICE CANCELLED · NAVIGATION RESTORED";
-			} else {
-				if (matchesKey(data, "escape")) this.resolveCacheDecision("cancel");
-				else if (data === "u" || data === "U") this.resolveCacheDecision("use");
-				else if (data === "f" || data === "F") this.resolveCacheDecision("refresh");
-				else this.status = cacheChoiceStatus(this.cacheDecision.request, this.cacheDecision.cached);
-				this.tui.requestRender();
-				return;
-			}
+			if (matchesKey(data, "escape")) this.resolveCacheDecision("cancel");
+			else if (data === "u" || data === "U") this.resolveCacheDecision("use");
+			else if (data === "f" || data === "F") this.resolveCacheDecision("refresh");
+			else this.status = `${cacheChoiceStatus(this.cacheDecision.request, this.cacheDecision.cached)} · NAVIGATION LOCKED`;
+			this.tui.requestRender();
+			return;
 		}
 		if (this.searching) {
 			if (matchesKey(data, "escape")) {
@@ -3760,16 +3984,19 @@ class MarketHub {
 			this.tui.requestRender();
 			return;
 		}
-		if (matchesKey(data, "escape") || data === "q" || data === "Q") {
+		if (data === "q" || data === "Q") {
 			this.done({ action: "close" });
 			return;
 		}
-		if (matchesKey(data, "left") || data === "a" || data === "A" || data === "h" || data === "H") {
-			this.screen = (this.screen + MARKET_SCREEN_NAMES.length - 1) % MARKET_SCREEN_NAMES.length;
-			this.selected = 0;
-		} else if (matchesKey(data, "right") || data === "d" || data === "D" || data === "l" || data === "L") {
-			this.screen = (this.screen + 1) % MARKET_SCREEN_NAMES.length;
-			this.selected = 0;
+		if (matchesKey(data, "escape")) {
+			this.status = "ESCAPE HAS NOTHING TO DISMISS · Q TO QUIT";
+			this.tui.requestRender();
+			return;
+		}
+		if (matchesKey(data, "left") || data === "a" || data === "A") {
+			this.changeScreen(-1);
+		} else if (matchesKey(data, "right") || data === "d" || data === "D") {
+			this.changeScreen(1);
 		} else if (matchesKey(data, "tab") && this.screen === MARKET_SCREEN.signals) {
 			this.signalsFocus = this.signalsFocus === "headlines" ? "story" : "headlines";
 			this.status = `SIGNALS FOCUS · ${this.signalsFocus === "story" ? "MARKET STORY · W/S SCROLL" : "HEADLINES · W/S SELECT"}`;
@@ -3777,8 +4004,11 @@ class MarketHub {
 			this.eventsFocus = this.eventsFocus === "lanes" ? "briefing" : "lanes";
 			this.status = `EVENTS FOCUS · ${this.eventsFocus === "briefing" ? "BRIEFING · W/S SCROLL" : "CATALYST LANES · W/S SELECT"}`;
 		} else if (matchesKey(data, "tab")) {
-			this.screen = (this.screen + 1) % MARKET_SCREEN_NAMES.length;
-			this.selected = 0;
+			this.status = `${MARKET_SCREEN_NAMES[this.screen]} HAS ONE PANE · A/D SWITCH SCREENS`;
+		} else if (this.screen === MARKET_SCREEN.signals && this.signalsFocus === "story" && !this.displayedMarketCanvas() && isViewportNavigationInput(data)) {
+			this.status = "MARKET STORY HAS NO CANVAS YET · J BRIEF · K WHY";
+		} else if (this.screen === MARKET_SCREEN.events && this.eventsFocus === "briefing" && !this.displayedEventCanvas() && isViewportNavigationInput(data)) {
+			this.status = "BRIEFING HAS NO CANVAS YET · J BRIEF · K WHY";
 		} else if (this.screen === MARKET_SCREEN.signals && this.signalsFocus === "story" && (matchesKey(data, "up") || data === "w" || data === "W")) {
 			if (this.displayedMarketCanvas()) this.signalStoryScroll = Math.max(0, this.signalStoryScroll - 1);
 			else this.status = "MARKET STORY HAS NO CANVAS YET";
@@ -3808,7 +4038,7 @@ class MarketHub {
 		} else if (this.screen === MARKET_SCREEN.events && this.eventsFocus === "briefing" && matchesKey(data, "end")) {
 			if (this.displayedEventCanvas()) this.eventBriefingScroll = Number.MAX_SAFE_INTEGER;
 		} else if (matchesKey(data, "up") || data === "w" || data === "W") {
-			this.selected = Math.max(0, this.selected - 1);
+			this.selectIndex(this.selected - 1);
 			if (this.screen === MARKET_SCREEN.events) {
 				this.eventBriefingScroll = 0;
 				if (this.archivedMarketCanvas && isEventResearchKey(canvasResearchKey(this.archivedMarketCanvas))) {
@@ -3817,7 +4047,7 @@ class MarketHub {
 				}
 			}
 		} else if (matchesKey(data, "down") || data === "s" || data === "S") {
-			this.selected = Math.min(Math.max(0, this.entries().length - 1), this.selected + 1);
+			this.selectIndex(this.selected + 1);
 			if (this.screen === MARKET_SCREEN.events) {
 				this.eventBriefingScroll = 0;
 				if (this.archivedMarketCanvas && isEventResearchKey(canvasResearchKey(this.archivedMarketCanvas))) {
@@ -3848,9 +4078,12 @@ class MarketHub {
 			else this.research("Build a source-verified factual market brief with concrete developments, verified dates, and explicit unknowns.", marketStoryIdentity("brief"));
 		} else if (data === "?") {
 			const watchHelp = this.screen === MARKET_SCREEN.market || this.screen === MARKET_SCREEN.movers || this.screen === MARKET_SCREEN.watch ? " · E WATCH" : "";
+			const paneHelp = this.screen === MARKET_SCREEN.signals || this.screen === MARKET_SCREEN.events ? "TAB PANE FOCUS" : "TAB ONE PANE";
+			const verticalHelp = (this.screen === MARKET_SCREEN.signals && this.signalsFocus === "story")
+				|| (this.screen === MARKET_SCREEN.events && this.eventsFocus === "briefing") ? "W/S SCROLL" : "W/S SELECT";
 			this.status = this.researchActions
-				? `A/D SCREENS · TAB PANE FOCUS · W/S SELECT/SCROLL · 1–5 SCOPE · [ OLDER · ] NEWER · J BRIEF/OPEN · K WHY · C CANCEL · / SEARCH${watchHelp} · Q QUIT`
-				: `A/D SCREENS · TAB PANE FOCUS · W/S SELECT/SCROLL · 1–5 SCOPE · [ OLDER · ] NEWER · J BRIEF/OPEN · K WHY · / SEARCH${watchHelp} · Q QUIT`;
+				? `A/D SCREENS · ${paneHelp} · ${verticalHelp} · 1–5 SCOPE · [ OLDER · ] NEWER · J BRIEF/OPEN · K WHY · C CANCEL · / SEARCH${watchHelp} · Q QUIT`
+				: `A/D SCREENS · ${paneHelp} · ${verticalHelp} · 1–5 SCOPE · [ OLDER · ] NEWER · J BRIEF/OPEN · K WHY · / SEARCH${watchHelp} · Q QUIT`;
 		} else if (data === "/") {
 			this.searching = true;
 			this.searchQuery = "";
@@ -3876,6 +4109,16 @@ class MarketHub {
 		const th = this.theme;
 		const fit = (text: string) => truncateToWidth(text, width);
 		const totalRows = terminalRows(this.tui);
+		const visibleJob = this.visibleResearchJob();
+		const activeJobs = activeResearchJobs();
+		const splitPane = this.screen === MARKET_SCREEN.signals || this.screen === MARKET_SCREEN.events;
+		const scrolling = this.screen === MARKET_SCREEN.signals && this.signalsFocus === "story"
+			|| this.screen === MARKET_SCREEN.events && this.eventsFocus === "briefing";
+		const tabLabel = this.screen === MARKET_SCREEN.signals
+			? this.signalsFocus === "headlines" ? "STORY" : "HEADLINES"
+			: this.screen === MARKET_SCREEN.events
+				? this.eventsFocus === "lanes" ? "BRIEFING" : "LANES"
+				: "ONE PANE";
 		const header: string[] = [];
 		const body: string[] = [];
 		const footer: string[] = [];
@@ -3892,7 +4135,7 @@ class MarketHub {
 		}
 		header.push(fit(th.fg("borderMuted", "─".repeat(width))));
 		let screenTabs = MARKET_SCREEN_NAMES.map((name, index) => index === this.screen ? th.bg("selectedBg", th.bold(th.fg("accent", ` ${name} `))) : th.fg("dim", ` ${name} `)).join(" ");
-		if (totalRows < 22) screenTabs += th.fg("dim", `  CHART ${CHART_SCOPE_CONFIGS[this.chartScope].label} [1–5]`);
+		if (totalRows < 22) screenTabs += th.fg("dim", `  CHART ${CHART_SCOPE_CONFIGS[this.chartScope].label} [1–5] · ${this.snapshotStatus()}`);
 		header.push(fit(screenTabs));
 		// Scope selector row
 		if (totalRows >= 22) {
@@ -3903,7 +4146,7 @@ class MarketHub {
 					? th.bg("selectedBg", th.bold(th.fg("accent", ` ${cfg.key}:${cfg.label} `)))
 					: th.fg("dim", ` ${cfg.key}:${cfg.label} `);
 			}).join("");
-			header.push(fit(scopeRow));
+			header.push(fit(`${scopeRow}${th.fg("dim", `  ${this.snapshotStatus()}`)}`));
 		}
 		if (totalRows >= 20) header.push("");
 
@@ -3922,9 +4165,24 @@ class MarketHub {
 		if (this.searching) {
 			footer.push(fit(`${th.fg("accent"," SEARCH ▸")} ${th.bold(th.fg("text", this.searchQuery))}${th.fg("dim","_")}   ${th.fg("dim","Enter open · then E watch · Esc cancel")}`));
 		} else {
-			footer.push(fit(th.fg("dim", researchSlotHeld(this.researchJob) ? researchStatusLine(this.researchJob)! : this.loading ? "SYNCING…" : this.status)));
+			const status = this.cacheDecision
+				? this.status
+				: researchSlotHeld(visibleJob)
+					? `${activeJobs.length > 1 ? `${researchQueueLabel()} · ` : ""}${researchStatusLine(visibleJob)!}`
+					: this.loading ? this.snapshotStatus() : `${activeJobs.length > 0 ? `${researchQueueLabel()} · ` : ""}${this.snapshotStatus()} · ${this.status}`;
+			footer.push(fit(th.fg("dim", status)));
 		}
-		renderArcadeController(footer, width, th, fit, { search: true, watch: this.screen === MARKET_SCREEN.market || this.screen === MARKET_SCREEN.movers || this.screen === MARKET_SCREEN.watch, cancel: researchSlotHeld(this.researchJob), jLabel: this.screen === MARKET_SCREEN.signals || this.screen === MARKET_SCREEN.events ? "BRIEF" : "OPEN" });
+		renderArcadeController(footer, width, th, fit, {
+			search: true,
+			searching: this.searching,
+			cache: Boolean(this.cacheDecision),
+			watch: this.screen === MARKET_SCREEN.market || this.screen === MARKET_SCREEN.movers || this.screen === MARKET_SCREEN.watch,
+			cancel: researchSlotHeld(visibleJob),
+			jLabel: splitPane ? "BRIEF" : "OPEN",
+			horizontalLabel: "SCREEN",
+			verticalLabel: scrolling ? "SCROLL" : "SELECT",
+			tabLabel,
+		});
 
 		const output = composeScreen(header, body, footer, totalRows);
 		this.layoutMetrics = computeLayoutMetrics(
@@ -3959,7 +4217,7 @@ class MarketHub {
 				const direction = (entry.quote.change ?? 0) >= 0 ? "success" : "error";
 				const chartDirection = entry.quote.points.length >= 2 ? entry.quote.points.at(-1)! >= entry.quote.points[0]! ? "success" : "error" : direction;
 				left.push(`${th.bold(th.fg(direction, `> ${entry.quote.symbol}`))} ${th.fg("muted", entry.quote.name)} ${th.bold(th.fg(direction, percent(entry.quote.changePercent)))}`);
-				left.push(...chartLines(entry.quote.points, Math.floor(width * 0.59), (text) => th.fg(chartDirection, text), (text) => th.fg("dim", text), this.chartScope === "day" ? entry.quote.previousClose : undefined, Math.max(2, Math.min(18, bodyRows - 8)), entry.quote.pointTimes, entry.quote.pointSessions, entry.quote.timezone, entry.quote.interval, (value) => dollars(value, entry.quote.currency), undefined, undefined, this.chartScope));
+				left.push(...chartLines(entry.quote.points, Math.floor(width * 0.59), (text) => th.fg(chartDirection, text), (text) => th.fg("dim", text), entry.quote.chartScope === "day" ? entry.quote.previousClose : undefined, Math.max(2, Math.min(18, bodyRows - 8)), entry.quote.pointTimes, entry.quote.pointSessions, entry.quote.timezone, entry.quote.interval, (value) => dollars(value, entry.quote.currency), undefined, undefined, entry.quote.chartScope));
 			}
 			const movers = this.snapshot.movers.slice(0, 6);
 			const right = [th.bold(th.fg("accent", "ON THE MOVE")), ...movers.map(({ quote }) => `${directionGlyph(quote.change)} ${th.bold(th.fg("text", quote.symbol.padEnd(6)))} ${th.fg((quote.change ?? 0) >= 0 ? "success" : "error", percent(quote.changePercent))}`), "", th.bold(th.fg("accent", "LEAD SIGNAL"))];
@@ -3977,7 +4235,7 @@ class MarketHub {
 			const direction = (quote.change ?? 0) >= 0 ? "success" : "error";
 			const chartDirection = quote.points.length >= 2 ? quote.points.at(-1)! >= quote.points[0]! ? "success" : "error" : direction;
 			const selectedBlock = [fit(`${th.bold(th.fg(direction, `> ${quote.symbol}`))} ${th.fg("muted", quote.name)} ${th.bold(th.fg(direction, percent(quote.changePercent)))}`)];
-			for (const row of chartLines(quote.points, width, (text) => th.fg(chartDirection, text), (text) => th.fg("dim", text), this.chartScope === "day" ? quote.previousClose : undefined, Math.max(2, Math.min(26, bodyRows - 12)), quote.pointTimes, quote.pointSessions, quote.timezone, quote.interval, (value) => dollars(value, quote.currency), undefined, undefined, this.chartScope)) selectedBlock.push(fit(row));
+			for (const row of chartLines(quote.points, width, (text) => th.fg(chartDirection, text), (text) => th.fg("dim", text), quote.chartScope === "day" ? quote.previousClose : undefined, Math.max(2, Math.min(26, bodyRows - 12)), quote.pointTimes, quote.pointSessions, quote.timezone, quote.interval, (value) => dollars(value, quote.currency), undefined, undefined, quote.chartScope)) selectedBlock.push(fit(row));
 			blocks.push(selectedBlock);
 		}
 		const movers = this.snapshot.movers.slice(0, 4);
@@ -4112,7 +4370,7 @@ class MarketHub {
 		return rows;
 	}
 
-	private storyViewport(rows: string[], maxRows: number, th: Theme): string[] {
+	private storyViewport(rows: string[], maxRows: number, width: number, th: Theme): string[] {
 		const available = Math.max(1, maxRows);
 		const showStatus = rows.length > available && available >= 2;
 		const contentRows = Math.max(1, available - (showStatus ? 1 : 0));
@@ -4124,16 +4382,17 @@ class MarketHub {
 		if (showStatus) {
 			const start = this.signalStoryScroll + 1;
 			const end = this.signalStoryScroll + result.length;
-			result.push(truncateToWidth(th.fg(this.signalsFocus === "story" ? "accent" : "dim", `CANVAS ${start}–${end} / ${rows.length}  ${this.signalsFocus === "story" ? "[W/S] scroll  [PgUp/PgDn] page" : "[Tab] focus story"}`), 160));
+			result.push(truncateToWidth(th.fg(this.signalsFocus === "story" ? "accent" : "dim", `CANVAS ${start}–${end} / ${rows.length}  ${this.signalsFocus === "story" ? "[W/S] scroll  [PgUp/PgDn] page" : "[Tab] focus story"}`), width));
 		}
 		return result;
 	}
 
 	private renderSignals(lines: string[], width: number, th: Theme, fit: (text: string) => string, bodyRows: number): void {
 		const canvas = this.displayedMarketCanvas();
-		const marketResearchActive = this.researchJob?.symbol === "MARKET" && isSignalsResearchKey(this.researchJob.researchKey) && researchSlotHeld(this.researchJob);
+		const marketResearchJob = this.latestJobFor("MARKET", [this.marketResearchKey]);
+		const marketResearchActive = researchSlotHeld(marketResearchJob);
 		const viewingArchive = Boolean(this.archivedMarketCanvas && !isEventResearchKey(canvasResearchKey(this.archivedMarketCanvas)) && this.archivePosition !== undefined);
-		const previous = Boolean(canvas && !viewingArchive && marketResearchActive && canvas.researchId !== this.researchJob!.id);
+		const previous = Boolean(canvas && !viewingArchive && marketResearchActive && canvas.researchId !== marketResearchJob!.id);
 		const canvasTitle = canvas ? `${CHART_SCOPE_CONFIGS[this.chartScope].label} · ${canvas.contextLabel || (canvasIntent(canvas) || "brief").toUpperCase()} · ${viewingArchive ? `ARCHIVE ${this.archivePosition! + 1}/${archivedResearchFor("MARKET", this.chartScope, canvasResearchKey(canvas)).length} · ` : previous ? "PREVIOUS · " : canvas.stage === "partial" ? "PARTIAL · " : ""}${canvas.title}` : "";
 		const headlineHeading = this.signalsFocus === "headlines"
 			? th.bg("selectedBg", th.bold(th.fg("accent", " HEADLINES FOCUS ")))
@@ -4141,8 +4400,9 @@ class MarketHub {
 		const storyHeading = this.signalsFocus === "story"
 			? th.bg("selectedBg", th.bold(th.fg("accent", " MARKET STORY FOCUS ")))
 			: th.bold(th.fg("accent", "TODAY'S MARKET STORY"));
+		const paneHint = this.signalsFocus === "headlines" ? "W/S selects headlines · Tab → Market Story" : "W/S scrolls story · Tab → Headlines";
 		if (width >= 84 && terminalRows(this.tui) >= 24) {
-			const left = [headlineHeading, th.fg("dim", "Tab switches pane · W/S selects or scrolls"), th.fg("dim", challengeNote(this.snapshot.challenge)), ""];
+			const left = [headlineHeading, th.fg("dim", paneHint), th.fg("dim", challengeNote(this.snapshot.challenge)), ""];
 			const headlineCapacity = Math.max(1, bodyRows - 4);
 			const headlineStart = Math.max(0, Math.min(this.selected - headlineCapacity + 1, Math.max(0, this.snapshot.headlines.length - headlineCapacity)));
 			for (const [offset, headline] of this.snapshot.headlines.slice(headlineStart, headlineStart + headlineCapacity).entries()) {
@@ -4160,17 +4420,17 @@ class MarketHub {
 			if (canvas) {
 				const storyWidth = Math.max(22, Math.floor(width * 0.39) - 1);
 				const rows = this.renderCanvasRows(canvas, storyWidth, th);
-				right.push(...this.storyViewport(rows, Math.max(1, bodyRows - right.length), th));
+				right.push(...this.storyViewport(rows, Math.max(1, bodyRows - right.length), storyWidth, th));
 			} else {
 				this.signalStoryRows = 0;
 				this.signalStoryViewportRows = 0;
-				right.push(th.fg("dim", marketResearchActive ? `${this.researchJob!.activity.toUpperCase()} · discovery blocks appear here · C cancels` : "J = factual market brief · K = causal/scenario analysis"));
+				right.push(th.fg("dim", marketResearchActive ? `${marketResearchJob!.phase === "queued" ? "QUEUED" : marketResearchJob!.activity.toUpperCase()} · discovery blocks appear here · C cancels` : "J = factual market brief · K = causal/scenario analysis"));
 			}
 			lines.push(...twoColumn(left, right, width, bodyRows));
 			return;
 		}
 
-		const compact: string[] = [fit(headlineHeading), fit(th.fg("dim", "Tab switches pane · W/S selects or scrolls"))];
+		const compact: string[] = [fit(headlineHeading), fit(th.fg("dim", paneHint))];
 		if (this.signalsFocus === "headlines") compact.push(fit(th.fg("dim", challengeNote(this.snapshot.challenge))));
 		const headlineLimit = this.signalsFocus === "story" ? 1 : Math.max(1, Math.min(5, Math.floor(bodyRows / 3)));
 		const headlineStart = Math.max(0, Math.min(this.selected - headlineLimit + 1, Math.max(0, this.snapshot.headlines.length - headlineLimit)));
@@ -4189,7 +4449,7 @@ class MarketHub {
 			compact.push(fit(th.bold(th.fg("text", canvasTitle))));
 			if (viewingArchive) compact.push(fit(th.fg("dim", `AS OF ${archiveAsOf(canvas)}`)));
 			const rows = this.renderCanvasRows(canvas, Math.max(20, width - 2), th);
-			compact.push(...this.storyViewport(rows, Math.max(1, bodyRows - compact.length), th).map(fit));
+			compact.push(...this.storyViewport(rows, Math.max(1, bodyRows - compact.length), Math.max(20, width - 2), th).map(fit));
 		} else {
 			this.signalStoryRows = 0;
 			this.signalStoryViewportRows = 0;
@@ -4201,24 +4461,30 @@ class MarketHub {
 	private renderEvents(lines: string[], width: number, th: Theme, fit: (text: string) => string, bodyRows: number): void {
 		const lane = this.selectedEventLane();
 		const canvas = this.displayedEventCanvas(lane);
-		const activeForLane = Boolean(lane && this.researchJob?.symbol === "MARKET" && researchSlotHeld(this.researchJob)
-			&& eventLaneIdFromResearchKey(this.researchJob!.researchKey) === lane.id);
+		const eventJob = lane ? this.latestJobFor("MARKET", [eventResearchIdentity(lane, "brief").researchKey, eventResearchIdentity(lane, "why").researchKey]) : undefined;
+		const activeForLane = researchSlotHeld(eventJob);
 		const laneHeading = this.eventsFocus === "lanes"
 			? th.bg("selectedBg", th.bold(th.fg("accent", " CATALYST LANES FOCUS ")))
 			: th.bold(th.fg("accent", "CATALYST LANES"));
 		const briefingHeading = this.eventsFocus === "briefing"
 			? th.bg("selectedBg", th.bold(th.fg("accent", " BRIEFING FOCUS ")))
 			: th.bold(th.fg("accent", "SELECTED BRIEFING"));
+		const paneHint = this.eventsFocus === "lanes" ? "W/S selects lanes · Tab → Briefing" : "W/S scrolls briefing · Tab → Lanes";
 		const laneStatus = (candidate: EventLane): string => {
 			const brief = canvasForResearch("MARKET", this.chartScope, eventResearchIdentity(candidate, "brief").researchKey);
 			const why = canvasForResearch("MARKET", this.chartScope, eventResearchIdentity(candidate, "why").researchKey);
-			return `BRIEF ${brief ? relativeAge(brief.updatedAt) : "--"} · WHY ${why ? relativeAge(why.updatedAt) : "--"}`;
+			const briefJob = this.latestJobFor("MARKET", [eventResearchIdentity(candidate, "brief").researchKey]);
+			const whyJob = this.latestJobFor("MARKET", [eventResearchIdentity(candidate, "why").researchKey]);
+			const state = (job: ResearchJob | undefined, result: Canvas | undefined) => researchSlotHeld(job)
+				? job!.phase === "queued" ? "QUEUED" : job!.phase === "cancelling" ? "CANCEL" : "RUNNING"
+				: result ? relativeAge(result.updatedAt) : "--";
+			return `BRIEF ${state(briefJob, brief)} · WHY ${state(whyJob, why)}`;
 		};
 		const metadata = canvas
 			? `${(canvasIntent(canvas) || "brief").toUpperCase()} · ${canvas.stage?.toUpperCase() || "COMPLETE"} · AS OF ${archiveAsOf(canvas)}`
 			: "";
 		if (width >= 84 && terminalRows(this.tui) >= 24) {
-			const left = [laneHeading, th.fg("warning", "ON-DEMAND RESEARCH · NOT A LIVE CALENDAR"), th.fg("dim", "W/S lane · Tab pane · J BRIEF · K WHY"), ""];
+			const left = [laneHeading, th.fg("warning", "ON-DEMAND RESEARCH · NOT A LIVE CALENDAR"), th.fg("dim", `${paneHint} · J BRIEF · K WHY`), ""];
 			for (const [index, candidate] of EVENT_LANES.entries()) {
 				const selected = index === this.selected;
 				left.push(`${selected ? th.bg("selectedBg", th.fg("accent", ">")) : " "} ${selected ? th.bold(th.fg("text", candidate.title)) : th.fg("muted", candidate.title)}`);
@@ -4230,7 +4496,7 @@ class MarketHub {
 			if (canvas) {
 				const storyWidth = Math.max(22, Math.floor(width * 0.39) - 1);
 				const rows = this.renderCanvasRows(canvas, storyWidth, th);
-				right.push(...this.eventViewport(rows, Math.max(1, bodyRows - right.length), th));
+				right.push(...this.eventViewport(rows, Math.max(1, bodyRows - right.length), storyWidth, th));
 			} else {
 				this.eventBriefingRows = 0;
 				this.eventBriefingViewportRows = 0;
@@ -4242,13 +4508,13 @@ class MarketHub {
 					th.fg("accent", "K · WHY"),
 					th.fg("muted", "Causal channels, alternative scenarios, triggers, and disconfirming evidence."),
 					"",
-					th.fg("dim", activeForLane ? `${this.researchJob!.activity.toUpperCase()} · verified blocks will appear here` : "No briefing cached for this lane and scope."),
+					th.fg("dim", activeForLane ? `${eventJob!.phase === "queued" ? "QUEUED" : eventJob!.activity.toUpperCase()} · verified blocks will appear here` : "No briefing cached for this lane and scope."),
 				);
 			}
 			lines.push(...twoColumn(left, right, width, bodyRows, 0.43));
 			return;
 		}
-		const compact: string[] = [fit(laneHeading), fit(th.fg("warning", "NOT A LIVE CALENDAR · J BRIEF · K WHY"))];
+		const compact: string[] = [fit(laneHeading), fit(th.fg("warning", "NOT A LIVE CALENDAR · J BRIEF · K WHY")), fit(th.fg("dim", paneHint))];
 		for (const [index, candidate] of EVENT_LANES.entries()) {
 			const selected = index === this.selected;
 			compact.push(fit(`${selected ? th.bg("selectedBg", th.fg("accent", ">")) : " "} ${selected ? th.bold(th.fg("text", candidate.shortLabel)) : th.fg("muted", candidate.shortLabel)}  ${th.fg("dim", laneStatus(candidate))}`));
@@ -4258,25 +4524,30 @@ class MarketHub {
 		if (metadata) compact.push(fit(th.fg("dim", metadata)));
 		if (canvas) {
 			const rows = this.renderCanvasRows(canvas, Math.max(20, width - 2), th);
-			compact.push(...this.eventViewport(rows, Math.max(1, bodyRows - compact.length), th).map(fit));
+			compact.push(...this.eventViewport(rows, Math.max(1, bodyRows - compact.length), Math.max(20, width - 2), th).map(fit));
 		} else {
 			this.eventBriefingRows = 0;
 			this.eventBriefingViewportRows = 0;
-			compact.push(fit(th.fg("muted", activeForLane ? `${this.researchJob!.activity.toUpperCase()} · verified blocks will appear here` : "J gets facts/dates · K gets mechanisms/scenarios")));
+			compact.push(fit(th.fg("muted", activeForLane ? `${eventJob!.phase === "queued" ? "QUEUED" : eventJob!.activity.toUpperCase()} · verified blocks will appear here` : "J gets facts/dates · K gets mechanisms/scenarios")));
 		}
 		lines.push(...stretchBlocks([compact], bodyRows, th.fg("borderMuted", "  │"), 0));
 	}
 
 	private renderMovers(lines: string[], width: number, th: Theme, fit: (text: string) => string, bodyRows: number): void {
 		const movers = this.snapshot.movers;
-		const heading = th.bold(th.fg("accent", "AUTO MOVERS"));
+		const eligible = eligibleMoverQuotes(this.snapshot.quotes).length;
+		const shownScope = CHART_SCOPE_CONFIGS[this.snapshot.chartScope].label;
+		const scopeState = this.loading && this.snapshot.chartScope !== this.chartScope
+			? `SHOWING ${shownScope} · SYNCING ${CHART_SCOPE_CONFIGS[this.chartScope].label}`
+			: `${shownScope} · ${recencyLabel(this.snapshot.updatedAt)}`;
+		const heading = th.bold(th.fg("accent", `AUTO MOVERS · TOP ${movers.length}/${MOVER_LIMIT} · ELIGIBLE ${eligible}/${MOVER_UNIVERSE.length} · ${scopeState}`));
 		const method = th.fg("dim", "LIQUID US UNIVERSE · 65% |MOVE| + 35% $VOLUME · R REFRESH");
 		if (movers.length === 0) {
 			lines.push(...stretchBlocks([[
 				fit(heading),
 				fit(method),
 				"",
-				fit(th.fg("muted", this.loading ? "Ranking delayed quotes…" : "No eligible movers available. Press R to retry.")),
+				fit(th.fg("muted", this.loading ? "Syncing delayed quotes…" : "No eligible movers available. Press R to retry.")),
 			]], bodyRows, th.fg("borderMuted", "  │"), 0));
 			return;
 		}
@@ -4303,7 +4574,7 @@ class MarketHub {
 			const left = [heading, method, "", ...window.items.map((mover, offset) => moverRow(mover, window.start + offset))];
 			if (window.items.length < movers.length) left.push(th.fg("dim", `MOVERS ${window.start + 1}–${window.start + window.items.length} / ${movers.length}`));
 			const right = [th.bold(th.fg("accent", "SELECTED MOVER")), selectedSummary, selectedMetrics, ""];
-			right.push(...chartLines(selectedQuote.points, Math.floor(width * 0.39), (text) => th.fg(chartTone, text), (text) => th.fg("dim", text), this.chartScope === "day" ? selectedQuote.previousClose : undefined, Math.max(2, Math.min(18, bodyRows - right.length - 2)), selectedQuote.pointTimes, selectedQuote.pointSessions, selectedQuote.timezone, selectedQuote.interval, (value) => dollars(value, selectedQuote.currency), undefined, undefined, this.chartScope));
+			right.push(...chartLines(selectedQuote.points, Math.floor(width * 0.39), (text) => th.fg(chartTone, text), (text) => th.fg("dim", text), selectedQuote.chartScope === "day" ? selectedQuote.previousClose : undefined, Math.max(2, Math.min(18, bodyRows - right.length - 2)), selectedQuote.pointTimes, selectedQuote.pointSessions, selectedQuote.timezone, selectedQuote.interval, (value) => dollars(value, selectedQuote.currency), undefined, undefined, selectedQuote.chartScope));
 			lines.push(...twoColumn(left, right, width, bodyRows));
 			return;
 		}
@@ -4314,17 +4585,19 @@ class MarketHub {
 		if (window.items.length < movers.length) listBlock.push(fit(th.fg("dim", `MOVERS ${window.start + 1}–${window.start + window.items.length} / ${movers.length}`)));
 		const detailBlock = [fit(selectedSummary), fit(selectedMetrics)];
 		if (bodyRows >= 18) {
-			for (const row of chartLines(selectedQuote.points, width, (text) => th.fg(chartTone, text), (text) => th.fg("dim", text), this.chartScope === "day" ? selectedQuote.previousClose : undefined, Math.max(2, Math.min(10, bodyRows - listBlock.length - 6)), selectedQuote.pointTimes, selectedQuote.pointSessions, selectedQuote.timezone, selectedQuote.interval, (value) => dollars(value, selectedQuote.currency), undefined, undefined, this.chartScope)) detailBlock.push(fit(row));
+			for (const row of chartLines(selectedQuote.points, width, (text) => th.fg(chartTone, text), (text) => th.fg("dim", text), selectedQuote.chartScope === "day" ? selectedQuote.previousClose : undefined, Math.max(2, Math.min(10, bodyRows - listBlock.length - 6)), selectedQuote.pointTimes, selectedQuote.pointSessions, selectedQuote.timezone, selectedQuote.interval, (value) => dollars(value, selectedQuote.currency), undefined, undefined, selectedQuote.chartScope)) detailBlock.push(fit(row));
 		}
 		lines.push(...stretchBlocks([listBlock, detailBlock], bodyRows, th.fg("borderMuted", "  │"), 1));
 	}
 
 	debugState() {
 		const entry = this.entries()[this.selected];
+		const researchJob = this.visibleResearchJob();
 		return {
 			mode: "market" as const,
 			screen: MARKET_SCREEN_NAMES[this.screen],
 			selectedIndex: this.selected,
+			selectedByScreen: [...this.selectedByScreen],
 			selected: entry?.type === "quote" ? entry.quote.symbol : entry?.type === "headline" ? entry.headline.title : entry?.type === "event" ? entry.lane.title : undefined,
 			available: this.entries().map((item) => item.type === "quote" ? item.quote.symbol : item.type === "headline" ? item.headline.title : item.lane.title),
 			chartScope: this.chartScope,
@@ -4350,6 +4623,9 @@ class MarketHub {
 			status: this.status,
 			loading: this.loading,
 			snapshotScope: this.snapshot.chartScope,
+			snapshotUpdatedAt: this.snapshot.updatedAt,
+			snapshotStatus: this.snapshotStatus(),
+			moverEligible: eligibleMoverQuotes(this.snapshot.quotes).length,
 			searching: this.searching,
 			searchQuery: this.searching ? this.searchQuery : undefined,
 			cacheDecision: this.cacheDecision ? { symbol: this.cacheDecision.request.symbol, researchKey: this.cacheDecision.request.researchKey, intent: this.cacheDecision.request.intent, asOf: this.cacheDecision.cached.updatedAt, chartScope: canvasScope(this.cacheDecision.cached) } : undefined,
@@ -4358,27 +4634,41 @@ class MarketHub {
 				count: archivedResearchFor("MARKET", this.chartScope, canvasResearchKey(this.archivedMarketCanvas)).length,
 				asOf: this.archivedMarketCanvas?.updatedAt,
 			} : undefined,
-			research: this.researchJob ? {
-				id: this.researchJob.id,
-				symbol: this.researchJob.symbol,
-				outcome: this.researchJob.outcome,
-				activity: this.researchJob.activity,
-				active: researchSlotHeld(this.researchJob),
-				publishedBlocks: this.researchJob.publishedBlocks,
-				chartScope: this.researchJob.chartScope,
-				researchKey: this.researchJob.researchKey,
-				intent: this.researchJob.intent,
+			research: researchJob ? {
+				id: researchJob.id,
+				symbol: researchJob.symbol,
+				outcome: researchJob.outcome,
+				phase: researchJob.phase,
+				activity: researchJob.activity,
+				active: researchSlotHeld(researchJob),
+				publishedBlocks: researchJob.publishedBlocks,
+				chartScope: researchJob.chartScope,
+				researchKey: researchJob.researchKey,
+				intent: researchJob.intent,
 			} : undefined,
+			researchQueue: this.knownResearchJobs().filter(researchSlotHeld).map((job) => ({ id: job.id, contextLabel: job.contextLabel, phase: job.phase })),
 		};
 	}
 
 	private renderWatch(lines: string[], width: number, th: Theme, fit: (text: string) => string, bodyRows: number): void {
 		const entries = this.entries();
+		const shownScope = CHART_SCOPE_CONFIGS[this.snapshot.chartScope].label;
+		const scopeState = this.loading && this.snapshot.chartScope !== this.chartScope
+			? `SHOWING ${shownScope} · SYNCING ${CHART_SCOPE_CONFIGS[this.chartScope].label}`
+			: `${shownScope} · ${recencyLabel(this.snapshot.updatedAt)}`;
+		const heading = th.bold(th.fg("accent", `WATCHLIST · ${entries.length}/${this.viewWatchlist.length} QUOTED · ${scopeState}`));
+		if (entries.length === 0) {
+			const message = this.viewWatchlist.length === 0
+				? "Watchlist is empty. Search / for a ticker, open it, then press E."
+				: this.loading ? "Loading watch quotes…" : "Watch quotes unavailable. Press R to retry.";
+			lines.push(...stretchBlocks([[fit(heading), "", fit(th.fg("muted", message))]], bodyRows, th.fg("borderMuted", "  │"), 0));
+			return;
+		}
 		if (width >= 84 && terminalRows(this.tui) >= 24) {
 			const reserveStatus = entries.length > Math.max(1, bodyRows - 3) ? 1 : 0;
 			const capacity = Math.max(1, bodyRows - 3 - reserveStatus);
 			const window = selectionWindow(entries, this.selected, capacity);
-			const left = [th.bold(th.fg("accent", "WATCHLIST")), th.fg("dim", "Session watch · J opens · K explains · E removes"), ""];
+			const left = [heading, th.fg("dim", "Session watch · J opens · K explains · E removes"), ""];
 			for (const [offset, entry] of window.items.entries()) {
 				if (entry.type !== "quote") continue;
 				const index = window.start + offset;
@@ -4392,15 +4682,16 @@ class MarketHub {
 			if (selected?.type === "quote") {
 				const direction = (selected.quote.change ?? 0) >= 0 ? "success" : "error";
 				const chartDirection = selected.quote.points.length >= 2 ? selected.quote.points.at(-1)! >= selected.quote.points[0]! ? "success" : "error" : direction;
-				right.push(`${th.bold(th.fg("text", selected.quote.symbol))} ${th.fg(direction, percent(selected.quote.changePercent))}`, "");
-				right.push(...chartLines(selected.quote.points, Math.floor(width * 0.39), (text) => th.fg(chartDirection, text), (text) => th.fg("dim", text), this.chartScope === "day" ? selected.quote.previousClose : undefined, Math.max(2, Math.min(18, bodyRows - 7)), selected.quote.pointTimes, selected.quote.pointSessions, selected.quote.timezone, selected.quote.interval, (value) => dollars(value, selected.quote.currency), undefined, undefined, this.chartScope));
+				right.push(`${th.bold(th.fg("text", selected.quote.symbol))} ${th.bold(th.fg("text", dollars(selected.quote.price, selected.quote.currency)))} ${th.fg(direction, percent(selected.quote.changePercent))}`);
+				right.push(th.fg("dim", `Day range ${dollars(selected.quote.dayLow, selected.quote.currency)} – ${dollars(selected.quote.dayHigh, selected.quote.currency)} · Volume ${compactNumber(selected.quote.volume)} · Quote ${relativeAge(selected.quote.updatedAt)}`), "");
+				right.push(...chartLines(selected.quote.points, Math.floor(width * 0.39), (text) => th.fg(chartDirection, text), (text) => th.fg("dim", text), selected.quote.chartScope === "day" ? selected.quote.previousClose : undefined, Math.max(2, Math.min(18, bodyRows - 7)), selected.quote.pointTimes, selected.quote.pointSessions, selected.quote.timezone, selected.quote.interval, (value) => dollars(value, selected.quote.currency), undefined, undefined, selected.quote.chartScope));
 			}
 			lines.push(...twoColumn(left, right, width, bodyRows));
 			return;
 		}
 		const capacity = bodyRows >= 18 ? Math.max(3, Math.floor(bodyRows * 0.42)) : Math.max(2, bodyRows - 7);
 		const window = selectionWindow(entries, this.selected, capacity);
-		const listBlock: string[] = [fit(th.bold(th.fg("accent", "WATCHLIST"))), fit(th.fg("dim", "Session watch · J opens · K explains · E removes"))];
+		const listBlock: string[] = [fit(heading), fit(th.fg("dim", "Session watch · J opens · K explains · E removes"))];
 		for (const [offset, entry] of window.items.entries()) {
 			if (entry.type !== "quote") continue;
 			const index = window.start + offset;
@@ -4414,10 +4705,10 @@ class MarketHub {
 		if (selected?.type === "quote") {
 			const direction = (selected.quote.change ?? 0) >= 0 ? "success" : "error";
 			const chartDirection = selected.quote.points.length >= 2 ? selected.quote.points.at(-1)! >= selected.quote.points[0]! ? "success" : "error" : direction;
-			const detailBlock: string[] = [fit(`${th.bold(th.fg("text", selected.quote.symbol))} ${th.fg(direction, percent(selected.quote.changePercent))}`)];
-			for (const row of chartLines(selected.quote.points, width, (text) => th.fg(chartDirection, text), (text) => th.fg("dim", text), this.chartScope === "day" ? selected.quote.previousClose : undefined, Math.max(2, Math.min(18, bodyRows - listBlock.length - 7)), selected.quote.pointTimes, selected.quote.pointSessions, selected.quote.timezone, selected.quote.interval, (value) => dollars(value, selected.quote.currency), undefined, undefined, this.chartScope)) detailBlock.push(fit(row));
+			const detailBlock: string[] = [fit(`${th.bold(th.fg("text", selected.quote.symbol))} ${th.bold(th.fg("text", dollars(selected.quote.price, selected.quote.currency)))} ${th.fg(direction, percent(selected.quote.changePercent))}`)];
+			for (const row of chartLines(selected.quote.points, width, (text) => th.fg(chartDirection, text), (text) => th.fg("dim", text), selected.quote.chartScope === "day" ? selected.quote.previousClose : undefined, Math.max(2, Math.min(18, bodyRows - listBlock.length - 7)), selected.quote.pointTimes, selected.quote.pointSessions, selected.quote.timezone, selected.quote.interval, (value) => dollars(value, selected.quote.currency), undefined, undefined, selected.quote.chartScope)) detailBlock.push(fit(row));
 			if (selected.quote.dayLow !== null || selected.quote.dayHigh !== null || selected.quote.volume !== null) {
-				detailBlock.push(fit(th.fg("dim", `Day range ${dollars(selected.quote.dayLow, selected.quote.currency)} – ${dollars(selected.quote.dayHigh, selected.quote.currency)}   Volume ${compactNumber(selected.quote.volume)}`)));
+				detailBlock.push(fit(th.fg("dim", `Day range ${dollars(selected.quote.dayLow, selected.quote.currency)} – ${dollars(selected.quote.dayHigh, selected.quote.currency)} · Volume ${compactNumber(selected.quote.volume)} · Quote ${relativeAge(selected.quote.updatedAt)}`)));
 			}
 			blocks.push(detailBlock);
 		}
@@ -4584,9 +4875,11 @@ let uiTest: {
 
 function createDebugResearchSimulation(autoAdvance: boolean): DebugResearchSimulation {
 	let component: UITestComponent | undefined;
-	let job: ResearchJob | undefined;
-	let canvas: Canvas | undefined;
-	let phase = 0;
+	const jobs = new Map<string, ResearchJob>();
+	const canvasesByJob = new Map<string, Canvas>();
+	const phases = new Map<string, number>();
+	const queue: string[] = [];
+	let runningId: string | undefined;
 	let sequence = 0;
 	let timers: Array<ReturnType<typeof setTimeout>> = [];
 
@@ -4594,13 +4887,15 @@ function createDebugResearchSimulation(autoAdvance: boolean): DebugResearchSimul
 		for (const timer of timers) clearTimeout(timer);
 		timers = [];
 	};
-	const emitJob = (patch: Partial<ResearchJob>) => {
-		if (!job) return;
-		job = { ...job, ...patch, updatedAt: Date.now() };
-		component?.setResearchJob(job);
+	const emitJob = (id: string, patch: Partial<ResearchJob>): ResearchJob | undefined => {
+		const job = jobs.get(id);
+		if (!job) return undefined;
+		const next = { ...job, ...patch, updatedAt: Date.now() };
+		jobs.set(id, next);
+		component?.setResearchJob(next);
+		return next;
 	};
-	const emitCanvas = (kind: "seed" | "extracted" | "complete") => {
-		if (!job) return;
+	const emitCanvas = (job: ResearchJob, kind: "seed" | "extracted" | "complete") => {
 		const fixture = makeTestCanvas(job.symbol, Date.now(), job.chartScope);
 		const fixtureBlocks = normalizeCanvasBlocks(fixture.blocks);
 		const useTechnicals = !isEventResearchKey(job.researchKey) && !job.researchKey.includes("/headline/");
@@ -4615,7 +4910,7 @@ function createDebugResearchSimulation(autoAdvance: boolean): DebugResearchSimul
 		} else {
 			blocks = contextualBlocks;
 		}
-		canvas = {
+		const canvas: Canvas = {
 			...fixture,
 			title: `${job.symbol} deterministic background research`,
 			blocks,
@@ -4625,45 +4920,67 @@ function createDebugResearchSimulation(autoAdvance: boolean): DebugResearchSimul
 			intent: job.intent,
 			contextLabel: job.contextLabel,
 		};
+		canvasesByJob.set(job.id, canvas);
 		component?.setCanvas(canvas);
-		emitJob({ publishedBlocks: blocks.length });
+		emitJob(job.id, { publishedBlocks: blocks.length });
+	};
+	const dispatchNext = () => {
+		if (runningId) return;
+		while (queue.length > 0) {
+			const id = queue.shift()!;
+			const job = jobs.get(id);
+			if (!job || !researchSlotHeld(job) || job.phase !== "queued") continue;
+			runningId = id;
+			emitJob(id, { phase: "dispatched" });
+			return;
+		}
 	};
 
 	const advance = () => {
-		if (!job || !job.slotHeld) return;
-		if (job.outcome === "cancelled") {
-			emitJob({ slotHeld: false, settledAt: Date.now() });
+		dispatchNext();
+		if (!runningId) return;
+		const job = jobs.get(runningId);
+		if (!job || !job.slotHeld) {
+			runningId = undefined;
+			dispatchNext();
 			return;
 		}
+		if (job.outcome === "cancelled") {
+			emitJob(job.id, { phase: "settled", slotHeld: false, settledAt: Date.now() });
+			runningId = undefined;
+			dispatchNext();
+			return;
+		}
+		const phase = phases.get(job.id) ?? 0;
 		if (phase === 0) {
-			phase = 1;
-			emitJob({ outcome: "running", activity: "seeding" });
+			phases.set(job.id, 1);
+			emitJob(job.id, { phase: "running", outcome: "running", activity: "seeding" });
 		} else if (phase === 1) {
-			phase = 2;
-			emitCanvas("seed");
-			emitJob({ outcome: "partial", activity: "fetching" });
+			phases.set(job.id, 2);
+			emitCanvas(job, "seed");
+			emitJob(job.id, { outcome: "partial", activity: "fetching" });
 		} else if (phase === 2) {
-			phase = 3;
-			emitCanvas("extracted");
-			emitJob({ outcome: "partial", activity: "extracting" });
+			phases.set(job.id, 3);
+			emitCanvas(job, "extracted");
+			emitJob(job.id, { outcome: "partial", activity: "extracting" });
 		} else if (phase === 3) {
-			phase = 4;
-			emitCanvas("complete");
-			emitJob({ outcome: "complete", activity: "synthesizing" });
+			phases.set(job.id, 4);
+			emitCanvas(job, "complete");
+			emitJob(job.id, { outcome: "complete", activity: "synthesizing" });
 		} else {
-			phase = 5;
-			emitJob({ slotHeld: false, settledAt: Date.now() });
+			phases.set(job.id, 5);
+			emitJob(job.id, { phase: "settled", slotHeld: false, settledAt: Date.now() });
+			runningId = undefined;
+			dispatchNext();
 		}
 	};
 
 	const actions: ResearchActions = {
 		start(request) {
-			if (job?.slotHeld) return { accepted: false, status: `RESEARCH ${job.symbol} ALREADY ACTIVE`, job };
-			clearTimers();
+			const duplicate = [...jobs.values()].find((job) => researchSlotHeld(job) && researchIdentityKey(job) === researchIdentityKey(request));
+			if (duplicate) return { accepted: false, status: `RESEARCH ${duplicate.contextLabel} ALREADY ACTIVE`, job: duplicate };
 			const now = Date.now();
-			phase = 0;
-			canvas = undefined;
-			job = {
+			const job: ResearchJob = {
 				id: `debug-${now.toString(36)}-${(++sequence).toString(36)}`,
 				symbol: request.symbol,
 				question: request.question,
@@ -4673,24 +4990,34 @@ function createDebugResearchSimulation(autoAdvance: boolean): DebugResearchSimul
 				startedAt: now,
 				updatedAt: now,
 				slotHeld: true,
+				phase: "queued",
 				publishedBlocks: 0,
 				chartScope: request.chartScope,
 				researchKey: request.researchKey,
 				intent: request.intent,
 				contextLabel: request.contextLabel,
 			};
+			jobs.set(job.id, job);
+			phases.set(job.id, 0);
+			queue.push(job.id);
 			component?.setResearchJob(job);
+			dispatchNext();
 			if (autoAdvance) {
-				for (const delay of [300, 750, 1_300, 1_900, 2_300]) timers.push(setTimeout(advance, delay));
+				for (const delay of [300, 750, 1_300, 1_900, 2_300, 2_700]) timers.push(setTimeout(advance, delay));
 			}
-			return { accepted: true, status: `DEBUG RESEARCH ${job.symbol} QUEUED`, job };
+			return { accepted: true, status: `DEBUG RESEARCH ${job.contextLabel} QUEUED`, job: jobs.get(job.id) ?? job };
 		},
-		cancel() {
+		cancel(jobId) {
+			const job = jobId ? jobs.get(jobId) : undefined;
 			if (!job?.slotHeld) return { accepted: false, status: "NO ACTIVE DEBUG RESEARCH", job };
-			clearTimers();
-			emitJob({ outcome: "cancelled", error: undefined });
+			if (job.phase === "queued") {
+				const settled = emitJob(job.id, { phase: "settled", outcome: "cancelled", slotHeld: false, settledAt: Date.now(), error: undefined });
+				dispatchNext();
+				return { accepted: true, status: `DEBUG RESEARCH ${job.contextLabel} CANCELLED`, job: settled };
+			}
+			const cancelled = emitJob(job.id, { phase: "cancelling", outcome: "cancelled", error: undefined });
 			if (autoAdvance) timers.push(setTimeout(advance, 250));
-			return { accepted: true, status: `DEBUG RESEARCH ${job.symbol} CANCELLING`, job };
+			return { accepted: true, status: `DEBUG RESEARCH ${job.contextLabel} CANCELLING`, job: cancelled };
 		},
 	};
 
@@ -4698,8 +5025,8 @@ function createDebugResearchSimulation(autoAdvance: boolean): DebugResearchSimul
 		actions,
 		attach(next) {
 			component = next;
-			if (job) next.setResearchJob(job);
-			if (canvas) next.setCanvas(canvas);
+			for (const job of jobs.values()) next.setResearchJob(job);
+			for (const canvas of canvasesByJob.values()) next.setCanvas(canvas);
 		},
 		advance,
 		dispose() {
@@ -4856,8 +5183,8 @@ async function openMarketPanel(
 ): Promise<TerminalResult | undefined> {
 	let quote: Quote | undefined;
 	let initialError: string | undefined;
-	const initialResearch = researchJobFor(symbol);
-	const scope = initialArchivedCanvas?.chartScope ?? (researchSlotHeld(initialResearch) ? initialResearch!.chartScope : initialScope);
+	const scope = initialArchivedCanvas?.chartScope ?? initialScope;
+	const initialResearch = [...researchJobs.values()].filter((job) => job.symbol === symbol && job.chartScope === scope).sort((a, b) => b.startedAt - a.startedAt)[0];
 	const initialLiveCanvas = researchSlotHeld(initialResearch)
 		? canvasForResearch(symbol, scope, initialResearch!.researchKey)
 		: latestCanvasForDisplay(symbol, scope, (canvas) => isTickerResearchKey(canvasResearchKey(canvas)));
@@ -4902,8 +5229,8 @@ async function openMarketMap(
 	initialArchivedCanvas?: Canvas,
 	initialNavigation?: MarketHubNavigationState,
 ): Promise<TerminalResult | undefined> {
-	const initialResearch = researchJobFor("MARKET");
-	const scope = initialArchivedCanvas?.chartScope ?? initialNavigation?.chartScope ?? (researchSlotHeld(initialResearch) ? initialResearch!.chartScope : DEFAULT_CHART_SCOPE);
+	const scope = initialArchivedCanvas?.chartScope ?? initialNavigation?.chartScope ?? DEFAULT_CHART_SCOPE;
+	const initialResearch = [...researchJobs.values()].filter((job) => job.symbol === "MARKET" && job.chartScope === scope).sort((a, b) => b.startedAt - a.startedAt)[0];
 	const initialLiveCanvas = researchSlotHeld(initialResearch) && isSignalsResearchKey(initialResearch!.researchKey)
 		? canvasForResearch("MARKET", scope, initialResearch!.researchKey)
 		: latestCanvasForDisplay("MARKET", scope, (canvas) => isSignalsResearchKey(canvasResearchKey(canvas)));
@@ -5152,52 +5479,91 @@ export default function (pi: ExtensionAPI) {
 		].join(" ");
 	};
 
+	const pumpResearchQueue = (ctx: ExtensionContext): void => {
+		if (runningResearchId || !ctx.isIdle() || ctx.hasPendingMessages()) return;
+		while (researchQueue.length > 0) {
+			const id = researchQueue.shift()!;
+			const queued = researchJobs.get(id);
+			if (!queued || !researchSlotHeld(queued) || queued.phase !== "queued") continue;
+			runningResearchId = id;
+			const dispatched = updateResearchJob(id, { phase: "dispatched", outcome: "queued", activity: "seeding" });
+			if (!dispatched) {
+				runningResearchId = undefined;
+				continue;
+			}
+			try {
+				pi.sendUserMessage(researchPrompt(dispatched), { deliverAs: "followUp" });
+				return;
+			} catch (error) {
+				const message = cleanText(error instanceof Error ? error.message : String(error)).slice(0, 180);
+				settleResearchJob(id, { outcome: "failed", error: message || "Could not dispatch agent" });
+			}
+		}
+	};
+
+	const scheduleResearchPump = (ctx: ExtensionContext): void => {
+		queueMicrotask(() => pumpResearchQueue(ctx));
+	};
+
 	const researchActions = (ctx: ExtensionContext): ResearchActions => ({
 		promptForCache: true,
 		start(request) {
-			const current = activeResearchJob();
-			if (current) {
+			const duplicate = activeResearchJobForIdentity(request);
+			if (duplicate) {
 				return {
 					accepted: false,
-					status: `RESEARCH ${current.symbol} ALREADY ACTIVE · ${current.activity.toUpperCase()}`,
-					job: current,
+					status: `RESEARCH ${duplicate.contextLabel} ALREADY ${duplicate.phase.toUpperCase()} · [C] CANCEL`,
+					job: duplicate,
 				};
 			}
-			if (!ctx.isIdle() || ctx.hasPendingMessages()) return { accepted: false, status: "AGENT BUSY · WAIT BEFORE STARTING RESEARCH" };
+			if (activeResearchJobs().length >= 24) return { accepted: false, status: "RESEARCH QUEUE FULL · CANCEL OR WAIT FOR A JOB" };
 			const job = createResearchJob(request);
-			if (!job) return { accepted: false, status: "ANOTHER RESEARCH JOB IS ACTIVE", job: activeResearchJob() };
-			try {
-				pi.sendUserMessage(researchPrompt(job));
-				return { accepted: true, status: `RESEARCH ${job.contextLabel} QUEUED · [C] CANCEL`, job };
-			} catch (error) {
-				const message = cleanText(error instanceof Error ? error.message : String(error)).slice(0, 180);
-				const failed = settleResearchJob(job.id, { outcome: "failed", error: message || "Could not dispatch agent" });
-				return { accepted: false, status: `RESEARCH DISPATCH FAILED · ${message || "unknown error"}`, job: failed };
-			}
+			if (!job) return { accepted: false, status: "THIS RESEARCH JOB IS ALREADY ACTIVE", job: activeResearchJobForIdentity(request) };
+			pumpResearchQueue(ctx);
+			const current = researchJobs.get(job.id) ?? job;
+			return { accepted: true, status: `${researchStatusLine(current)} · ${researchQueueLabel()}`, job: current };
 		},
-		cancel() {
-			const job = activeResearchJob();
-			if (!job) return { accepted: false, status: "NO ACTIVE RESEARCH JOB" };
-			if (job.outcome === "cancelled") return { accepted: false, status: `RESEARCH ${job.symbol} IS CANCELLING`, job };
-			const cancelled = updateResearchJob(job.id, { outcome: "cancelled", error: undefined });
+		cancel(jobId) {
+			const job = jobId ? researchJobs.get(jobId) : undefined;
+			if (!job || !researchSlotHeld(job)) return { accepted: false, status: "NO ACTIVE RESEARCH FOR CURRENT SELECTION", job };
+			if (job.phase === "cancelling") return { accepted: false, status: `RESEARCH ${job.contextLabel} IS CANCELLING`, job };
+			if (job.phase === "queued") {
+				const cancelled = settleResearchJob(job.id, { outcome: "cancelled", error: undefined });
+				pumpResearchQueue(ctx);
+				return { accepted: true, status: `RESEARCH ${job.contextLabel} CANCELLED IN QUEUE`, job: cancelled };
+			}
+			const cancelled = updateResearchJob(job.id, { phase: "cancelling", outcome: "cancelled", error: undefined });
 			ctx.abort();
-			return { accepted: true, status: `RESEARCH ${job.symbol} CANCELLING…`, job: cancelled };
+			return { accepted: true, status: `RESEARCH ${job.contextLabel} CANCELLING…`, job: cancelled };
 		},
 	});
 
 	const correlatedResearchJob = (rawId: unknown, expectedSymbol?: string): ResearchJob | undefined => {
 		const id = typeof rawId === "string" ? cleanText(rawId).slice(0, 160).trim() : "";
-		const active = activeResearchJob();
+		const active = runningResearchJob();
 		if (!id) {
 			if (active) throw new Error(`Active background research requires research_id=${active.id}`);
 			return undefined;
 		}
 		const job = researchJobs.get(id);
-		if (!job || activeResearchId !== id || job.settledAt !== undefined) throw new Error(`Stale or unknown research_id: ${id}`);
+		if (!job || runningResearchId !== id || job.phase === "settled" || job.settledAt !== undefined) throw new Error(`Stale or unknown research_id (possibly queued): ${id}`);
 		if (job.outcome === "cancelled") throw new Error(`Research job ${id} was cancelled`);
 		if (job.outcome === "complete") throw new Error(`Research job ${id} already published a complete canvas`);
 		if (expectedSymbol && job.symbol !== expectedSymbol) throw new Error(`research_id ${id} belongs to ${job.symbol}, not ${expectedSymbol}`);
 		return job;
+	};
+
+	const writableResearchJob = (job: ResearchJob): ResearchJob | undefined => {
+		const current = researchJobs.get(job.id);
+		return current && runningResearchId === job.id && researchSlotHeld(current)
+			&& current.phase !== "cancelling" && current.outcome !== "cancelled" && current.outcome !== "complete"
+			? current : undefined;
+	};
+
+	const requireWritableResearchJob = (job: ResearchJob): ResearchJob => {
+		const current = writableResearchJob(job);
+		if (!current) throw new Error(`Research job ${job.id} is no longer writable`);
+		return current;
 	};
 
 	const publishDiscoverySeed = (
@@ -5206,8 +5572,8 @@ export default function (pi: ExtensionAPI) {
 		challenge?: string,
 	): Canvas | undefined => {
 		if (!job || (candidates.length === 0 && !challenge)) return undefined;
-		const current = researchJobs.get(job.id);
-		if (!current || activeResearchId !== job.id || current.outcome === "cancelled" || current.outcome === "complete" || current.settledAt !== undefined) return undefined;
+		const current = writableResearchJob(job);
+		if (!current) return undefined;
 		const blocks: CanvasBlock[] = [];
 		if (candidates.length > 0) {
 			blocks.push({
@@ -5236,9 +5602,9 @@ export default function (pi: ExtensionAPI) {
 			chartScope: job.chartScope,
 			researchKey: job.researchKey,
 			intent: job.intent,
-			contextLabel: job.contextLabel,
+			contextLabel: current.contextLabel,
 		}, true);
-		updateResearchJob(job.id, {
+		updateResearchJob(current.id, {
 			outcome: "partial",
 			activity: "fetching",
 			error: undefined,
@@ -5266,18 +5632,21 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", (_event, ctx) => restoreSessionState(ctx));
 	pi.on("session_tree", (_event, ctx) => restoreSessionState(ctx));
 	pi.on("agent_start", () => {
-		const job = activeResearchJob();
-		if (job && job.outcome !== "cancelled") updateResearchJob(job.id, { outcome: "running", activity: "seeding" });
+		const job = runningResearchJob();
+		if (job?.phase === "dispatched" && job.outcome !== "cancelled") updateResearchJob(job.id, { phase: "running", outcome: "running", activity: "seeding" });
 	});
 	pi.on("tool_execution_start", (event) => {
-		const job = activeResearchJob();
+		const job = runningResearchJob();
 		if (!job || job.outcome === "cancelled") return;
+		toolResearchJobs.set(event.toolCallId, job.id);
 		const activity = activityForTool(event.toolName, event.args);
 		updateResearchJob(job.id, { ...(activity ? { activity } : {}), toolName: event.toolName });
 	});
 	pi.on("tool_execution_end", (event) => {
-		const job = activeResearchJob();
-		if (!job || job.outcome === "cancelled" || !event.isError) return;
+		const jobId = toolResearchJobs.get(event.toolCallId);
+		toolResearchJobs.delete(event.toolCallId);
+		const job = jobId ? researchJobs.get(jobId) : undefined;
+		if (!job || !researchSlotHeld(job) || job.outcome === "cancelled" || !event.isError) return;
 		let rawResult = "Tool failed";
 		try {
 			rawResult = typeof event.result === "string" ? event.result : JSON.stringify(event.result ?? "Tool failed");
@@ -5288,19 +5657,21 @@ export default function (pi: ExtensionAPI) {
 		updateResearchJob(job.id, { error: `${event.toolName}: ${message || "tool failed"}` });
 	});
 	pi.on("agent_settled", (_event, ctx) => {
-		const job = activeResearchJob();
-		if (!job) return;
-		let patch: Partial<ResearchJob> = {};
-		if (job.outcome === "queued" || job.outcome === "running") {
-			patch = { outcome: "failed", error: job.error || "No research canvas was published" };
-		} else if (job.outcome === "partial" && !job.error) {
-			patch = { error: "Agent settled before a complete canvas was published" };
+		const job = runningResearchJob();
+		if (job) {
+			let patch: Partial<ResearchJob> = {};
+			if (job.outcome === "queued" || job.outcome === "running") {
+				patch = { outcome: "failed", error: job.error || "No research canvas was published" };
+			} else if (job.outcome === "partial" && !job.error) {
+				patch = { error: "Agent settled before a complete canvas was published" };
+			}
+			const settled = settleResearchJob(job.id, patch);
+			if (settled && ctx.mode === "tui" && !activeTerminal) {
+				const level = settled.outcome === "failed" ? "error" : settled.outcome === "cancelled" || settled.outcome === "partial" ? "warning" : "info";
+				ctx.ui.notify(researchStatusLine(settled) || `${settled.symbol} research settled`, level);
+			}
 		}
-		const settled = settleResearchJob(job.id, patch);
-		if (settled && ctx.mode === "tui" && !activeTerminal) {
-			const level = settled.outcome === "failed" ? "error" : settled.outcome === "cancelled" || settled.outcome === "partial" ? "warning" : "info";
-			ctx.ui.notify(researchStatusLine(settled) || `${settled.symbol} research settled`, level);
-		}
+		if (!ctx.hasPendingMessages()) scheduleResearchPump(ctx);
 	});
 
 	pi.registerTool({
@@ -5311,8 +5682,8 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Use market_ui_test only when asked to test or review the /market UI/UX.",
 			"Use market_ui_test state and press actions to verify a complete keyboard path before reporting a UI/UX conclusion.",
-			"To test background research deterministically, open with background=true, press J/K, then call advance_research for each lifecycle step; use button_c for cancellation.",
-			"Use button_e to verify ticker watch toggling, button_b for ticker back navigation, focus_next for SIGNALS pane focus, and history_older/history_newer for archive navigation.",
+			"To test background research deterministically, open with background=true, launch distinct J/K or EVENT-lane jobs, then call advance_research for each FIFO lifecycle step; button_c cancels the currently visible context.",
+			"Verify that EVENT lane focus and A/D screen navigation remain usable while jobs run. Use button_e for watch toggling, button_b for ticker back navigation, focus_next for SIGNALS/EVENTS pane focus, and history_older/history_newer for archive navigation.",
 		],
 		parameters: Type.Object({
 			action: StringEnum(["open_market", "open_ticker", "state", "press", "reset", "load_canvas", "advance_research"] as const),
@@ -5427,6 +5798,7 @@ export default function (pi: ExtensionAPI) {
 				throw new Error(`chart_scope=${params.chart_scope} does not match the active research job scope (${job.chartScope})`);
 			}
 			const quote = await fetchQuote(targetSymbol, chartScope, signal);
+			if (job) requireWritableResearchJob(job);
 			const snapshot = technicalSnapshot(quote);
 			const blocks = normalizeCanvasBlocks(technicalCanvasBlocks(snapshot));
 			let canvas: Canvas | undefined;
