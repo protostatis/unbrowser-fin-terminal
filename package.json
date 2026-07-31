@@ -2,15 +2,14 @@
   "name": "market-terminal-webui",
   "version": "0.1.0",
   "private": true,
-  "description": "Web UI projection of the Pi market-terminal extension — extension logic runs unchanged.",
+  "description": "Keyboard-first Pi market terminal with a browser projection of its canonical extension.",
   "type": "module",
   "scripts": {
     "dev": "concurrently -n server,web -c blue,green \"npm run dev:server\" \"npm run dev:web\"",
     "dev:server": "tsx watch server/index.ts",
     "dev:web": "vite",
     "build": "tsc -p tsconfig.server.json && vite build",
-    "typecheck": "tsc -p tsconfig.server.json --noEmit && tsc -p web/tsconfig.json --noEmit",
-    "verify-extension-unchanged": "diff -q .pi/extensions/market-terminal.ts ../unbrowser-fin-terminal/.pi/extensions/market-terminal.ts && echo 'extension byte-identical to source worktree' || (echo 'EXTENSION MODIFIED — must stay unchanged' && exit 1)"
+    "typecheck": "tsc -p tsconfig.extension.json --noEmit && tsc -p tsconfig.server.json --noEmit && tsc -p web/tsconfig.json --noEmit"
   },
   "dependencies": {
     "@earendil-works/pi-ai": "0.83.0",

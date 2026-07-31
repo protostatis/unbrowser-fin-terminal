@@ -1,5 +1,5 @@
 /**
- * SPIKE — prove the in-process Pi SDK can host the UNCHANGED market-terminal
+ * SPIKE — prove the in-process Pi SDK can host the canonical market-terminal
  * extension, bind our UI, open /market, render, and drive a real J-triggered
  * research job (agent_start → market_technicals/discover → market_canvas
  * stage=partial → live canvas update).

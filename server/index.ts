@@ -2,21 +2,22 @@
  * Market Terminal web backend — Express + WebSocket.
  *
  * Architecture: a REAL in-process Pi agent session (createAgentSession) hosts
- * the UNCHANGED `.pi/extensions/market-terminal.ts`. The session IS the
+ * the canonical `.pi/extensions/market-terminal.ts`. The session IS the
  * ExtensionAPI (agent, tools, events, pi.exec, pi.sendUserMessage, model/auth).
  * We only supply the UI surface (server/web-ui.ts) so the extension's
  * `ctx.ui.custom()` hands us the live panel, whose `render()` we convert
  * (ANSI→HTML) and stream to the browser. Research (J/K) runs the real agent in
  * the same process, so canvases flow live to the same panel.
  *
- * The extension file (.pi/extensions/market-terminal.ts) is never edited.
+ * The same extension file powers both Pi's TUI and this browser projection.
  */
 
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { existsSync } from "node:fs";
+import type { IncomingMessage } from "node:http";
 import express from "express";
-import { WebSocketServer, type WebSocket } from "ws";
+import { WebSocket, WebSocketServer } from "ws";
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -31,11 +32,74 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const CWD = path.resolve(__dirname, "..");
 
+const PORT = Number(process.env.PORT ?? 8787);
+const HOST = process.env.HOST?.trim() || "127.0.0.1";
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+const CLIENT_REPLACED_CLOSE_CODE = 4001;
+
+function parseAllowedOrigins(raw: string | undefined): Set<string> | null {
+  if (raw === undefined) return null;
+  const entries = raw.split(",").map((entry) => entry.trim()).filter(Boolean);
+  if (entries.length === 0) throw new Error("ALLOWED_ORIGINS must not be empty when set");
+
+  const origins = new Set<string>();
+  for (const entry of entries) {
+    let parsed: URL;
+    try {
+      parsed = new URL(entry);
+    } catch {
+      throw new Error(`Invalid ALLOWED_ORIGINS entry: ${entry}`);
+    }
+    if (
+      (parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
+      parsed.origin !== entry
+    ) {
+      throw new Error(`ALLOWED_ORIGINS entries must be canonical HTTP(S) origins: ${entry}`);
+    }
+    origins.add(parsed.origin);
+  }
+  return origins;
+}
+
+const allowedOrigins = parseAllowedOrigins(process.env.ALLOWED_ORIGINS);
+if (!LOOPBACK_HOSTS.has(HOST) && !allowedOrigins) {
+  throw new Error(
+    "Refusing a non-loopback HOST without ALLOWED_ORIGINS. Remote deployment also requires authentication.",
+  );
+}
+
+function isAllowedWebSocketRequest(req: IncomingMessage): boolean {
+  const originValues: string[] = [];
+  for (let i = 0; i < req.rawHeaders.length; i += 2) {
+    if (req.rawHeaders[i]?.toLowerCase() === "origin") {
+      originValues.push(req.rawHeaders[i + 1] ?? "");
+    }
+  }
+  if (originValues.length !== 1 || originValues[0] === "null") return false;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(originValues[0]);
+  } catch {
+    return false;
+  }
+  if (
+    (parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
+    parsed.origin !== originValues[0]
+  ) {
+    return false;
+  }
+
+  if (allowedOrigins) return allowedOrigins.has(parsed.origin);
+  return LOOPBACK_HOSTS.has(parsed.hostname);
+}
+
 // ==========================================================================
 // 1. Connection state (single active web client; the session is a singleton)
 // ==========================================================================
 
 let activePanel: Panel | null = null;
+let activeClient: WebSocket | null = null;
 let cols = 120;
 let sendToClient: (msg: object) => void = () => {};
 let renderScheduled = false;
@@ -73,6 +137,11 @@ const web = createWebUi({
 const pendingSelects = new Map<string, { resolve: (v: string | undefined) => void }>();
 function waitForSelect(id: string): Promise<string | undefined> {
   return new Promise((resolve) => pendingSelects.set(id, { resolve }));
+}
+
+function cancelPendingSelects(): void {
+  for (const [, pending] of pendingSelects) pending.resolve(undefined);
+  pendingSelects.clear();
 }
 
 // ==========================================================================
@@ -128,9 +197,8 @@ if (existsSync(webDist)) {
   );
 }
 
-const PORT = Number(process.env.PORT ?? 8787);
-const server = app.listen(PORT, async () => {
-  console.log(`[server] Listening on http://localhost:${PORT}`);
+const server = app.listen(PORT, HOST, async () => {
+  console.log(`[server] Listening on http://${HOST}:${PORT}`);
 });
 
 // ==========================================================================
@@ -140,11 +208,35 @@ const server = app.listen(PORT, async () => {
 let session: AgentSession | undefined;
 let panelOpening = false;
 
-const wss = new WebSocketServer({ server, path: "/ws" });
+const wss = new WebSocketServer({
+  server,
+  path: "/ws",
+  maxPayload: 64 * 1024,
+  verifyClient: ({ req }, done) => {
+    if (isAllowedWebSocketRequest(req)) {
+      done(true);
+      return;
+    }
+    console.warn("[ws] rejected connection with invalid or disallowed Origin");
+    done(false, 403, "Forbidden");
+  },
+});
 
 wss.on("connection", (ws: WebSocket) => {
   console.log("[ws] client connected");
+  const previousClient = activeClient;
+  activeClient = ws;
+  if (previousClient && previousClient.readyState === WebSocket.OPEN) {
+    // A dedicated application close code tells the old browser tab not to
+    // reconnect automatically and steal the singleton session back.
+    cancelPendingSelects();
+    previousClient.close(
+      CLIENT_REPLACED_CLOSE_CODE,
+      "Replaced by a newer market-terminal client",
+    );
+  }
   sendToClient = (msg) => {
+    if (activeClient !== ws || ws.readyState !== WebSocket.OPEN) return;
     try {
       ws.send(JSON.stringify(msg));
     } catch {
@@ -154,8 +246,13 @@ wss.on("connection", (ws: WebSocket) => {
 
   // Open the Market Map for this client (no-op if one is already opening/open).
   openMarket();
+  // Reconnecting to an existing singleton panel must immediately replay its
+  // current frame; otherwise the new client stays blank until another input or
+  // render event happens to arrive.
+  if (activePanel) pushFrame();
 
   ws.on("message", (raw) => {
+    if (activeClient !== ws) return;
     let msg: any;
     try {
       msg = JSON.parse(raw.toString());
@@ -195,9 +292,11 @@ wss.on("connection", (ws: WebSocket) => {
 
   ws.on("close", () => {
     console.log("[ws] client disconnected");
+    if (activeClient !== ws) return;
+    activeClient = null;
+    sendToClient = () => {};
     // Reject any pending selects so they don't leak.
-    for (const [, p] of pendingSelects) p.resolve(undefined);
-    pendingSelects.clear();
+    cancelPendingSelects();
   });
 
   ws.on("error", (err) => console.warn("[ws] error:", err.message));
@@ -229,6 +328,9 @@ function openMarket(args = ""): void {
 bootSession()
   .then((s) => {
     session = s;
+    // A browser can connect before the agent session finishes booting. Its
+    // first openMarket() call is then a no-op, so retry once the session exists.
+    if (wss.clients.size > 0) openMarket();
   })
   .catch((err) => {
     console.error("[server] FAILED to boot agent session:", err instanceof Error ? err.stack ?? err.message : err);

@@ -2,11 +2,13 @@
 
 ## Goal
 
-Run the Pi Market Terminal extension **byte-for-byte unchanged** and project its
-existing terminal rendering into a browser. The same `render()` and
-`handleInput()` logic that powers the TUI must produce the web layout.
+Run the canonical Pi Market Terminal extension directly and project its
+terminal rendering into a browser. The same `render()` and `handleInput()`
+logic that powers the TUI must produce the web layout.
 
-Hard constraint: **`.pi/extensions/market-terminal.ts` is never edited.**
+Hard constraint: **the web UI must not fork or copy
+`.pi/extensions/market-terminal.ts`.** Extension improvements apply to both
+the TUI and browser projection.
 
 ## Why this is possible (findings)
 
@@ -33,7 +35,7 @@ Hard constraint: **`.pi/extensions/market-terminal.ts` is never edited.**
    implementation triggers a re-render push and reports the browser viewport's
    row count.
 
-Net: the **identical** layout/composition/scroll/chart-positioning code executes;
+Net: the **same** layout/composition/scroll/chart-positioning code executes;
 only the color/token encoding and the transport change.
 
 ## Architecture
@@ -43,7 +45,7 @@ Browser (React + Vite)              Node backend (Express + ws)
 +-----------------------+           +------------------------------+
 | Terminal panel        |  <--ws--- | Pi-harness                   |
 |  monospace row grid   |           |  real @earendil-works deps   |
-|  CSS from <span> cls  |           |  market-terminal.ts UNCHANGED|
+|  CSS from <span> cls  |           |  canonical market-terminal.ts|
 | Keyboard capture      |  --ws-->  |  input listener -> handleInput|
 | Resize -> cols/rows   |  --ws-->  |  webTui.terminal.rows = rows |
 | (opt) SVG chart layer |  <-rest-- | data-layer tools (quotes,    |
@@ -319,13 +321,14 @@ both cases — it reads both for most keys, so either works).
 
 ## Verification
 
-1. `npm install` succeeds; `tsc --noEmit` passes for both server and web.
+1. `npm install` succeeds; `npm run typecheck` passes for the extension, server,
+   and web client.
 2. `npm run dev` starts backend + Vite; browser opens Market Map.
 3. Arrow keys / `J` / `K` / `R` / `Q` behave identically to the TUI.
 4. Resize the browser; rows/width update and layout reflows like the terminal.
 5. `/market-debug AAPL canvas` shows the fixture canvas in the browser.
-6. Diff check: `.pi/extensions/market-terminal.ts` is byte-identical to the
-   source worktree (asserted by a `verify-extension-unchanged` npm script).
+6. `npm run build` and deterministic extension/runtime checks pass without
+   maintaining a separate browser-specific extension copy.
 
 ## Implementation status (built)
 
@@ -335,7 +338,7 @@ Two layers, both verified:
 The original `PiHarness` (a fake `ExtensionAPI` with no agent) is gone. The
 backend now creates a **real** `AgentSession` via `createAgentSession()` from
 `@earendil-works/pi-coding-agent`. `DefaultResourceLoader({ cwd })` discovers
-the unchanged `.pi/extensions/market-terminal.ts`; `session.bindExtensions({
+the canonical `.pi/extensions/market-terminal.ts`; `session.bindExtensions({
 uiContext: <our web-ui shim>, mode: "tui" })` plugs in our UI. The session IS
 the `ExtensionAPI` — it owns the agent, tools, `pi.exec`, `pi.sendUserMessage`,
 events, and model/auth (resolved from `~/.pi/agent`). We only implement the
@@ -356,7 +359,7 @@ machine advancing on real `pi.on` events.
   `select` (+ Proxy no-ops for the rest), `webTui` with microtask render coalescing.
 - `server/index.ts` — Express + WebSocket: boots the SDK session, serves
   `dist-web/` at `/`, streams ANSI→HTML frames, routes input/resize/command/select.
-- `web/` — React + Vite (unchanged by this pivot): `TerminalFrame`, `keyboard.ts`
+- `web/` — React + Vite: `TerminalFrame`, `keyboard.ts`
   (DOM→extension key strings), `socket.ts`, `main.tsx` (viewport-exact sizing),
   `styles.css`.
 

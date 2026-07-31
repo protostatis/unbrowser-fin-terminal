@@ -8,9 +8,19 @@
 export function keyToData(e: KeyboardEvent): string | null {
   // Ignore keys when the user is typing in an interactive element so that
   // browser-native inputs (search, select prompt) work without interference.
-  const target = e.target as HTMLElement;
-  const tag = target.tagName?.toLowerCase();
-  if (tag === "input" || tag === "textarea" || tag === "select") return null;
+  const target = e.target;
+  if (
+    target instanceof Element &&
+    target.closest(
+      'input, textarea, select, button, a[href], [contenteditable="true"]',
+    )
+  )
+    return null;
+
+  // Preserve browser and OS shortcuts (Cmd/Ctrl+R, Cmd/Ctrl+L, Alt+Left,
+  // copy/paste, etc.) instead of turning them into terminal commands. Shift is
+  // intentionally allowed because it determines printable character casing.
+  if (e.metaKey || e.ctrlKey || e.altKey) return null;
 
   const key = e.key;
 
