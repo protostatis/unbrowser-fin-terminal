@@ -19,7 +19,9 @@ A keyboard-first market terminal for the [Pi coding agent](https://github.com/ea
 ## Requirements
 
 - [Pi coding agent](https://github.com/earendil-works/pi-coding-agent)
-- `unbrowser` available on `PATH` for web research
+- An OpenRouter key or another model configured in Pi for agent research
+- An isolated `unbrowser` MCP endpoint for source extraction; local `unbrowser`
+  on `PATH` remains a development fallback for discovery only
 
 ## Run
 
@@ -50,6 +52,25 @@ npm ci
 npm run dev
 ```
 
+To use Pi through OpenRouter with the hosted public-source extractor:
+
+```bash
+export OPENROUTER_API_KEY=sk-or-...
+export UNBROWSER_MCP_URL=https://unchainedsky.com/unbrowser-mcp
+npm run dev
+```
+
+When OpenRouter is configured, the default model is
+`deepseek/deepseek-v4-flash`. Override it with `OPENROUTER_MODEL` or set the
+provider-neutral pair `MARKET_MODEL_PROVIDER` and `MARKET_MODEL_ID`. Production
+deployments should mount a dedicated key and set `OPENROUTER_API_KEY_FILE`
+instead of placing the key directly in Compose environment metadata.
+
+The public hosted MCP endpoint is shared and suitable only for public pages. A
+production deployment should use a dedicated Docker-internal isolated endpoint,
+such as `http://unbrowser-mcp:8767/mcp`. Production startup fails closed when
+`UNBROWSER_MCP_URL` is missing.
+
 Run `npm run typecheck` to validate the extension, backend, and browser client,
 or `npm run build` for a production browser bundle.
 
@@ -64,6 +85,10 @@ for example `PORT=8788 npm run dev`.
 The bridge listens on `127.0.0.1` by default and accepts browser connections
 only from loopback origins. Do not expose it remotely without authentication
 and TLS; `ALLOWED_ORIGINS` alone is not authentication.
+
+The web agent is restricted to `market_technicals`, `market_discover`,
+`market_extract`, and `market_canvas`. Pi's shell and filesystem tools are not
+registered in the model-facing runtime.
 
 ## Controls
 
@@ -108,8 +133,11 @@ or `Esc` to cancel the prompt before navigating elsewhere.
 ## How research works
 
 1. `market_technicals` computes sourced TA blocks from aligned Yahoo chart data for the selected chart scope.
-2. `market_discover` finds candidate public sources.
-3. The agent extracts selected sources with `unbrowser`.
+2. `market_discover` finds candidate public sources and issues short-lived,
+   research-bound candidate IDs.
+3. The agent calls `market_extract` for up to four selected IDs. The typed tool
+   uses isolated `unbrowser` MCP infrastructure and does not accept arbitrary
+   URLs.
 4. `market_canvas` publishes verified structured research back into the terminal.
 
 Completed canvases are stored in `.pi/market-research-archive.json`, which is ignored by Git.

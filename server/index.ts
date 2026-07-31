@@ -25,6 +25,12 @@ import {
   SessionManager,
   type AgentSession,
 } from "@earendil-works/pi-coding-agent";
+import {
+  assertMarketAgentTools,
+  createAgentModelRuntime,
+  MARKET_AGENT_TOOLS,
+  validateUnbrowserRuntime,
+} from "./agent-config.js";
 import { ansiToHtml } from "./theme.js";
 import { createWebUi, type Panel } from "./web-ui.js";
 
@@ -150,21 +156,39 @@ function cancelPendingSelects(): void {
 
 async function bootSession(): Promise<AgentSession> {
   console.log("[server] cwd:", CWD);
-  const loader = new DefaultResourceLoader({ cwd: CWD, agentDir: getAgentDir() });
+  validateUnbrowserRuntime();
+  const agentDir = getAgentDir();
+  const { modelRuntime, model, config } = await createAgentModelRuntime(agentDir);
+  const loader = new DefaultResourceLoader({ cwd: CWD, agentDir });
   await loader.reload();
 
   console.log("[server] creating agent session...");
   const { session, extensionsResult } = await createAgentSession({
     cwd: CWD,
+    agentDir,
+    modelRuntime,
+    ...(model ? { model } : {}),
+    noTools: "builtin",
+    tools: [...MARKET_AGENT_TOOLS],
     resourceLoader: loader,
     sessionManager: SessionManager.inMemory(CWD),
   });
+  if (extensionsResult.errors.length) {
+    session.dispose();
+    throw new Error(`Market extension failed to load: ${extensionsResult.errors.map((error) => String(error)).join(" | ")}`);
+  }
+  try {
+    assertMarketAgentTools(session);
+  } catch (error) {
+    session.dispose();
+    throw error;
+  }
   console.log(
     "[server] session ready. model:",
     session.model ? `${session.model.provider}/${session.model.id}` : "(none — research will fail until a model is configured)",
   );
-  if (extensionsResult.errors.length) {
-    console.warn("[server] extension load errors:", extensionsResult.errors);
+  if (config.provider && config.modelId) {
+    console.log(`[server] model policy: ${config.provider}/${config.modelId}, max output ${config.maxOutputTokens} tokens`);
   }
 
   await session.bindExtensions({
@@ -334,7 +358,13 @@ bootSession()
   })
   .catch((err) => {
     console.error("[server] FAILED to boot agent session:", err instanceof Error ? err.stack ?? err.message : err);
-    console.error("[server] Research will not work. Browsing still works only after a successful boot.");
+    if (process.env.NODE_ENV === "production") {
+      console.error("[server] Fatal production startup failure; exiting.");
+      wss.close();
+      server.close(() => process.exit(1));
+      return;
+    }
+    console.error("[server] Research is unavailable; fix the configuration and restart.");
   });
 
 process.on("SIGINT", () => {
