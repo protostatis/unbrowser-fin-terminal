@@ -61,7 +61,7 @@ npm run dev
 ```
 
 When OpenRouter is configured, the default model is
-`deepseek/deepseek-v4-flash`. Override it with `OPENROUTER_MODEL` or set the
+`deepseek/deepseek-v4-flash-0731`. Override it with `OPENROUTER_MODEL` or set the
 provider-neutral pair `MARKET_MODEL_PROVIDER` and `MARKET_MODEL_ID`. Production
 deployments should mount a dedicated key and set `OPENROUTER_API_KEY_FILE`
 instead of placing the key directly in Compose environment metadata.

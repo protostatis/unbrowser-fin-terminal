@@ -17,10 +17,10 @@ import {
   validateUnbrowserRuntime,
 } from "../server/agent-config.js";
 
-test("OpenRouter configuration selects the DeepSeek Flash default", () => {
+test("OpenRouter configuration selects the latest DeepSeek Flash default", () => {
   const config = readAgentModelConfig({ OPENROUTER_API_KEY: "test-only" });
   assert.equal(config.provider, "openrouter");
-  assert.equal(config.modelId, "deepseek/deepseek-v4-flash");
+  assert.equal(config.modelId, "deepseek/deepseek-v4-flash-0731");
   assert.equal(config.modelId, DEFAULT_OPENROUTER_MODEL);
   assert.equal(config.maxOutputTokens, 4_096);
 });
@@ -31,12 +31,16 @@ test("model policy stays on local Pi configuration when OpenRouter is not config
   assert.equal(config.modelId, undefined);
 });
 
-test("Pi resolves the configured DeepSeek Flash catalog entry", async () => {
+test("Pi resolves the July 31 DeepSeek Flash release before its catalog entry ships", async () => {
   const agentDir = await mkdtemp(path.join(tmpdir(), "fin-terminal-model-test-"));
   try {
     const { model } = await createAgentModelRuntime(agentDir, { OPENROUTER_API_KEY: "test-only" });
     assert.equal(model?.provider, "openrouter");
-    assert.equal(model?.id, "deepseek/deepseek-v4-flash");
+    assert.equal(model?.id, "deepseek/deepseek-v4-flash-0731");
+    assert.equal(model?.name, "DeepSeek: DeepSeek V4 Flash 0731");
+    assert.equal(model?.contextWindow, 1_048_576);
+    assert.equal(model?.cost.input, 0.09);
+    assert.equal(model?.cost.output, 0.18);
     assert.equal(model?.maxTokens, 4_096);
   } finally {
     await rm(agentDir, { recursive: true, force: true });
@@ -50,7 +54,7 @@ test("Pi loads an OpenRouter key from an absolute secret file without provider r
     await writeFile(keyPath, "test-only\n", { mode: 0o600 });
     const { model } = await createAgentModelRuntime(agentDir, { OPENROUTER_API_KEY_FILE: keyPath });
     assert.equal(model?.provider, "openrouter");
-    assert.equal(model?.id, "deepseek/deepseek-v4-flash");
+    assert.equal(model?.id, "deepseek/deepseek-v4-flash-0731");
   } finally {
     await rm(agentDir, { recursive: true, force: true });
   }
@@ -72,7 +76,7 @@ test("model configuration rejects ambiguous credentials and incomplete policy", 
   assert.throws(
     () => readAgentModelConfig({
       MARKET_MODEL_PROVIDER: "openrouter",
-      MARKET_MODEL_ID: "deepseek/deepseek-v4-flash",
+      MARKET_MODEL_ID: "deepseek/deepseek-v4-flash-0731",
       OPENROUTER_MODEL: "another/model",
     }),
     /must match/,

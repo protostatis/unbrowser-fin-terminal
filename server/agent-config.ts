@@ -13,8 +13,38 @@ export const MARKET_AGENT_TOOLS = [
   "market_canvas",
 ] as const;
 
-export const DEFAULT_OPENROUTER_MODEL = "deepseek/deepseek-v4-flash";
+export const DEFAULT_OPENROUTER_MODEL = "deepseek/deepseek-v4-flash-0731";
 const DEFAULT_MAX_OUTPUT_TOKENS = 4_096;
+const DEFAULT_OPENROUTER_MODEL_TEMPLATE = "deepseek/deepseek-v4-flash";
+
+function resolveConfiguredModel(
+  modelRuntime: ModelRuntime,
+  provider: string,
+  modelId: string,
+): Model<any> | undefined {
+  const catalogModel = modelRuntime.getModel(provider, modelId);
+  if (catalogModel) return catalogModel;
+  if (provider !== "openrouter" || modelId !== DEFAULT_OPENROUTER_MODEL) return undefined;
+
+  // Pi 0.83.0's bundled catalog predates the July 31 model release. Reuse the
+  // existing OpenRouter transport compatibility while supplying the published
+  // identity, context, and pricing until the next Pi catalog ships it.
+  const template = modelRuntime.getModel("openrouter", DEFAULT_OPENROUTER_MODEL_TEMPLATE);
+  if (!template) return undefined;
+  return {
+    ...template,
+    id: DEFAULT_OPENROUTER_MODEL,
+    name: "DeepSeek: DeepSeek V4 Flash 0731",
+    cost: {
+      input: 0.09,
+      output: 0.18,
+      cacheRead: 0.018,
+      cacheWrite: 0,
+    },
+    contextWindow: 1_048_576,
+    maxTokens: 65_536,
+  };
+}
 
 export type AgentModelConfig = {
   provider?: string;
@@ -116,7 +146,7 @@ export async function createAgentModelRuntime(
   });
 
   if (!config.provider || !config.modelId) return { modelRuntime, config };
-  const selected = modelRuntime.getModel(config.provider, config.modelId);
+  const selected = resolveConfiguredModel(modelRuntime, config.provider, config.modelId);
   if (!selected) {
     throw new Error(`Unknown configured market model: ${config.provider}/${config.modelId}`);
   }
