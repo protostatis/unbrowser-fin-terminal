@@ -99,6 +99,10 @@ recommended rather than sharing another service's key.
 Run `npm run typecheck` to validate the extension, backend, and browser client,
 or `npm run build` for a production browser bundle.
 
+For the production release workflow, including the immutable source-SHA handoff
+to `unchained-infra` and GitHub Actions production approval, see
+[`docs/deployment.md`](docs/deployment.md).
+
 ### Public demo deployment
 
 An anonymous kiosk deployment is supported for public demos. Build with the
