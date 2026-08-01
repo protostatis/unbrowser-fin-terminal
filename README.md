@@ -97,6 +97,26 @@ recommended rather than sharing another service's key.
 Run `npm run typecheck` to validate the extension, backend, and browser client,
 or `npm run build` for a production browser bundle.
 
+### Public demo deployment
+
+An anonymous kiosk deployment is supported for public demos. Build with the
+demo base path and set `PUBLIC_DEMO=1`:
+
+```bash
+docker build \
+  --build-arg PUBLIC_BASE_PATH=/unbrowser/fin-terminal-demo/ \
+  -t unbrowser-fin-terminal-demo .
+```
+
+In demo mode the trusted proxy injects a fixed `guest` principal instead of an
+authenticated one, the frame state carries `demo: true` (the UI shows a PUBLIC
+DEMO banner and a waiting room when the singleton seat is taken), and the
+process exits after `DEMO_IDLE_SECONDS` (default 300, minimum 60) without any
+WebSocket activity so the container restart policy hands the seat to the next
+visitor. Use a tmpfs `/data` so every reset starts pristine. Research (BRIEF/WHY)
+remains enabled; prefer a dedicated, provider-capped OpenRouter key for the
+demo build.
+
 Open the Vite URL printed in the terminal (normally
 `http://localhost:5173`). Quote browsing works immediately; agent research
 uses your local Pi model/auth configuration and may consume configured model

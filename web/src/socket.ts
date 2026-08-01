@@ -60,6 +60,9 @@ const RECONNECT_MAX_MS = 8_000;
 const MAX_RETRIES = 20;
 const CLIENT_REPLACED_CLOSE_CODE = 4001;
 
+/** Server close code for the public demo: seat busy or rate-limited. */
+export const DEMO_BUSY_CLOSE_CODE = 1013;
+
 export class TerminalSocket {
   private ws: WebSocket | null = null;
   private handlers = new Map<string, Set<Handler>>();
@@ -145,7 +148,11 @@ export class TerminalSocket {
       if (this.ws !== ws) return;
       this.ws = null;
       const replaced = event.code === CLIENT_REPLACED_CLOSE_CODE;
-      if (replaced) this._disconnected = true;
+      // 1013 (demo seat busy / rate-limited) must not trigger the fast
+      // reconnect loop either: the waiting room owns retry timing, with
+      // jitter, so clients don't churn the server with connections.
+      const stopAutoRetry = replaced || event.code === DEMO_BUSY_CLOSE_CODE;
+      if (stopAutoRetry) this._disconnected = true;
       this.setConnectionState("disconnected");
       this.dispatch("_close", {
         code: event.code,
