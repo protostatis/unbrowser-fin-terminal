@@ -12,6 +12,7 @@ A keyboard-first market terminal for the [Pi coding agent](https://github.com/ea
 - Agent research through `unbrowser`, rendered as structured charts, metrics, tables, news, risks, and sources
 - On-demand EVENTS catalyst monitor for earnings, macro, and global handoff research (not a live calendar feed)
 - Independently keyed background research jobs with a visible FIFO queue, contextual cancellation, and honest status labels
+- Up to two isolated Pi research workers run concurrently while the Market Map remains responsive
 - Scope-aware snapshot age, quote coverage, stale/sync state, mover eligibility, and watchlist coverage
 - Project-local research history with explicit `AS OF` timestamps
 - Full-height layouts for narrow and wide terminals
@@ -31,6 +32,7 @@ A keyboard-first market terminal for the [Pi coding agent](https://github.com/ea
 ```bash
 git clone https://github.com/protostatis/unbrowser-fin-terminal.git
 cd unbrowser-fin-terminal
+npm ci # required for isolated research workers when running the source extension
 pi -e .pi/extensions/market-terminal.ts
 ```
 
@@ -97,6 +99,10 @@ recommended rather than sharing another service's key.
 Run `npm run typecheck` to validate the extension, backend, and browser client,
 or `npm run build` for a production browser bundle.
 
+For the production release workflow, including the immutable source-SHA handoff
+to `unchained-infra` and GitHub Actions production approval, see
+[`docs/deployment.md`](docs/deployment.md).
+
 ### Public demo deployment
 
 An anonymous kiosk deployment is supported for public demos. Build with the
@@ -133,24 +139,37 @@ The web agent is restricted to `market_technicals`, `market_discover`,
 `market_extract`, and `market_canvas`. Pi's shell and filesystem tools are not
 registered in the model-facing runtime.
 
+`MARKET_RESEARCH_CONCURRENCY` controls isolated research workers. It defaults
+to `6` and accepts integers from `1` through `6`; keep it at `1` when
+characterizing a new model or MCP endpoint. Workers inherit the configured
+model policy and expose the same four model-facing tools, but the canonical
+terminal process remains the sole archive writer.
+
 ## Controls
 
-On touch or narrow screens, the web UI adds a bottom command deck. It exposes
-previous/next view, selection movement, OPEN, BRIEF, WHY, watch/cancel, sync,
-pane/back, chart-range controls, and a native symbol-entry sheet. Swipe left or
-right over the terminal canvas to change screens or ticker tabs. The controls
-send the same canonical key inputs listed below; connecting from a newer tab or
-phone for the same authenticated principal takes control of the singleton
-session and preserves its current state.
+The browser keeps the terminal keyboard-first while adding a web-only
+interaction layer. Use **Web controls** to select the current event or ticker,
+change a split pane, start the explicit Open / Brief / Why action, and scroll a
+research canvas without relying on a keyboard. Its item list is a semantic
+mirror of the terminal state, so it remains reliable across responsive terminal
+layouts.
+
+On touch or narrow screens, the web UI also adds a bottom command deck. It
+exposes previous/next view, selection movement, OPEN, BRIEF, WHY,
+watch/cancel, sync, pane/back, chart-range controls, and a native symbol-entry
+sheet. Swipe left or right over the terminal canvas to change screens or ticker
+tabs. The controls send the same canonical key inputs listed below; connecting
+from a newer tab or phone for the same authenticated principal takes control of
+the singleton session and preserves its current state.
 
 | Key | Action |
 |---|---|
 | `1`–`5` | Change chart scope (DAY / WEEK / MONTH / YEAR / TOTAL) |
-| `A` / `D` | Switch top-level screens or ticker tabs |
-| `W` / `S` | Select in lists, or scroll the focused research pane |
-| `Tab` | Switch pane focus in SIGNALS and EVENTS; single-pane screens keep focus in place |
-| `J` | Open a ticker, or build a source-verified factual BRIEF |
-| `K` | Build a WHY analysis with causal channels, scenarios, and disconfirming evidence |
+| `←` / `→` or `A` / `D` | Switch top-level screens or ticker tabs |
+| `↑` / `↓` or `W` / `S` | Select in lists, or scroll the focused research pane |
+| `Tab` | Switch pane focus in SIGNALS and EVENTS. In terminal keyboard mode it stays in the app instead of tabbing through browser controls. |
+| `Enter` (or `J`) | Primary action: open a ticker, or build a source-verified factual BRIEF |
+| `K` | Secondary WHY analysis with causal channels, scenarios, and disconfirming evidence |
 | `E` | Add or remove a ticker from the watchlist |
 | `[` / `]` | Browse older or newer research |
 | `C` | Cancel research for the currently selected lane, headline, or ticker context |
@@ -172,11 +191,11 @@ watchlist.
 
 Changing screens, selections, pane focus, or chart scope does not stop research.
 Each symbol/scope/BRIEF-or-WHY context gets its own job and canvas identity. The
-terminal keeps one model turn running at a time and queues additional jobs FIFO,
-so multiple requests can remain active without mixing their tool writes or
-locking navigation. Queued jobs can be cancelled without interrupting the
-running job; cancelling the running context aborts only that model turn. The
-footer and EVENTS lanes expose contextual RUNNING/QUEUED state.
+terminal dispatches up to six FIFO jobs to isolated one-shot Pi worker sessions,
+so independent requests can progress concurrently without mixing tool writes or
+locking navigation. Queued jobs can be cancelled without touching a worker;
+cancelling a dispatched job fences and aborts only its worker. The footer and
+EVENTS lanes expose contextual RUNNING/QUEUED state.
 
 Cached-research choices are modal: choose `U` to use the cache, `F` to refresh,
 or `Esc` to cancel the prompt before navigating elsewhere.

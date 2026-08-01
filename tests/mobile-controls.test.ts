@@ -12,7 +12,9 @@ import {
 test("mobile actions adapt to market, ticker, research, and cache states", () => {
   const market = mobileActions({ mode: "market" });
   assert.equal(market[0]?.id, "help");
-  assert.equal(market.find((action) => action.id === "brief")?.label, "Open");
+  assert.equal(market.find((action) => action.id === "why")?.input, "k");
+  assert.equal(market.some((action) => action.id === "brief"), false);
+  assert.equal(market.length, 5);
   assert.equal(market.at(-1)?.id, "search");
 
   const signals = mobileActions({ mode: "market", screen: "SIGNALS" });

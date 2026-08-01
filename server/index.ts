@@ -40,6 +40,8 @@ import {
   singleHeader,
 } from "./proxy-auth.js";
 import { createDemoRateLimiter, type DemoRateLimiter } from "./demo-guards.js";
+import { readResearchWorkerConcurrency } from "./research-worker-coordinator.js";
+import { resolveWebAction } from "./web-actions.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -63,6 +65,7 @@ const PUBLIC_DEMO = process.env.PUBLIC_DEMO === "1" || process.env.PUBLIC_DEMO =
 const DEMO_IDLE_SECONDS = Math.max(60, Number(process.env.DEMO_IDLE_SECONDS) || 300);
 const DEMO_MAX_SESSION_SECONDS = Math.max(300, Number(process.env.DEMO_MAX_SESSION_SECONDS) || 1800);
 const DEMO_BUSY_CLOSE_CODE = 1013;
+const RESEARCH_WORKER_CONCURRENCY = readResearchWorkerConcurrency();
 
 if (process.env.NODE_ENV === "production" && !PROXY_TOKEN) {
   throw new Error("MARKET_PROXY_TOKEN is required in production");
@@ -197,6 +200,7 @@ const principalLease = new PrincipalLease();
 
 async function bootSession(): Promise<AgentSession> {
   console.log("[server] cwd:", CWD);
+  console.log(`[server] research worker concurrency: ${RESEARCH_WORKER_CONCURRENCY}`);
   validateUnbrowserRuntime();
   const agentDir = getAgentDir();
   const { modelRuntime, model, config } = await createAgentModelRuntime(agentDir);
@@ -310,6 +314,7 @@ const wss = new WebSocketServer({
 
 wss.on("connection", (ws: WebSocket, request: IncomingMessage) => {
   const socketIp = request.socket.remoteAddress ?? "unknown";
+  let lastWebScrollAt = 0;
   // The edge proxy overwrites this with the visitor's real IP; never trust a
   // client-supplied header (Caddy strips it from the request first).
   const clientIp = (request.headers["x-real-ip"] as string | undefined)?.trim() || socketIp;
@@ -404,6 +409,42 @@ wss.on("connection", (ws: WebSocket, request: IncomingMessage) => {
           pendingSelects.delete(id);
           pending.resolve(msg.cancelled ? undefined : msg.value);
         }
+        handled = true;
+        break;
+      }
+      case "web_action": {
+        const isScrollAction =
+          typeof msg.data === "object" &&
+          msg.data !== null &&
+          (msg.data as { action?: unknown }).action === "scroll";
+        const now = Date.now();
+        // High-resolution trackpads can emit dozens of wheel events per
+        // second. Silently throttle them here as a server-side backstop so a
+        // legitimate scroll gesture cannot exhaust the public-demo budget.
+        if (isScrollAction && now - lastWebScrollAt < 500) break;
+
+        let inputs: string[] | undefined;
+        try {
+          const rawState =
+            typeof activePanel?.debugState === "function"
+              ? activePanel.debugState()
+              : undefined;
+          const result = resolveWebAction(msg.data, rawState);
+          if (Array.isArray(result)) inputs = result;
+        } catch {
+          // Defensive: any unexpected exception is swallowed.
+        }
+        if (!inputs) break;
+        if (PUBLIC_DEMO) {
+          if (!demoLimiter!.allowInput(clientIp)) {
+            console.log("[demo] input rate limit hit:", clientIp);
+            ws.close(DEMO_BUSY_CLOSE_CODE, "Too many demo inputs");
+            return;
+          }
+        }
+        for (const input of inputs) web.sendInput(input);
+        if (isScrollAction) lastWebScrollAt = now;
+        pushFrame();
         handled = true;
         break;
       }

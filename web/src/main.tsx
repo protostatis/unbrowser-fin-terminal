@@ -1,8 +1,20 @@
-import { StrictMode, useEffect, useReducer, useRef, useState } from "react";
+import {
+  StrictMode,
+  useCallback,
+  useEffect,
+  useReducer,
+  useRef,
+  useState,
+} from "react";
 import { createRoot } from "react-dom/client";
 import { TerminalSocket } from "./socket";
 import { TerminalFrame } from "./TerminalFrame";
 import { MobileControls } from "./MobileControls";
+import { EvidenceControl, EvidenceInspector } from "./EvidenceInspector";
+import {
+  InteractionOverlay,
+  type TerminalWebAction,
+} from "./InteractionOverlay";
 import { keyToData } from "./keyboard";
 import { PUBLIC_DEMO } from "./demo-mode";
 import { DEMO_BUSY_CLOSE_CODE } from "./socket";
@@ -49,6 +61,18 @@ function App() {
   const [demoWaiting, setDemoWaiting] = useState(false);
   const demoRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  /* ── Evidence locker (research dossier) state ──────────────────────────── */
+  const [evidenceOpen, setEvidenceOpen] = useState(false);
+  const evidenceOpenRef = useRef(false);
+  evidenceOpenRef.current = evidenceOpen;
+  const evidenceTriggerRef = useRef<HTMLButtonElement>(null);
+
+  const closeEvidence = useCallback(() => {
+    setEvidenceOpen(false);
+    // Return keyboard focus to the status chip that opened the locker.
+    requestAnimationFrame(() => evidenceTriggerRef.current?.focus());
+  }, []);
+
   const clearDemoRetry = () => {
     if (demoRetryTimerRef.current) {
       clearTimeout(demoRetryTimerRef.current);
@@ -69,6 +93,17 @@ function App() {
   /* ── Container / ruler refs for viewport measurement ───────────────── */
   const containerRef = useRef<HTMLDivElement>(null);
   const rulerRef = useRef<HTMLSpanElement>(null);
+  const terminalFrameRef = useRef<HTMLDivElement>(null);
+
+  const focusTerminal = () => {
+    requestAnimationFrame(() => {
+      terminalFrameRef.current?.focus({ preventScroll: true });
+    });
+  };
+
+  useEffect(() => {
+    focusTerminal();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   /* ── WebSocket lifecycle ──────────────────────────────────────────────── */
 
@@ -101,6 +136,7 @@ function App() {
       rowsRef.current = [];
       frameStateRef.current = undefined;
       isClosedRef.current = true;
+      setEvidenceOpen(false);
       forceUpdate();
     });
 
@@ -237,6 +273,17 @@ function App() {
           e.preventDefault();
           s.sendSelectResponse(selectReqRef.current.id, undefined, true);
           setSelectReq(null);
+          focusTerminal();
+        }
+        return;
+      }
+
+      // Evidence locker is open: Escape ejects it, and no key reaches the
+      // terminal while the cartridge is in view.
+      if (evidenceOpenRef.current && frameStateRef.current?.dossier) {
+        if (e.key === "Escape") {
+          e.preventDefault();
+          closeEvidence();
         }
         return;
       }
@@ -258,6 +305,7 @@ function App() {
     if (selectReq) {
       socket.sendSelectResponse(selectReq.id, value);
       setSelectReq(null);
+      focusTerminal();
     }
   };
 
@@ -265,6 +313,7 @@ function App() {
     if (selectReq) {
       socket.sendSelectResponse(selectReq.id, undefined, true);
       setSelectReq(null);
+      focusTerminal();
     }
   };
 
@@ -274,15 +323,28 @@ function App() {
     isClosedRef.current = false;
     socket.sendCommand("market", "");
     forceUpdate();
+    focusTerminal();
   };
 
   const handleTouchInput = (data: string) => {
     if (
       connectionStateRef.current !== "connected" ||
       isClosedRef.current ||
-      selectReqRef.current
+      selectReqRef.current ||
+      evidenceOpenRef.current
     ) return;
     socket.sendInput(data);
+    focusTerminal();
+  };
+
+  const handleWebAction = (action: TerminalWebAction) => {
+    if (
+      connectionStateRef.current !== "connected" ||
+      isClosedRef.current ||
+      selectReqRef.current ||
+      evidenceOpenRef.current
+    ) return;
+    socket.sendWebAction(action);
   };
 
   /* ── Render ──────────────────────────────────────────────────────────────── */
@@ -290,6 +352,13 @@ function App() {
   const cs = connectionStateRef.current;
   const hasFrame = rowsRef.current.length > 0;
   const wasReplaced = wasReplacedRef.current;
+  const dossier = frameStateRef.current?.dossier;
+
+  useEffect(() => {
+    // A new frame can replace or clear the active canvas while the locker is
+    // open. Close it rather than leaving the keyboard behind an invisible dialog.
+    if (!dossier && evidenceOpen) setEvidenceOpen(false);
+  }, [dossier, evidenceOpen]);
 
   const emptyTitle =
     cs === "connected"
@@ -320,7 +389,14 @@ function App() {
       </span>
 
       {/* Terminal grid */}
-      <TerminalFrame rows={rowsRef.current} onInput={handleTouchInput} />
+      <TerminalFrame
+        rows={rowsRef.current}
+        state={frameStateRef.current}
+        columns={colsRef.current}
+        onInput={handleTouchInput}
+        onWebAction={handleWebAction}
+        terminalRef={terminalFrameRef}
+      />
 
       {/* Actionable startup / terminal-less reconnect state */}
       {!hasFrame && !isClosedRef.current && (
@@ -339,14 +415,32 @@ function App() {
       )}
 
       {/* Status line */}
-      <div className="status-line" aria-live="polite">
-        <span className={`status-dot ${cs}`} />
-        {cs === "connected"
-          ? `${colsRef.current}×${rowsCountRef.current}`
-          : cs === "connecting"
-            ? "Connecting…"
-            : "Disconnected"}
+      <div className="status-line">
+        <span className="status-conn" aria-live="polite">
+          <span className={`status-dot ${cs}`} />
+          {cs === "connected"
+            ? `${colsRef.current}×${rowsCountRef.current}`
+            : cs === "connecting"
+              ? "Connecting…"
+              : "Disconnected"}
+        </span>
+
+        {dossier && (
+          <EvidenceControl
+            dossier={dossier}
+            open={evidenceOpen}
+            onOpen={() => setEvidenceOpen(true)}
+            triggerRef={evidenceTriggerRef}
+          />
+        )}
       </div>
+
+      <InteractionOverlay
+        state={frameStateRef.current}
+        disabled={cs !== "connected" || Boolean(selectReq) || evidenceOpen || isClosedRef.current}
+        onAction={handleWebAction}
+        onReturnToTerminal={focusTerminal}
+      />
 
       {/* Public demo banner */}
       {frameStateRef.current?.demo && (
@@ -357,8 +451,9 @@ function App() {
 
       <MobileControls
         state={frameStateRef.current}
-        disabled={cs !== "connected" || Boolean(selectReq) || isClosedRef.current}
+        disabled={cs !== "connected" || Boolean(selectReq) || evidenceOpen || isClosedRef.current}
         onInput={handleTouchInput}
+        onReturnToTerminal={focusTerminal}
       />
 
       {/* Toast notification */}
@@ -399,6 +494,11 @@ function App() {
             </button>
           </div>
         </div>
+      )}
+
+      {/* Evidence locker — the research dossier inspector */}
+      {evidenceOpen && dossier && (
+        <EvidenceInspector dossier={dossier} onClose={closeEvidence} />
       )}
 
       {/* Closed overlay */}
