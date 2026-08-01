@@ -2,8 +2,8 @@
  * Parent-side FIFO coordinator for research workers.
  *
  * Architecture:
- *  - Admits research jobs FIFO up to a configured concurrency cap (default 2,
- *    clamped 1–4).
+ *  - Admits research jobs FIFO up to a configured concurrency cap (default 6,
+ *    clamped 1–6).
  *  - Each dispatch forks a fresh child process (in production) and sends an
  *    immutable `WorkerRunMessage` snapshot.
  *  - Worker events are validated, sequenced, and fenced: the coordinator
@@ -51,7 +51,7 @@ export type WorkerFactory = (env: Record<string, string>) => WorkerHandle;
 // ── Options ───────────────────────────────────────────────────────────────
 
 export interface ResearchWorkerCoordinatorOptions {
-  /** Maximum concurrent workers (1–4, default 2). */
+  /** Maximum concurrent workers (1–6, default 6). */
   concurrency?: number;
   /**
    * Maximum total active-or-queued jobs (default 24, clamped ≥ 1).
@@ -92,10 +92,10 @@ export function readResearchWorkerConcurrency(
   env: NodeJS.ProcessEnv = process.env,
 ): number {
   const raw = env.MARKET_RESEARCH_CONCURRENCY?.trim();
-  if (!raw) return 2;
+  if (!raw) return 6;
   const value = Number(raw);
-  if (!Number.isInteger(value) || value < 1 || value > 4) {
-    throw new Error("MARKET_RESEARCH_CONCURRENCY must be an integer from 1 to 4");
+  if (!Number.isInteger(value) || value < 1 || value > 6) {
+    throw new Error("MARKET_RESEARCH_CONCURRENCY must be an integer from 1 to 6");
   }
   return value;
 }
@@ -166,7 +166,7 @@ export class ResearchWorkerCoordinator {
   private _disposed = false;
 
   constructor(options: ResearchWorkerCoordinatorOptions) {
-    this.concurrency = clampConcurrency(options.concurrency ?? 2);
+    this.concurrency = clampConcurrency(options.concurrency ?? 6);
     this.maxQueueSize = Math.max(1, options.maxQueueSize ?? 24);
     this.workerFactory = options.workerFactory;
     this.generateAttemptId =
@@ -540,8 +540,8 @@ export class ResearchWorkerCoordinator {
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 function clampConcurrency(value: number): number {
-  if (!Number.isInteger(value) || value < 1) return 2;
-  return Math.min(value, 4);
+  if (!Number.isInteger(value) || value < 1) return 6;
+  return Math.min(value, 6);
 }
 
 function positiveTimeout(value: number | undefined, fallback: number): number {

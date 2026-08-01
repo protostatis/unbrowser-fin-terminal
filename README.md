@@ -136,7 +136,7 @@ The web agent is restricted to `market_technicals`, `market_discover`,
 registered in the model-facing runtime.
 
 `MARKET_RESEARCH_CONCURRENCY` controls isolated research workers. It defaults
-to `2` and accepts integers from `1` through `4`; keep it at `1` when
+to `6` and accepts integers from `1` through `6`; keep it at `1` when
 characterizing a new model or MCP endpoint. Workers inherit the configured
 model policy and expose the same four model-facing tools, but the canonical
 terminal process remains the sole archive writer.
@@ -180,7 +180,7 @@ watchlist.
 
 Changing screens, selections, pane focus, or chart scope does not stop research.
 Each symbol/scope/BRIEF-or-WHY context gets its own job and canvas identity. The
-terminal dispatches up to two FIFO jobs to isolated one-shot Pi worker sessions,
+terminal dispatches up to six FIFO jobs to isolated one-shot Pi worker sessions,
 so independent requests can progress concurrently without mixing tool writes or
 locking navigation. Queued jobs can be cancelled without touching a worker;
 cancelling a dispatched job fences and aborts only its worker. The footer and

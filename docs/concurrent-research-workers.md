@@ -14,7 +14,7 @@ requests serial.
 
 ## Goals
 
-1. Run up to two independent market-research jobs concurrently.
+1. Run up to six independent market-research jobs concurrently.
 2. Keep the canonical `/market` session responsive while research runs.
 3. Preserve the existing canvas, queue, cache, archive, cancellation, and
    production tool-allowlist behavior from the user's point of view.
@@ -39,10 +39,10 @@ canonical Pi session + /market extension
           ▼
   ResearchWorkerCoordinator (parent-owned)
           │                         │
-       IPC events              bounded FIFO / max 2
+       IPC events              bounded FIFO / max 6
           │                         │
           ▼                         ▼
- worker process #1           worker process #2
+ worker process #1           worker process #2 ... #6
  one fresh Pi session        one fresh Pi session
  one research-only attempt   one research-only attempt
 ```
@@ -64,8 +64,8 @@ allowlist:
 
 1. The UI creates its normal parent `ResearchJob`, identified by `jobId`.
 2. The parent coordinator admits FIFO jobs while fewer than
-   `MARKET_RESEARCH_CONCURRENCY` workers are active (default 2, constrained to
-   1–4).
+   `MARKET_RESEARCH_CONCURRENCY` workers are active (default 6, constrained to
+   1–6).
 3. For every launch the coordinator creates a unique `attemptId`, forks a
    worker, and sends an immutable request snapshot.
 4. A worker emits ordered IPC events and performs no persistence.
@@ -80,7 +80,7 @@ allowlist:
    queued parent job.
 
 The initial queue limit remains 24 active-or-queued jobs.  This protects the
-model provider and MCP endpoint while allowing two jobs to make progress.
+model provider and MCP endpoint while allowing six jobs to make progress.
 
 ## IPC contract
 
@@ -147,7 +147,7 @@ a new `attemptId`.
 
 ## Operational policy
 
-- `MARKET_RESEARCH_CONCURRENCY`: optional integer 1–4; defaults to 2.
+- `MARKET_RESEARCH_CONCURRENCY`: optional integer 1–6; defaults to 6.
 - Production still requires `UNBROWSER_MCP_URL`.
 - Workers inherit the configured model policy but not a broader model-facing
   tool registry.
@@ -159,7 +159,7 @@ a new `attemptId`.
 
 Unit tests must cover:
 
-1. FIFO scheduling with a two-worker cap.
+1. FIFO scheduling with a six-worker cap.
 2. Cancellation fencing and ignored late worker events.
 3. Worker crash/fatal handling releases a slot and continues the queue.
 4. Parent deadline, terminal-without-exit, and disconnected-IPC cleanup.
@@ -168,5 +168,5 @@ Unit tests must cover:
 
 Manual/live characterization before increasing the cap must measure queue wait,
 completion latency, worker startup time, provider/MCP 429s, memory use, and
-cross-job contamination.  Roll out behind `MARKET_RESEARCH_CONCURRENCY=1` by
-default-compatible configuration, then explicitly set `2` after validation.
+cross-job contamination. Set `MARKET_RESEARCH_CONCURRENCY=1` while
+characterizing a new deployment, then return to the default of `6` after validation.

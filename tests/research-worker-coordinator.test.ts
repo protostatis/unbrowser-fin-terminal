@@ -261,21 +261,21 @@ test("enqueue dispatches immediately when a slot is free", () => {
   assert.equal(workers[0].sentMessages[0].type, "run");
 });
 
-test("worker concurrency defaults to two and rejects unsafe environment values", () => {
-  assert.equal(readResearchWorkerConcurrency({}), 2);
+test("worker concurrency defaults to six and rejects unsafe environment values", () => {
+  assert.equal(readResearchWorkerConcurrency({}), 6);
   assert.equal(readResearchWorkerConcurrency({ MARKET_RESEARCH_CONCURRENCY: "1" }), 1);
-  assert.equal(readResearchWorkerConcurrency({ MARKET_RESEARCH_CONCURRENCY: "4" }), 4);
+  assert.equal(readResearchWorkerConcurrency({ MARKET_RESEARCH_CONCURRENCY: "6" }), 6);
   assert.throws(
     () => readResearchWorkerConcurrency({ MARKET_RESEARCH_CONCURRENCY: "0" }),
-    /must be an integer from 1 to 4/,
+    /must be an integer from 1 to 6/,
   );
   assert.throws(
-    () => readResearchWorkerConcurrency({ MARKET_RESEARCH_CONCURRENCY: "5" }),
-    /must be an integer from 1 to 4/,
+    () => readResearchWorkerConcurrency({ MARKET_RESEARCH_CONCURRENCY: "7" }),
+    /must be an integer from 1 to 6/,
   );
   assert.throws(
     () => readResearchWorkerConcurrency({ MARKET_RESEARCH_CONCURRENCY: "two" }),
-    /must be an integer from 1 to 4/,
+    /must be an integer from 1 to 6/,
   );
 });
 
