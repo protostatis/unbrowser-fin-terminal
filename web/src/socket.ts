@@ -148,7 +148,11 @@ export class TerminalSocket {
       if (this.ws !== ws) return;
       this.ws = null;
       const replaced = event.code === CLIENT_REPLACED_CLOSE_CODE;
-      if (replaced) this._disconnected = true;
+      // 1013 (demo seat busy / rate-limited) must not trigger the fast
+      // reconnect loop either: the waiting room owns retry timing, with
+      // jitter, so clients don't churn the server with connections.
+      const stopAutoRetry = replaced || event.code === DEMO_BUSY_CLOSE_CODE;
+      if (stopAutoRetry) this._disconnected = true;
       this.setConnectionState("disconnected");
       this.dispatch("_close", {
         code: event.code,

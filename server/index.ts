@@ -309,19 +309,24 @@ const wss = new WebSocketServer({
 });
 
 wss.on("connection", (ws: WebSocket, request: IncomingMessage) => {
-  const clientIp = request.socket.remoteAddress ?? "unknown";
+  const socketIp = request.socket.remoteAddress ?? "unknown";
+  // The edge proxy overwrites this with the visitor's real IP; never trust a
+  // client-supplied header (Caddy strips it from the request first).
+  const clientIp = (request.headers["x-real-ip"] as string | undefined)?.trim() || socketIp;
   if (PUBLIC_DEMO) {
+    // Rate-limit connections before anything else so busy-seat upgrades also
+    // consume the per-IP budget.
+    if (!demoLimiter!.allowConnection(clientIp)) {
+      console.log("[demo] connection rate limit hit:", clientIp);
+      ws.close(DEMO_BUSY_CLOSE_CODE, "Too many demo connections");
+      return;
+    }
     // One seat at a time: a newcomer must wait rather than evict the current
     // visitor. 1013 gives the browser a distinct close code so the UI can
     // show the waiting room instead of fighting for the seat.
     if (activeClient && activeClient.readyState === WebSocket.OPEN) {
       console.log("[demo] seat busy; rejecting newcomer");
       ws.close(DEMO_BUSY_CLOSE_CODE, "Demo seat is in use by another visitor");
-      return;
-    }
-    if (!demoLimiter!.allowConnection(clientIp)) {
-      console.log("[demo] connection rate limit hit:", clientIp);
-      ws.close(DEMO_BUSY_CLOSE_CODE, "Too many demo connections");
       return;
     }
     lastDemoActivity = Date.now();
@@ -363,20 +368,21 @@ wss.on("connection", (ws: WebSocket, request: IncomingMessage) => {
       return;
     }
     if (!msg || typeof msg !== "object") return;
-    if (PUBLIC_DEMO) {
-      if (!demoLimiter!.allowInput(clientIp)) {
-        console.log("[demo] input rate limit hit:", clientIp);
-        ws.close(DEMO_BUSY_CLOSE_CODE, "Too many demo inputs");
-        return;
-      }
-    }
     let handled = false;
     switch (msg.type) {
-      case "input":
+      case "input": {
+        if (PUBLIC_DEMO) {
+          if (!demoLimiter!.allowInput(clientIp)) {
+            console.log("[demo] input rate limit hit:", clientIp);
+            ws.close(DEMO_BUSY_CLOSE_CODE, "Too many demo inputs");
+            return;
+          }
+        }
         web.sendInput(String(msg.data ?? ""));
         pushFrame(); // ensure a frame after state mutation
         handled = true;
         break;
+      }
       case "resize": {
         const c = Number(msg.cols);
         const r = Number(msg.rows);
