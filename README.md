@@ -12,6 +12,7 @@ A keyboard-first market terminal for the [Pi coding agent](https://github.com/ea
 - Agent research through `unbrowser`, rendered as structured charts, metrics, tables, news, risks, and sources
 - On-demand EVENTS catalyst monitor for earnings, macro, and global handoff research (not a live calendar feed)
 - Independently keyed background research jobs with a visible FIFO queue, contextual cancellation, and honest status labels
+- Up to two isolated Pi research workers run concurrently while the Market Map remains responsive
 - Scope-aware snapshot age, quote coverage, stale/sync state, mover eligibility, and watchlist coverage
 - Project-local research history with explicit `AS OF` timestamps
 - Full-height layouts for narrow and wide terminals
@@ -31,6 +32,7 @@ A keyboard-first market terminal for the [Pi coding agent](https://github.com/ea
 ```bash
 git clone https://github.com/protostatis/unbrowser-fin-terminal.git
 cd unbrowser-fin-terminal
+npm ci # required for isolated research workers when running the source extension
 pi -e .pi/extensions/market-terminal.ts
 ```
 
@@ -133,6 +135,12 @@ The web agent is restricted to `market_technicals`, `market_discover`,
 `market_extract`, and `market_canvas`. Pi's shell and filesystem tools are not
 registered in the model-facing runtime.
 
+`MARKET_RESEARCH_CONCURRENCY` controls isolated research workers. It defaults
+to `2` and accepts integers from `1` through `4`; keep it at `1` when
+characterizing a new model or MCP endpoint. Workers inherit the configured
+model policy and expose the same four model-facing tools, but the canonical
+terminal process remains the sole archive writer.
+
 ## Controls
 
 On touch or narrow screens, the web UI adds a bottom command deck. It exposes
@@ -172,11 +180,11 @@ watchlist.
 
 Changing screens, selections, pane focus, or chart scope does not stop research.
 Each symbol/scope/BRIEF-or-WHY context gets its own job and canvas identity. The
-terminal keeps one model turn running at a time and queues additional jobs FIFO,
-so multiple requests can remain active without mixing their tool writes or
-locking navigation. Queued jobs can be cancelled without interrupting the
-running job; cancelling the running context aborts only that model turn. The
-footer and EVENTS lanes expose contextual RUNNING/QUEUED state.
+terminal dispatches up to two FIFO jobs to isolated one-shot Pi worker sessions,
+so independent requests can progress concurrently without mixing tool writes or
+locking navigation. Queued jobs can be cancelled without touching a worker;
+cancelling a dispatched job fences and aborts only its worker. The footer and
+EVENTS lanes expose contextual RUNNING/QUEUED state.
 
 Cached-research choices are modal: choose `U` to use the cache, `F` to refresh,
 or `Esc` to cancel the prompt before navigating elsewhere.

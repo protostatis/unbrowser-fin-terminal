@@ -40,6 +40,7 @@ import {
   singleHeader,
 } from "./proxy-auth.js";
 import { createDemoRateLimiter, type DemoRateLimiter } from "./demo-guards.js";
+import { readResearchWorkerConcurrency } from "./research-worker-coordinator.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -63,6 +64,7 @@ const PUBLIC_DEMO = process.env.PUBLIC_DEMO === "1" || process.env.PUBLIC_DEMO =
 const DEMO_IDLE_SECONDS = Math.max(60, Number(process.env.DEMO_IDLE_SECONDS) || 300);
 const DEMO_MAX_SESSION_SECONDS = Math.max(300, Number(process.env.DEMO_MAX_SESSION_SECONDS) || 1800);
 const DEMO_BUSY_CLOSE_CODE = 1013;
+const RESEARCH_WORKER_CONCURRENCY = readResearchWorkerConcurrency();
 
 if (process.env.NODE_ENV === "production" && !PROXY_TOKEN) {
   throw new Error("MARKET_PROXY_TOKEN is required in production");
@@ -197,6 +199,7 @@ const principalLease = new PrincipalLease();
 
 async function bootSession(): Promise<AgentSession> {
   console.log("[server] cwd:", CWD);
+  console.log(`[server] research worker concurrency: ${RESEARCH_WORKER_CONCURRENCY}`);
   validateUnbrowserRuntime();
   const agentDir = getAgentDir();
   const { modelRuntime, model, config } = await createAgentModelRuntime(agentDir);
