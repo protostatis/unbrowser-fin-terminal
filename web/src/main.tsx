@@ -2,6 +2,7 @@ import { StrictMode, useEffect, useReducer, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { TerminalSocket } from "./socket";
 import { TerminalFrame } from "./TerminalFrame";
+import { MobileControls } from "./MobileControls";
 import { keyToData } from "./keyboard";
 import type { FrameMessage, SelectRequestMessage } from "./socket";
 import "./styles.css";
@@ -28,6 +29,7 @@ function App() {
   const rowsCountRef = useRef(24);
   const isClosedRef = useRef(false);
   const wasReplacedRef = useRef(false);
+  const frameStateRef = useRef<FrameMessage["state"]>(undefined);
 
   /* ── React state for overlays ──────────────────────────────────────── */
   const [notify, setNotify] = useState<{
@@ -58,6 +60,7 @@ function App() {
       rowsRef.current = msg.rows;
       colsRef.current = msg.width;
       rowsCountRef.current = msg.rows_count;
+      frameStateRef.current = msg.state;
       isClosedRef.current = false;
       forceUpdate();
     });
@@ -77,6 +80,7 @@ function App() {
 
     const unsubClosed = s.on("closed", () => {
       rowsRef.current = [];
+      frameStateRef.current = undefined;
       isClosedRef.current = true;
       forceUpdate();
     });
@@ -96,6 +100,7 @@ function App() {
       connectionStateRef.current = "disconnected";
       wasReplacedRef.current = Boolean(event.replaced);
       if (event.replaced) rowsRef.current = [];
+      if (event.replaced) frameStateRef.current = undefined;
       forceUpdate();
     });
 
@@ -236,6 +241,15 @@ function App() {
     forceUpdate();
   };
 
+  const handleTouchInput = (data: string) => {
+    if (
+      connectionStateRef.current !== "connected" ||
+      isClosedRef.current ||
+      selectReqRef.current
+    ) return;
+    socket.sendInput(data);
+  };
+
   /* ── Render ──────────────────────────────────────────────────────────────── */
 
   const cs = connectionStateRef.current;
@@ -271,7 +285,7 @@ function App() {
       </span>
 
       {/* Terminal grid */}
-      <TerminalFrame rows={rowsRef.current} />
+      <TerminalFrame rows={rowsRef.current} onInput={handleTouchInput} />
 
       {/* Actionable startup / terminal-less reconnect state */}
       {!hasFrame && !isClosedRef.current && (
@@ -298,6 +312,12 @@ function App() {
             ? "Connecting…"
             : "Disconnected"}
       </div>
+
+      <MobileControls
+        state={frameStateRef.current}
+        disabled={cs !== "connected" || Boolean(selectReq) || isClosedRef.current}
+        onInput={handleTouchInput}
+      />
 
       {/* Toast notification */}
       {notify && (
