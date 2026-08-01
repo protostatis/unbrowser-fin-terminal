@@ -1,0 +1,167 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import {
+  terminalPaneHitTarget,
+  terminalRowHitTarget,
+  terminalRowText,
+} from "../web/src/terminal-hit-targets.js";
+
+test("terminal row text removes trusted web-theme markup", () => {
+  assert.equal(
+    terminalRowText('<span class="tc tc-accent">Earnings &amp; guidance</span>&nbsp;'),
+    "Earnings & guidance ",
+  );
+});
+
+test("watch and movers rows select a new ticker, then open the selected one", () => {
+  const watch = {
+    mode: "market" as const,
+    screen: "WATCH",
+    available: ["SPY", "QQQ"],
+    selectedIndex: 0,
+    selected: "SPY",
+  };
+  assert.deepEqual(
+    terminalRowHitTarget(watch, "  ▲ QQQ      +0.65% Invesco QQQ Trust"),
+    {
+      action: { action: "select", screen: "WATCH", index: 1, item: "QQQ" },
+      label: "Select QQQ",
+    },
+  );
+  assert.deepEqual(terminalRowHitTarget(watch, "> ▲ SPY      +0.72% State Street"), {
+    action: {
+      action: "primary",
+      context: {
+        mode: "market",
+        screen: "WATCH",
+        selectedIndex: 0,
+        selected: "SPY",
+        pane: null,
+      },
+    },
+    label: "Open SPY",
+  });
+  assert.equal(terminalRowHitTarget(watch, "SPY $747.03 +0.72%"), undefined);
+
+  const movers = {
+    mode: "market" as const,
+    screen: "MOVERS",
+    available: ["AAPL", "MSFT"],
+    selectedIndex: 1,
+    selected: "MSFT",
+  };
+  assert.equal(
+    terminalRowHitTarget(movers, "  #01 ▼ AAPL -7.35% VOL 45M")?.action.action,
+    "select",
+  );
+  assert.equal(
+    terminalRowHitTarget(movers, "> #02 ▲ MSFT +3.02% VOL 32M")?.action.action,
+    "primary",
+  );
+});
+
+test("event and headline rows select without starting research", () => {
+  const events = {
+    mode: "market" as const,
+    screen: "EVENTS",
+    available: [
+      "Earnings & guidance monitor",
+      "Macro policy & data monitor",
+      "Global handoff monitor",
+    ],
+    selectedIndex: 0,
+    selected: "Earnings & guidance monitor",
+    eventsFocus: "lanes" as const,
+  };
+  assert.deepEqual(terminalRowHitTarget(events, "  MACRO  BRIEF -- · WHY --"), {
+    action: {
+      action: "select",
+      screen: "EVENTS",
+      index: 1,
+      item: "Macro policy & data monitor",
+    },
+    label: "Select Macro policy & data monitor",
+  });
+  assert.equal(
+    terminalRowHitTarget(
+      events,
+      "ON-DEMAND RESEARCH · NOT A LIVE CALENDAR │ Macro policy & data monitor",
+      { columns: 120, rowCount: 30, xFraction: 0.8 },
+    ),
+    undefined,
+  );
+
+  const signals = {
+    mode: "market" as const,
+    screen: "SIGNALS",
+    available: ["Technology leadership broadens as index futures advance"],
+    selectedIndex: 0,
+    selected: "Technology leadership broadens as index futures advance",
+    signalsFocus: "headlines" as const,
+  };
+  assert.equal(
+    terminalRowHitTarget(
+      signals,
+      "  demo.news   Technology leadership broadens as index futures advance",
+    )?.action.action,
+    "select",
+  );
+});
+
+test("pane headings and wide pane bodies change focus without changing selection", () => {
+  const signals = {
+    mode: "market" as const,
+    screen: "SIGNALS",
+    available: ["Headline"],
+    selectedIndex: 0,
+    selected: "Headline",
+    signalsFocus: "headlines" as const,
+  };
+  assert.deepEqual(terminalRowHitTarget(signals, " MARKET STORY FOCUS ")?.action, {
+    action: "focus-pane",
+    pane: "story",
+  });
+  assert.deepEqual(
+    terminalPaneHitTarget(signals, 120, 10, 30, 0.8)?.action,
+    { action: "focus-pane", pane: "story" },
+  );
+
+  const events = {
+    mode: "market" as const,
+    screen: "EVENTS",
+    available: ["Earnings & guidance monitor"],
+    selectedIndex: 0,
+    selected: "Earnings & guidance monitor",
+    eventsFocus: "lanes" as const,
+  };
+  assert.deepEqual(
+    terminalPaneHitTarget(events, 120, 10, 30, 0.7)?.action,
+    { action: "focus-pane", pane: "briefing" },
+  );
+  assert.deepEqual(
+    terminalRowHitTarget(
+      events,
+      "CATALYST LANES FOCUS │ BRIEFING FOCUS",
+      { columns: 120, rowCount: 30, xFraction: 0.7 },
+    )?.action,
+    { action: "focus-pane", pane: "briefing" },
+  );
+  assert.equal(terminalPaneHitTarget(events, 80, 10, 30, 0.7), undefined);
+});
+
+test("locked terminal rows expose no pointer action", () => {
+  assert.equal(
+    terminalRowHitTarget(
+      {
+        mode: "market",
+        screen: "WATCH",
+        available: ["SPY"],
+        selectedIndex: 0,
+        selected: "SPY",
+        cacheDecision: {},
+      },
+      "> ▲ SPY",
+    ),
+    undefined,
+  );
+});

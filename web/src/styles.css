@@ -65,6 +65,24 @@ body,
   min-height: calc(1em * 1.2);
 }
 
+/* Rows with a stable semantic match are pointer shortcuts for the web UI.
+ * Keyboard navigation remains owned by the terminal frame itself. */
+.term-row-interactive {
+  cursor: pointer;
+  border-radius: 2px;
+  touch-action: manipulation;
+}
+
+@media (hover: hover) {
+  .term-row-interactive:hover {
+    background: #1f6feb22;
+  }
+}
+
+.term-row-interactive:active {
+  background: #1f6feb33;
+}
+
 /* Hidden ruler used for character-cell measurement */
 .term-row.ruler {
   position: absolute;

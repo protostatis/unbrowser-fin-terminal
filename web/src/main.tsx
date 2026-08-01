@@ -354,6 +354,7 @@ function App() {
       <TerminalFrame
         rows={rowsRef.current}
         state={frameStateRef.current}
+        columns={colsRef.current}
         onInput={handleTouchInput}
         onWebAction={handleWebAction}
         terminalRef={terminalFrameRef}

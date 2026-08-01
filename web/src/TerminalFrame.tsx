@@ -1,6 +1,7 @@
 import {
   memo,
   useRef,
+  type MouseEvent,
   type PointerEvent,
   type Ref,
   type WheelEvent,
@@ -11,12 +12,18 @@ import {
   canUsePointerScroll,
   type TerminalWebAction,
 } from "./web-interactions";
+import {
+  terminalPaneHitTarget,
+  terminalRowHitTarget,
+} from "./terminal-hit-targets";
 
 interface TerminalFrameProps {
   /** Array of HTML-safe row strings emitted by the backend web theme. */
   rows: string[];
   /** The current semantic state, used only to gate pointer scrolling. */
   state?: TerminalFrameState;
+  /** Current terminal width, used to detect the wide split-pane layout. */
+  columns?: number;
   onInput?: (data: string) => void;
   onWebAction?: (action: TerminalWebAction) => void;
   terminalRef?: Ref<HTMLDivElement>;
@@ -47,6 +54,7 @@ function normalizedWheelPixels(event: WheelEvent<HTMLDivElement>): number {
 export const TerminalFrame = memo(function TerminalFrame({
   rows,
   state,
+  columns,
   onInput,
   onWebAction,
   terminalRef,
@@ -55,12 +63,49 @@ export const TerminalFrame = memo(function TerminalFrame({
   const activeTouchPointersRef = useRef(new Set<number>());
   const wheelRemainderRef = useRef(0);
   const wheelDirectionRef = useRef<"up" | "down" | null>(null);
+  const suppressClickRef = useRef(false);
 
   const pointerPoint = (event: PointerEvent<HTMLDivElement>): SwipePoint => ({
     x: event.clientX,
     y: event.clientY,
     at: performance.now(),
   });
+
+  const handleRowClick = (
+    event: MouseEvent<HTMLDivElement>,
+    row: string,
+    rowIndex: number,
+  ) => {
+    if (!onWebAction) return;
+    if (suppressClickRef.current) {
+      suppressClickRef.current = false;
+      return;
+    }
+
+    const frame = event.currentTarget.parentElement;
+    if (!frame) return;
+    const rect = frame.getBoundingClientRect();
+    if (rect.width <= 0) return;
+    const xFraction = (event.clientX - rect.left) / rect.width;
+    const rowTarget = terminalRowHitTarget(state, row, {
+      columns,
+      rowCount: rows.length,
+      xFraction,
+    });
+    if (rowTarget) {
+      onWebAction(rowTarget.action);
+      return;
+    }
+
+    const paneTarget = terminalPaneHitTarget(
+      state,
+      columns,
+      rowIndex,
+      rows.length,
+      xFraction,
+    );
+    if (paneTarget) onWebAction(paneTarget.action);
+  };
 
   return (
     <div
@@ -72,6 +117,7 @@ export const TerminalFrame = memo(function TerminalFrame({
       onPointerDown={(event) => {
         event.currentTarget.focus({ preventScroll: true });
         if (event.pointerType !== "touch") return;
+        suppressClickRef.current = false;
         activeTouchPointersRef.current.add(event.pointerId);
         swipeStartRef.current =
           activeTouchPointersRef.current.size === 1 && event.isPrimary
@@ -92,7 +138,13 @@ export const TerminalFrame = memo(function TerminalFrame({
           !event.isPrimary
         ) return;
         const input = horizontalSwipeInput(start, pointerPoint(event));
-        if (input) onInput?.(input);
+        if (input) {
+          suppressClickRef.current = true;
+          onInput?.(input);
+          requestAnimationFrame(() => {
+            suppressClickRef.current = false;
+          });
+        }
       }}
       onPointerCancel={(event) => {
         activeTouchPointersRef.current.delete(event.pointerId);
@@ -127,13 +179,18 @@ export const TerminalFrame = memo(function TerminalFrame({
         onWebAction({ action: "scroll", direction, amount });
       }}
     >
-      {rows.map((row, i) => (
-        <div
-          key={i}
-          className="term-row"
-          dangerouslySetInnerHTML={{ __html: row || "&nbsp;" }}
-        />
-      ))}
+      {rows.map((row, i) => {
+        const hitTarget = terminalRowHitTarget(state, row);
+        return (
+          <div
+            key={i}
+            className={`term-row${hitTarget ? " term-row-interactive" : ""}`}
+            title={hitTarget?.label}
+            onClick={onWebAction ? (event) => handleRowClick(event, row, i) : undefined}
+            dangerouslySetInnerHTML={{ __html: row || "&nbsp;" }}
+          />
+        );
+      })}
     </div>
   );
 });
