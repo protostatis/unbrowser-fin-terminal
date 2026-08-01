@@ -69,23 +69,26 @@ export function normalizeUnbrowserMcpUrl(raw: string): string {
   return parsed.href;
 }
 
-/** Keep transport details out of user-facing research status while retaining useful recovery guidance. */
+const SOURCE_RETRIEVAL_UNAVAILABLE = "Source retrieval is temporarily unavailable. Try refreshing later.";
+const SOURCE_RETRIEVAL_BUSY = "Source retrieval is busy. Try refreshing later.";
+const SOURCE_RETRIEVAL_TIMEOUT = "Source retrieval timed out. Try refreshing later.";
+
+const SAFE_SOURCE_RETRIEVAL_MESSAGES = new Set([
+  "Source returned no extractable content",
+  "Page requires a higher-fidelity browser; scripts were not executed",
+  "Source presented an access challenge",
+  SOURCE_RETRIEVAL_UNAVAILABLE,
+  SOURCE_RETRIEVAL_BUSY,
+  SOURCE_RETRIEVAL_TIMEOUT,
+]);
+
+/** Convert MCP transport and tool failures into safe, actionable research status. */
 export function userFacingUnbrowserError(message: string): string {
   const normalized = message.replace(/\s+/g, " ").trim();
-  const statusMatch = normalized.match(/\bHTTP\s+(\d{3})\b/i);
-  if (!statusMatch) return normalized;
-
-  switch (Number(statusMatch[1])) {
-    case 401:
-    case 403:
-      return "This source is not available to this research run.";
-    case 404:
-      return "This source is no longer available.";
-    case 429:
-      return "Source retrieval is busy. Try refreshing later.";
-    default:
-      return "Source retrieval is temporarily unavailable. Try refreshing later.";
-  }
+  if (SAFE_SOURCE_RETRIEVAL_MESSAGES.has(normalized)) return normalized;
+  if (/\bHTTP\s+429\b/i.test(normalized)) return SOURCE_RETRIEVAL_BUSY;
+  if (/\b(?:timed out|timeout)\b/i.test(normalized)) return SOURCE_RETRIEVAL_TIMEOUT;
+  return SOURCE_RETRIEVAL_UNAVAILABLE;
 }
 
 function timeoutSignal(parent: AbortSignal | undefined, timeoutMs: number): {
@@ -287,14 +290,14 @@ export class UnbrowserMcpClient {
   }
 
   async navigate(url: string, signal?: AbortSignal): Promise<UnbrowserNavigation> {
-    return this.withSession(async (session) => {
+    return this.withUserFacingErrors(() => this.withSession(async (session) => {
       const text = await session.callTool("navigate", { url, exec_scripts: false, include_ascii: false }, signal);
       const result = parseToolJson(text, "navigate");
       if (!result || typeof result !== "object" || Array.isArray(result)) {
         throw new Error("unbrowser navigate returned an invalid result");
       }
       return result as UnbrowserNavigation;
-    }, signal);
+    }, signal));
   }
 
   async extract(
@@ -302,7 +305,7 @@ export class UnbrowserMcpClient {
     mode: UnbrowserExtractionMode,
     signal?: AbortSignal,
   ): Promise<UnbrowserExtraction> {
-    return this.withSession(async (session) => {
+    return this.withUserFacingErrors(() => this.withSession(async (session) => {
       const navigationText = await session.callTool(
         "navigate",
         { url, exec_scripts: false, include_ascii: false },
@@ -359,7 +362,15 @@ export class UnbrowserMcpClient {
         content: normalized.slice(0, this.maxExtractChars),
         truncated,
       };
-    }, signal);
+    }, signal));
+  }
+
+  private async withUserFacingErrors<T>(operation: () => Promise<T>): Promise<T> {
+    try {
+      return await operation();
+    } catch (error) {
+      throw new Error(userFacingUnbrowserError(error instanceof Error ? error.message : String(error)));
+    }
   }
 
   private async withSession<T>(

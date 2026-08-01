@@ -2540,8 +2540,7 @@ function createResearchJob(request: ResearchRequest): ResearchJob | undefined {
 function updateResearchJob(id: string, patch: Partial<Omit<ResearchJob, "id" | "startedAt">>): ResearchJob | undefined {
 	const previous = researchJobs.get(id);
 	if (!previous) return undefined;
-	const error = typeof patch.error === "string" ? userFacingUnbrowserError(patch.error) : patch.error;
-	const next: ResearchJob = { ...previous, ...patch, ...(error !== undefined ? { error } : {}), updatedAt: Date.now() };
+	const next: ResearchJob = { ...previous, ...patch, updatedAt: Date.now() };
 	researchJobs.set(id, next);
 	const latest = latestResearchBySymbol.get(next.symbol);
 	if (!latest || (researchJobs.get(latest)?.startedAt ?? 0) <= next.startedAt) latestResearchBySymbol.set(next.symbol, id);
@@ -6892,7 +6891,7 @@ export default function (pi: ExtensionAPI) {
 			try {
 				extraction = await requireUnbrowserMcpClient().extract(safeUrl, mode, signal);
 			} catch (error) {
-				const failureNote = cleanText(error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 180).trim() || "Source extraction failed";
+				const failureNote = userFacingUnbrowserError(cleanText(error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 180).trim());
 				recordEvidencePacket(job, {
 					sourceId: candidate.sourceId,
 					sourceTitle: candidate.title,
@@ -7041,7 +7040,7 @@ export default function (pi: ExtensionAPI) {
 				const research = researchResult.status === "fulfilled" ? researchResult.value : undefined;
 				const failures: string[] = [];
 				if (quoteResult.status === "rejected") failures.push(`Quote: ${String(quoteResult.reason).slice(0, 200)}`);
-				if (researchResult.status === "rejected") failures.push(`Search: ${String(researchResult.reason).slice(0, 200)}`);
+				if (researchResult.status === "rejected") failures.push(`Search: ${userFacingUnbrowserError(String(researchResult.reason))}`);
 				const raw: DiscoveryCandidate[] = (research?.sources ?? []).map((s: { text: string; url: string }, i: number) => {
 					let source = "web";
 					try { source = new URL(s.url).hostname.replace(/^www\./, ""); } catch { /* keep web */ }
@@ -7051,7 +7050,7 @@ export default function (pi: ExtensionAPI) {
 				const challenge = research?.challenge
 					? `${research.challenge.provider}: ${research.challenge.reason}`
 					: researchResult.status === "rejected"
-						? `Source discovery unavailable: ${cleanText(String(researchResult.reason)).replace(/\s+/g, " ").slice(0, 180) || "request failed"}`
+						? userFacingUnbrowserError(String(researchResult.reason))
 						: undefined;
 				const query = research?.query || question || "latest news and catalysts";
 				const text = [

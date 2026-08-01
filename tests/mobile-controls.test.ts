@@ -93,6 +93,21 @@ test("research status names the active source-search and evidence phases", () =>
     }),
     "RESEARCH AAPL · EXTRACTING EVIDENCE",
   );
+  assert.equal(
+    activeResearchStatus({
+      researchQueue: [{ symbol: "MSFT", phase: "cancelling", outcome: "cancelled" }],
+    }),
+    "RESEARCH MSFT · CANCELLING",
+  );
+  assert.equal(
+    activeResearchStatus({
+      researchQueue: [
+        { symbol: "MSFT", phase: "cancelling", outcome: "cancelled" },
+        { symbol: "AAPL", phase: "running", activity: "extracting" },
+      ],
+    }),
+    "RESEARCH AAPL · EXTRACTING EVIDENCE",
+  );
   assert.equal(activeResearchStatus({}), undefined);
 });
 

@@ -37,6 +37,11 @@ const WHEEL_ACTION_INTERVAL_MS = 520;
 const WHEEL_DELTA_LINE = 1;
 const WHEEL_DELTA_PAGE = 2;
 
+type TouchGesture = {
+  point: SwipePoint;
+  pane?: TerminalPane;
+};
+
 function normalizedWheelPixels(event: WheelEvent<HTMLDivElement>): number {
   if (event.deltaMode === WHEEL_DELTA_LINE) return event.deltaY * 16;
   if (event.deltaMode === WHEEL_DELTA_PAGE) {
@@ -63,7 +68,7 @@ export const TerminalFrame = memo(function TerminalFrame({
   onWebAction,
   terminalRef,
 }: TerminalFrameProps) {
-  const swipeStartRef = useRef<SwipePoint | null>(null);
+  const swipeStartRef = useRef<TouchGesture | null>(null);
   const activeTouchPointersRef = useRef(new Set<number>());
   const wheelRemainderRef = useRef(0);
   const wheelDirectionRef = useRef<"up" | "down" | null>(null);
@@ -91,6 +96,23 @@ export const TerminalFrame = memo(function TerminalFrame({
     y: event.clientY,
     at: performance.now(),
   });
+
+  const touchPaneAtPointer = (event: PointerEvent<HTMLDivElement>): TerminalPane | undefined => {
+    if (!(event.target instanceof Element)) return undefined;
+    const row = event.target.closest(".term-row");
+    const frame = event.currentTarget;
+    if (!row || row.parentElement !== frame) return undefined;
+    const rowIndex = Array.from(frame.children).indexOf(row);
+    const rect = frame.getBoundingClientRect();
+    if (rowIndex < 0 || rect.width <= 0) return undefined;
+    return terminalPaneAtPosition(
+      state,
+      columns,
+      rowIndex,
+      rows.length,
+      (event.clientX - rect.left) / rect.width,
+    );
+  };
 
   const handleRowClick = (
     event: MouseEvent<HTMLDivElement>,
@@ -215,7 +237,13 @@ export const TerminalFrame = memo(function TerminalFrame({
     }, WHEEL_ACTION_INTERVAL_MS - elapsed);
   };
 
-  const touchScrollEnabled = canUsePointerScroll(state);
+  const touchScrollEnabled = Boolean(onWebAction) && (
+    canUsePointerScroll(state) ||
+    canUsePointerScroll(state, "headlines") ||
+    canUsePointerScroll(state, "story") ||
+    canUsePointerScroll(state, "lanes") ||
+    canUsePointerScroll(state, "briefing")
+  );
 
   return (
     <div
@@ -224,16 +252,15 @@ export const TerminalFrame = memo(function TerminalFrame({
       role="application"
       aria-label="Market terminal. Keyboard commands active. Use Tab to change panes."
       tabIndex={0}
-      style={{ touchAction: touchScrollEnabled ? "none" : undefined }}
+      style={{ touchAction: touchScrollEnabled ? "pinch-zoom" : undefined }}
       onPointerDown={(event) => {
         event.currentTarget.focus({ preventScroll: true });
         if (event.pointerType !== "touch") return;
         suppressClickRef.current = false;
         activeTouchPointersRef.current.add(event.pointerId);
-        swipeStartRef.current =
-          activeTouchPointersRef.current.size === 1 && event.isPrimary
-            ? pointerPoint(event)
-            : null;
+        swipeStartRef.current = activeTouchPointersRef.current.size === 1 && event.isPrimary
+          ? { point: pointerPoint(event), pane: touchPaneAtPointer(event) }
+          : null;
       }}
       onPointerUp={(event) => {
         const start = swipeStartRef.current;
@@ -249,7 +276,7 @@ export const TerminalFrame = memo(function TerminalFrame({
           !event.isPrimary
         ) return;
         const end = pointerPoint(event);
-        const input = horizontalSwipeInput(start, end);
+        const input = horizontalSwipeInput(start.point, end);
         if (input) {
           suppressClickRef.current = true;
           onInput?.(input);
@@ -258,12 +285,16 @@ export const TerminalFrame = memo(function TerminalFrame({
           });
           return;
         }
-        const scroll = verticalSwipeScroll(start, end);
-        if (scroll && touchScrollEnabled && onWebAction) {
+        const scroll = verticalSwipeScroll(start.point, end);
+        const canScrollAtTouchStart = start.pane
+          ? canUsePointerScroll(state, start.pane)
+          : canUsePointerScroll(state);
+        if (scroll && canScrollAtTouchStart && onWebAction) {
           suppressClickRef.current = true;
           onWebAction({
             action: "scroll",
             ...scroll,
+            ...(start.pane ? { pane: start.pane } : {}),
             ...(state?.screen ? { screen: state.screen } : {}),
           });
           requestAnimationFrame(() => {

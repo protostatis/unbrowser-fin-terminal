@@ -181,6 +181,7 @@ export function activeResearchStatus(state?: TerminalFrameState): string | undef
   const queued = state?.researchQueue ?? [];
   const active = queued.find((job) => job.phase === "running")
     ?? queued.find((job) => job.phase === "dispatched")
+    ?? queued.find((job) => job.phase === "cancelling")
     ?? queued.find((job) => job.phase === "queued");
   return active ? researchStatusFor(active) : undefined;
 }
