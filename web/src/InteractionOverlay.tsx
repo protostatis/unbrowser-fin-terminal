@@ -5,19 +5,13 @@ import {
   paneChoices,
   scrollControls,
   contextKeyHints,
+  type TerminalWebAction,
   type PaneModel,
   type ScrollControl,
   type ContextKeyHint,
 } from "./web-interactions";
 
-/* ── Discriminated action union matching the server protocol ─────────── */
-
-export type TerminalWebAction =
-  | { action: "select"; screen: string; index: number; item: string }
-  | { action: "focus-pane"; pane: "headlines" | "story" | "lanes" | "briefing" }
-  | { action: "primary" }
-  | { action: "why" }
-  | { action: "scroll"; direction: "up" | "down"; amount: number };
+export type { TerminalWebAction } from "./web-interactions";
 
 /* ── Props ──────────────────────────────────────────────────────────── */
 
@@ -84,7 +78,7 @@ export function InteractionOverlay({
 
   const cacheLocked = Boolean(state?.cacheDecision);
   const searching = Boolean(state?.searching);
-  const actionDisabled = disabled || cacheLocked || searching;
+  const actionDisabled = disabled || !state || cacheLocked || searching;
 
   const hasSplitPane =
     paneModel !== undefined && paneModel.panes.length > 1;
@@ -143,7 +137,7 @@ export function InteractionOverlay({
           {hasItems && (
             <div
               className="interaction-list"
-              role="listbox"
+              role="group"
               aria-label={`Select item in ${state?.screen ?? "market"}`}
             >
               {items.map((item) => (
@@ -151,13 +145,12 @@ export function InteractionOverlay({
                   key={item.index}
                   type="button"
                   className="interaction-list-item"
-                  role="option"
-                  aria-selected={item.selected}
+                  aria-pressed={item.selected}
                   disabled={actionDisabled}
                   onClick={() =>
                     emit({
                       action: "select",
-                      screen: state?.screen ?? "market",
+                      screen: state?.screen ?? "MARKET",
                       index: item.index,
                       item: item.label,
                     })
@@ -192,9 +185,7 @@ export function InteractionOverlay({
                   className="interaction-pane-btn"
                   aria-pressed={pane.selected}
                   disabled={actionDisabled || pane.selected}
-                  onClick={() =>
-                    emit({ action: "focus-pane", pane: pane.id as "headlines" | "story" | "lanes" | "briefing" })
-                  }
+                  onClick={() => emit({ action: "focus-pane", pane: pane.id })}
                 >
                   {pane.label}
                 </button>

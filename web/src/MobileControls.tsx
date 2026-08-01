@@ -13,6 +13,7 @@ interface MobileControlsProps {
   state?: TerminalFrameState;
   disabled: boolean;
   onInput: (data: string) => void;
+  onReturnToTerminal?(): void;
 }
 
 function contextLabel(state?: TerminalFrameState): string {
@@ -24,13 +25,13 @@ export function MobileControls({
   state,
   disabled,
   onInput,
+  onReturnToTerminal,
 }: MobileControlsProps) {
   const [searchOpen, setSearchOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [searchError, setSearchError] = useState("");
   const searchInputRef = useRef<HTMLInputElement>(null);
   const searchSheetRef = useRef<HTMLFormElement>(null);
-  const searchTriggerRef = useRef<HTMLButtonElement>(null);
   const cacheLocked = Boolean(state?.cacheDecision);
   const actions = mobileActions(state);
 
@@ -38,7 +39,7 @@ export function MobileControls({
     setSearchOpen(false);
     setQuery("");
     setSearchError("");
-    requestAnimationFrame(() => searchTriggerRef.current?.focus());
+    requestAnimationFrame(() => onReturnToTerminal?.());
   };
 
   useEffect(() => {
@@ -169,7 +170,6 @@ export function MobileControls({
             <button
               type="button"
               key={action.id}
-              ref={action.id === "search" ? searchTriggerRef : undefined}
               className={`mobile-key mobile-key-action mobile-key-${action.tone || "default"}`}
               disabled={disabled || action.disabled}
               onClick={() => activate(action)}

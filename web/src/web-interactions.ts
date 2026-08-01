@@ -14,6 +14,20 @@
 import type { TerminalFrameState } from "./mobile-controls";
 import { TERMINAL_INPUTS } from "./mobile-controls";
 
+/**
+ * Whitelisted semantic browser actions. The server validates each action
+ * against the live terminal state before translating it to canonical inputs.
+ */
+export type TerminalWebAction =
+  | { action: "select"; screen: string; index: number; item: string }
+  | {
+      action: "focus-pane";
+      pane: "headlines" | "story" | "lanes" | "briefing";
+    }
+  | { action: "primary" }
+  | { action: "why" }
+  | { action: "scroll"; direction: "up" | "down"; amount?: number };
+
 /* ── Selectable list ──────────────────────────────────────────────────── */
 
 export interface SelectableItem {
@@ -47,13 +61,13 @@ export function selectableItems(state?: TerminalFrameState): SelectableItem[] {
 /* ── Pane choices (SIGNALS / EVENTS) ──────────────────────────────────── */
 
 export interface PaneChoice {
-  id: string;
+  id: "headlines" | "story" | "lanes" | "briefing";
   label: string;
   selected: boolean;
 }
 
 export interface PaneModel {
-  activePaneId: string;
+  activePaneId: PaneChoice["id"];
   panes: PaneChoice[];
 }
 
@@ -155,6 +169,17 @@ export function arrowsMoveSelection(state?: TerminalFrameState): boolean {
   if (screen === "SIGNALS") return state.signalsFocus !== "story";
   if (screen === "EVENTS") return state.eventsFocus !== "briefing";
   return screen === "MARKET" || screen === "MOVERS" || screen === "WATCH";
+}
+
+/**
+ * Whether a mouse wheel / trackpad gesture has a meaningful canonical action
+ * in the current view. Lists move the selection; canvases scroll their content.
+ */
+export function canUsePointerScroll(state?: TerminalFrameState): boolean {
+  return (
+    arrowsMoveSelection(state) ||
+    scrollControls(state).some((control) => control.scrollable)
+  );
 }
 
 /* ── Key guidance ─────────────────────────────────────────────────────── */

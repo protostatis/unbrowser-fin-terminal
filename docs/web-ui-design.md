@@ -211,6 +211,12 @@ backend HTML-escapes all dynamic text, so this is XSS-safe).
 
 Client → server:
 - `{ "type": "input", "data": "<raw key string>" }` — forward to `handleInput`
+- `{ "type": "web_action", "data": { ... } }` — a whitelisted browser-only
+  semantic action. The server validates it against the current `debugState()`
+  and translates it to canonical raw inputs, so a click on a distant mover does
+  not send dozens of client messages. Supported actions are `select`
+  (`screen`, `index`, `item`), `focus-pane` (`pane`), `scroll` (`direction`,
+  optional `amount`), `primary`, and `why`.
 - `{ "type": "resize", "cols": number, "rows": number }` — update
   `webTui.terminal.rows` and re-render at `cols`
 - `{ "type": "command", "name": "market", "args": "AAPL" }` — (re)open a panel

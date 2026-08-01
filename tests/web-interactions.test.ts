@@ -3,6 +3,7 @@ import test from "node:test";
 import type { TerminalFrameState } from "../web/src/mobile-controls.js";
 import {
   arrowsMoveSelection,
+  canUsePointerScroll,
   contextKeyHints,
   paneChoices,
   scrollControls,
@@ -109,6 +110,34 @@ test("arrows move selection on normal market lists, not story or briefing", () =
   assert.equal(arrowsMoveSelection({ mode: "market", screen: "SIGNALS", signalsFocus: "story" }), false);
   assert.equal(arrowsMoveSelection({ mode: "market", screen: "EVENTS", eventsFocus: "briefing" }), false);
   assert.equal(arrowsMoveSelection({ mode: "ticker", screen: "RESEARCH" }), false);
+});
+
+test("pointer scrolling is available only when a list or canvas can respond", () => {
+  assert.equal(canUsePointerScroll(), false);
+  assert.equal(canUsePointerScroll({ mode: "ticker", screen: "QUOTE" }), false);
+  assert.equal(
+    canUsePointerScroll({ mode: "ticker", screen: "RESEARCH", hasCanvas: true }),
+    true,
+  );
+  assert.equal(canUsePointerScroll({ mode: "market", screen: "MOVERS" }), true);
+  assert.equal(
+    canUsePointerScroll({
+      mode: "market",
+      screen: "SIGNALS",
+      signalsFocus: "story",
+      storyScroll: { offset: 0, rows: 8, viewportRows: 8 },
+    }),
+    false,
+  );
+  assert.equal(
+    canUsePointerScroll({
+      mode: "market",
+      screen: "SIGNALS",
+      signalsFocus: "story",
+      storyScroll: { offset: 0, rows: 9, viewportRows: 8 },
+    }),
+    true,
+  );
 });
 
 test("key hints foreground arrows, Enter, and Tab before J/K", () => {

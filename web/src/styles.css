@@ -51,6 +51,11 @@ body,
   min-height: 0;
   overflow: hidden;
   padding: 8px 12px;
+  outline: none;
+}
+
+.terminal-frame:focus-visible {
+  box-shadow: inset 0 0 0 1px #58a6ff99;
 }
 
 .term-row {
@@ -855,8 +860,7 @@ strong {
  * A companion overlay for the browser projection of market actions. It is
  * positioned absolutely over .terminal so it never shifts cell measurement.
  * On wide screens it anchors as a compact edge panel; on narrow/coarse
- * screens it becomes an anchored bottom sheet that clears the mobile-controls
- * deck.
+ * screens it becomes a flex sibling directly above the mobile-controls deck.
  */
 
 .interaction-overlay {
@@ -979,7 +983,7 @@ strong {
   outline-offset: 1px;
 }
 
-.interaction-list-item[aria-selected="true"] {
+.interaction-list-item[aria-pressed="true"] {
   border-color: #1f6feb;
   background: #1f6feb14;
 }
@@ -1266,24 +1270,25 @@ strong {
 
 /* ── Narrow containers ─────────────────────────────────────────────────────
  *
- * On narrow viewports the overlay becomes a full-width anchored bottom sheet
- * positioned above the mobile-controls deck so the two decks never overlap.
+ * On narrow viewports the overlay becomes a full-width bottom sheet in the
+ * flex flow, directly above the mobile-controls deck.
  */
 
 @container (max-width: 600px) {
   .interaction-overlay {
-    right: 0;
-    left: 0;
-    bottom: 0;
+    position: relative;
+    right: auto;
+    left: auto;
+    bottom: auto;
     max-width: none;
     width: 100%;
     z-index: 59;
+    flex-shrink: 0;
   }
 
   .interaction-toggle {
     position: relative;
     margin: 0 8px 4px auto;
-    /* Pull the toggle above the mobile-controls area */
     bottom: auto;
   }
 
@@ -1309,12 +1314,14 @@ strong {
 
 @media (hover: none) and (pointer: coarse) {
   .interaction-overlay {
-    right: 0;
-    left: 0;
-    bottom: 0;
+    position: relative;
+    right: auto;
+    left: auto;
+    bottom: auto;
     max-width: none;
     width: 100%;
     z-index: 59;
+    flex-shrink: 0;
   }
 
   .interaction-toggle {

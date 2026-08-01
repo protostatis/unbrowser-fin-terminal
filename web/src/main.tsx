@@ -3,6 +3,10 @@ import { createRoot } from "react-dom/client";
 import { TerminalSocket } from "./socket";
 import { TerminalFrame } from "./TerminalFrame";
 import { MobileControls } from "./MobileControls";
+import {
+  InteractionOverlay,
+  type TerminalWebAction,
+} from "./InteractionOverlay";
 import { keyToData } from "./keyboard";
 import { PUBLIC_DEMO } from "./demo-mode";
 import { DEMO_BUSY_CLOSE_CODE } from "./socket";
@@ -69,6 +73,17 @@ function App() {
   /* ── Container / ruler refs for viewport measurement ───────────────── */
   const containerRef = useRef<HTMLDivElement>(null);
   const rulerRef = useRef<HTMLSpanElement>(null);
+  const terminalFrameRef = useRef<HTMLDivElement>(null);
+
+  const focusTerminal = () => {
+    requestAnimationFrame(() => {
+      terminalFrameRef.current?.focus({ preventScroll: true });
+    });
+  };
+
+  useEffect(() => {
+    focusTerminal();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   /* ── WebSocket lifecycle ──────────────────────────────────────────────── */
 
@@ -237,11 +252,12 @@ function App() {
           e.preventDefault();
           s.sendSelectResponse(selectReqRef.current.id, undefined, true);
           setSelectReq(null);
+          focusTerminal();
         }
         return;
       }
 
-      const data = keyToData(e);
+      const data = keyToData(e, { captureTabOnControl: true });
       if (data !== null) {
         e.preventDefault();
         s.sendInput(data);
@@ -258,6 +274,7 @@ function App() {
     if (selectReq) {
       socket.sendSelectResponse(selectReq.id, value);
       setSelectReq(null);
+      focusTerminal();
     }
   };
 
@@ -265,6 +282,7 @@ function App() {
     if (selectReq) {
       socket.sendSelectResponse(selectReq.id, undefined, true);
       setSelectReq(null);
+      focusTerminal();
     }
   };
 
@@ -274,6 +292,7 @@ function App() {
     isClosedRef.current = false;
     socket.sendCommand("market", "");
     forceUpdate();
+    focusTerminal();
   };
 
   const handleTouchInput = (data: string) => {
@@ -283,6 +302,16 @@ function App() {
       selectReqRef.current
     ) return;
     socket.sendInput(data);
+    focusTerminal();
+  };
+
+  const handleWebAction = (action: TerminalWebAction) => {
+    if (
+      connectionStateRef.current !== "connected" ||
+      isClosedRef.current ||
+      selectReqRef.current
+    ) return;
+    socket.sendWebAction(action);
   };
 
   /* ── Render ──────────────────────────────────────────────────────────────── */
@@ -320,7 +349,13 @@ function App() {
       </span>
 
       {/* Terminal grid */}
-      <TerminalFrame rows={rowsRef.current} onInput={handleTouchInput} />
+      <TerminalFrame
+        rows={rowsRef.current}
+        state={frameStateRef.current}
+        onInput={handleTouchInput}
+        onWebAction={handleWebAction}
+        terminalRef={terminalFrameRef}
+      />
 
       {/* Actionable startup / terminal-less reconnect state */}
       {!hasFrame && !isClosedRef.current && (
@@ -348,6 +383,13 @@ function App() {
             : "Disconnected"}
       </div>
 
+      <InteractionOverlay
+        state={frameStateRef.current}
+        disabled={cs !== "connected" || Boolean(selectReq) || isClosedRef.current}
+        onAction={handleWebAction}
+        onReturnToTerminal={focusTerminal}
+      />
+
       {/* Public demo banner */}
       {frameStateRef.current?.demo && (
         <div className="demo-banner" role="status">
@@ -359,6 +401,7 @@ function App() {
         state={frameStateRef.current}
         disabled={cs !== "connected" || Boolean(selectReq) || isClosedRef.current}
         onInput={handleTouchInput}
+        onReturnToTerminal={focusTerminal}
       />
 
       {/* Toast notification */}

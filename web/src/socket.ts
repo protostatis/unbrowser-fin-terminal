@@ -1,4 +1,5 @@
 import type { TerminalFrameState } from "./mobile-controls";
+import type { TerminalWebAction } from "./web-interactions";
 
 /**
  * WebSocket client for the Pi market-terminal backend.
@@ -183,6 +184,11 @@ export class TerminalSocket {
 
   sendInput(data: string): void {
     this.send({ type: "input", data });
+  }
+
+  /** Send a validated semantic browser action to the terminal bridge. */
+  sendWebAction(action: TerminalWebAction): void {
+    this.send({ type: "web_action", data: action });
   }
 
   sendResize(cols: number, rows: number): void {

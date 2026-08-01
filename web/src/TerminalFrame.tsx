@@ -1,10 +1,37 @@
-import { memo, useRef, type PointerEvent } from "react";
+import {
+  memo,
+  useRef,
+  type PointerEvent,
+  type Ref,
+  type WheelEvent,
+} from "react";
 import { horizontalSwipeInput, type SwipePoint } from "./mobile-controls";
+import type { TerminalFrameState } from "./mobile-controls";
+import {
+  canUsePointerScroll,
+  type TerminalWebAction,
+} from "./web-interactions";
 
 interface TerminalFrameProps {
   /** Array of HTML-safe row strings emitted by the backend web theme. */
   rows: string[];
+  /** The current semantic state, used only to gate pointer scrolling. */
+  state?: TerminalFrameState;
   onInput?: (data: string) => void;
+  onWebAction?: (action: TerminalWebAction) => void;
+  terminalRef?: Ref<HTMLDivElement>;
+}
+
+const WHEEL_STEP_PIXELS = 48;
+const WHEEL_DELTA_LINE = 1;
+const WHEEL_DELTA_PAGE = 2;
+
+function normalizedWheelPixels(event: WheelEvent<HTMLDivElement>): number {
+  if (event.deltaMode === WHEEL_DELTA_LINE) return event.deltaY * 16;
+  if (event.deltaMode === WHEEL_DELTA_PAGE) {
+    return event.deltaY * event.currentTarget.clientHeight;
+  }
+  return event.deltaY;
 }
 
 /**
@@ -19,10 +46,15 @@ interface TerminalFrameProps {
  */
 export const TerminalFrame = memo(function TerminalFrame({
   rows,
+  state,
   onInput,
+  onWebAction,
+  terminalRef,
 }: TerminalFrameProps) {
   const swipeStartRef = useRef<SwipePoint | null>(null);
   const activeTouchPointersRef = useRef(new Set<number>());
+  const wheelRemainderRef = useRef(0);
+  const wheelDirectionRef = useRef<"up" | "down" | null>(null);
 
   const pointerPoint = (event: PointerEvent<HTMLDivElement>): SwipePoint => ({
     x: event.clientX,
@@ -32,10 +64,13 @@ export const TerminalFrame = memo(function TerminalFrame({
 
   return (
     <div
+      ref={terminalRef}
       className="terminal-frame"
-      role="region"
-      aria-label="Market terminal display. Swipe left or right to change view."
+      role="application"
+      aria-label="Market terminal. Keyboard commands active. Use Tab to change panes."
+      tabIndex={0}
       onPointerDown={(event) => {
+        event.currentTarget.focus({ preventScroll: true });
         if (event.pointerType !== "touch") return;
         activeTouchPointersRef.current.add(event.pointerId);
         swipeStartRef.current =
@@ -62,6 +97,34 @@ export const TerminalFrame = memo(function TerminalFrame({
       onPointerCancel={(event) => {
         activeTouchPointersRef.current.delete(event.pointerId);
         swipeStartRef.current = null;
+      }}
+      onWheel={(event) => {
+        if (!onWebAction || !canUsePointerScroll(state)) return;
+        const pixels = normalizedWheelPixels(event);
+        if (!Number.isFinite(pixels) || pixels === 0) return;
+
+        event.preventDefault();
+        const direction = pixels < 0 ? "up" : "down";
+        if (
+          wheelDirectionRef.current !== null &&
+          wheelDirectionRef.current !== direction
+        ) {
+          wheelRemainderRef.current = 0;
+        }
+        wheelDirectionRef.current = direction;
+        wheelRemainderRef.current = Math.min(
+          WHEEL_STEP_PIXELS * 8,
+          wheelRemainderRef.current + Math.abs(pixels),
+        );
+
+        const amount = Math.min(
+          8,
+          Math.floor(wheelRemainderRef.current / WHEEL_STEP_PIXELS),
+        );
+        if (amount < 1) return;
+
+        wheelRemainderRef.current -= amount * WHEEL_STEP_PIXELS;
+        onWebAction({ action: "scroll", direction, amount });
       }}
     >
       {rows.map((row, i) => (
