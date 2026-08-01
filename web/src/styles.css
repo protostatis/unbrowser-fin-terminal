@@ -1465,7 +1465,7 @@ strong {
 
 .interaction-overlay {
   position: absolute;
-  right: 0;
+  left: 0;
   bottom: 0;
   z-index: 60;
   max-width: 380px;
@@ -1480,7 +1480,7 @@ strong {
   appearance: none;
   display: flex;
   align-items: center;
-  margin: 0 8px 8px auto;
+  margin: 0 auto 8px 8px;
   width: 28px;
   height: 28px;
   justify-content: center;
@@ -1890,7 +1890,7 @@ strong {
 
   .interaction-toggle {
     position: relative;
-    margin: 0 8px 4px auto;
+    margin: 0 auto 4px 8px;
     bottom: auto;
     width: 44px;
     height: 44px;
@@ -1938,7 +1938,7 @@ strong {
 
   .interaction-toggle {
     position: relative;
-    margin: 0 8px 4px auto;
+    margin: 0 auto 4px 8px;
     bottom: auto;
     width: 44px;
     height: 44px;
