@@ -10,6 +10,13 @@ export const TERMINAL_INPUTS = {
 
 export type ChartScope = "day" | "week" | "month" | "year" | "max";
 
+/** Scroll window emitted by the canonical extension's story/briefing panes. */
+export interface TerminalScrollWindow {
+  offset: number;
+  rows: number;
+  viewportRows: number;
+}
+
 export interface TerminalFrameState {
   mode?: "market" | "ticker";
   screen?: string;
@@ -21,6 +28,18 @@ export interface TerminalFrameState {
   cacheDecision?: unknown;
   research?: { active?: boolean };
   demo?: boolean;
+  // Fields emitted by the canonical extension's debugState() and consumed by
+  // the browser interaction layer (web-interactions.ts). They only exist for
+  // states the extension actually publishes them for.
+  status?: string;
+  selectedIndex?: number;
+  selected?: string;
+  available?: string[];
+  signalsFocus?: "headlines" | "story";
+  eventsFocus?: "lanes" | "briefing";
+  storyScroll?: TerminalScrollWindow;
+  eventScroll?: TerminalScrollWindow;
+  hasCanvas?: boolean;
 }
 
 export interface MobileAction {
