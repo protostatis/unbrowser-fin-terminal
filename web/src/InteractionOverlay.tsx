@@ -14,10 +14,10 @@ import {
 
 export type TerminalWebAction =
   | { action: "select"; screen: string; index: number; item: string }
-  | { action: "focus-pane"; paneId: string }
+  | { action: "focus-pane"; pane: "headlines" | "story" | "lanes" | "briefing" }
   | { action: "primary" }
   | { action: "why" }
-  | { action: "scroll"; direction: "prev" | "next"; amount: number };
+  | { action: "scroll"; direction: "up" | "down"; amount: number };
 
 /* ── Props ──────────────────────────────────────────────────────────── */
 
@@ -90,7 +90,6 @@ export function InteractionOverlay({
     paneModel !== undefined && paneModel.panes.length > 1;
 
   const isTicker = state?.mode === "ticker";
-  const isMarket = state?.mode === "market" || !state?.mode;
   const hasItems = items.length > 0;
   const hasScroll = scrollCtrls.some((c) => c.scrollable);
 
@@ -194,7 +193,7 @@ export function InteractionOverlay({
                   aria-pressed={pane.selected}
                   disabled={actionDisabled || pane.selected}
                   onClick={() =>
-                    emit({ action: "focus-pane", paneId: pane.id })
+                    emit({ action: "focus-pane", pane: pane.id as "headlines" | "story" | "lanes" | "briefing" })
                   }
                 >
                   {pane.label}
@@ -252,7 +251,7 @@ export function InteractionOverlay({
                     onClick={() =>
                       emit({
                         action: "scroll",
-                        direction: "prev",
+                        direction: "up",
                         amount: 3,
                       })
                     }
@@ -266,7 +265,7 @@ export function InteractionOverlay({
                     onClick={() =>
                       emit({
                         action: "scroll",
-                        direction: "next",
+                        direction: "down",
                         amount: 3,
                       })
                     }
