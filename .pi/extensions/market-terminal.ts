@@ -396,6 +396,7 @@ const researchQueue: string[] = [];
 const toolResearchJobs = new Map<string, string>();
 const researchCandidates = new ResearchCandidateRegistry({ maxExtractions: 4, ttlMs: 15 * 60_000 });
 const workerSubmittedResearch = new Set<string>();
+const workerFinalizations = new Set<string>();
 const isResearchWorkerProcess = process.env.MARKET_RESEARCH_WORKER === "1";
 type WorkerBridge = {
 	parentJobId: string;
@@ -2340,6 +2341,7 @@ function settleResearchJob(id: string, patch: Partial<Omit<ResearchJob, "id" | "
 	const next = updateResearchJob(id, { ...patch, phase: "settled", slotHeld: false, settledAt });
 	if (runningResearchId === id) runningResearchId = undefined;
 	workerSubmittedResearch.delete(id);
+	workerFinalizations.delete(id);
 	emitWorkerSettled(next);
 	const removed = new Set(pruneSettledResearchJobs(researchJobs));
 	if (removed.size > 0) {
@@ -2361,6 +2363,7 @@ function resetResearchJobs(): void {
 	latestResearchBySymbol.clear();
 	researchQueue.splice(0, researchQueue.length);
 	workerSubmittedResearch.clear();
+	workerFinalizations.clear();
 	toolResearchJobs.clear();
 	runningResearchId = undefined;
 	workerBridge = undefined;
@@ -2538,6 +2541,7 @@ function archivePayload(): ResearchArchiveFile {
 }
 
 async function persistResearchArchive(): Promise<void> {
+	if (isResearchWorkerProcess) throw new Error("Research workers must not persist the shared archive");
 	const target = archivePath;
 	if (!target) return;
 	archiveWriteQueue = archiveWriteQueue.catch(() => {}).then(async () => {
@@ -2562,6 +2566,7 @@ async function archiveCompletedCanvas(canvas: Canvas, question?: string): Promis
 }
 
 async function readProjectArchive(cwd: string): Promise<ArchivedResearch[]> {
+	if (isResearchWorkerProcess) throw new Error("Research workers must not read the shared archive");
 	const configuredDataDir = process.env.MARKET_DATA_DIR?.trim();
 	if (configuredDataDir && !isAbsolute(configuredDataDir)) {
 		throw new Error("MARKET_DATA_DIR must be an absolute path");
@@ -5280,6 +5285,7 @@ async function rebuildCanvasState(ctx: ExtensionContext): Promise<void> {
 }
 
 async function ensureArchiveLoaded(ctx: ExtensionContext, force = false): Promise<void> {
+	if (isResearchWorkerProcess) throw new Error("Research workers must not load the shared archive");
 	if (!force && archiveCwd === ctx.cwd && archiveReady) return archiveReady;
 	archiveCwd = ctx.cwd;
 	archiveReady = rebuildCanvasState(ctx);
@@ -5609,6 +5615,26 @@ export default function (pi: ExtensionAPI) {
 		settleResearchJob(jobId, { outcome: "failed", error: message || "Research worker failed" });
 	};
 
+	const finalizeWorkerCompletion = async (jobId: string, canvas: Canvas): Promise<void> => {
+		if (workerFinalizations.has(jobId)) return;
+		workerFinalizations.add(jobId);
+		const job = researchJobs.get(jobId);
+		if (!job || !researchSlotHeld(job) || job.outcome !== "complete") {
+			workerFinalizations.delete(jobId);
+			return;
+		}
+		try {
+			await archiveCompletedCanvas(canvas, job.question);
+			const current = researchJobs.get(jobId);
+			if (!current || !researchSlotHeld(current) || current.outcome !== "complete") return;
+			settleResearchJob(jobId, { outcome: "complete", error: undefined });
+		} catch (error) {
+			settleWorkerFailure(jobId, `Could not persist completed research: ${cleanText(error instanceof Error ? error.message : String(error)).slice(0, 140)}`);
+		} finally {
+			workerFinalizations.delete(jobId);
+		}
+	};
+
 	const applyWorkerEvent = (event: WorkerEvent): void => {
 		const job = researchJobs.get(event.jobId);
 		if (!job || !researchSlotHeld(job) || job.outcome === "cancelled") return;
@@ -5654,24 +5680,17 @@ export default function (pi: ExtensionAPI) {
 					error: undefined,
 					publishedBlocks: normalizeCanvasBlocks(canvas.blocks).length,
 				});
-				if (complete) {
-					void archiveCompletedCanvas(canvas, job.question).catch((error) => {
-						const current = researchJobs.get(job.id);
-						if (current && researchSlotHeld(current)) {
-							updateResearchJob(job.id, { error: `Archive warning: ${cleanText(error instanceof Error ? error.message : String(error)).slice(0, 140)}` });
-						}
-					});
-				}
 				return;
 			}
 			case "settled": {
 				const canvas = canvasForResearch(job.symbol, job.chartScope, job.researchKey);
-				const outcome = event.outcome === "complete" && canvas?.researchId === job.id && canvas.stage === "complete"
-					? "complete"
-					: event.outcome === "cancelled" ? "cancelled" : "failed";
+				if (event.outcome === "complete" && canvas?.researchId === job.id && canvas.stage === "complete") {
+					void finalizeWorkerCompletion(job.id, canvas);
+					return;
+				}
 				settleResearchJob(job.id, {
-					outcome,
-					...(outcome === "failed" ? { error: cleanText(event.error || "Worker settled without a complete canvas").slice(0, 180) } : {}),
+					outcome: event.outcome === "cancelled" ? "cancelled" : "failed",
+					...(event.outcome === "cancelled" ? {} : { error: cleanText(event.error || "Worker settled without a complete canvas").slice(0, 180) }),
 				});
 				return;
 			}
@@ -5766,6 +5785,7 @@ export default function (pi: ExtensionAPI) {
 		cancel(jobId) {
 			const job = jobId ? researchJobs.get(jobId) : undefined;
 			if (!job || !researchSlotHeld(job)) return { accepted: false, status: "NO ACTIVE RESEARCH FOR CURRENT SELECTION", job };
+			if (job.outcome === "complete") return { accepted: false, status: `RESEARCH ${job.contextLabel} IS FINALIZING`, job };
 			if (job.phase === "cancelling") return { accepted: false, status: `RESEARCH ${job.contextLabel} IS CANCELLING`, job };
 			if (!isResearchWorkerProcess) {
 				const cancelledByWorker = researchWorkerCoordinator?.cancel(job.id);
@@ -6521,16 +6541,6 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
-	const parseWorkerFailure = (raw: string): string | undefined => {
-		if (!raw || raw.length > 4_000) return undefined;
-		try {
-			const value = cleanText(Buffer.from(raw, "base64url").toString("utf8")).replace(/\s+/g, " ").trim();
-			return value ? value.slice(0, 500) : undefined;
-		} catch {
-			return undefined;
-		}
-	};
-
 	pi.registerCommand("market-worker-run", {
 		description: "Internal command used only by isolated market research workers",
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
@@ -6566,20 +6576,6 @@ export default function (pi: ExtensionAPI) {
 				activity: "seeding",
 				error: undefined,
 			});
-		},
-	});
-
-	pi.registerCommand("market-worker-fail", {
-		description: "Internal failure signal used only by isolated market research workers",
-		handler: async (args: string) => {
-			if (!isResearchWorkerProcess) throw new Error("/market-worker-fail is available only in an isolated research worker");
-			const message = parseWorkerFailure(args.trim()) || "Research worker failed before the agent settled";
-			const workerJobId = workerBridge?.workerJobId;
-			if (!workerJobId) {
-				emitWorkerEvent("fatal", { error: message });
-				return;
-			}
-			settleResearchJob(workerJobId, { outcome: "failed", error: message });
 		},
 	});
 

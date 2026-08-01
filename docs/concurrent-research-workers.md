@@ -72,7 +72,11 @@ allowlist:
 5. The parent accepts events only while the matching `(jobId, attemptId)` is
    active.  It translates worker canvas data to the parent job ID, updates the
    live panel, and remains the only archive writer.
-6. A completed/failed/cancelled worker releases its slot and starts the next
+6. A terminal IPC does not free a slot on its own: the coordinator keeps the
+   child tracked until it exits, force-killing a child that does not exit after
+   a short terminal grace period.  A parent-enforced 12-minute wall-clock
+   deadline fences, kills, and releases a non-terminal worker.
+7. A completed/failed/cancelled worker releases its slot and starts the next
    queued parent job.
 
 The initial queue limit remains 24 active-or-queued jobs.  This protects the
@@ -119,7 +123,8 @@ idempotent by `(attemptId, sequence)`.
 Cancelling a queued job removes it locally.  Cancelling a dispatched/running
 job first fences its attempt in the parent, sends `WorkerCancel`, asks that
 worker's Pi session to abort, and force-terminates it after a short grace
-period.  A late canvas event must never be rendered or archived.
+period.  A disconnected IPC channel follows the same forced cleanup path. A
+late canvas event must never be rendered or archived.
 
 This implementation has no automatic retries.  Retrying is a later policy
 decision once provider/MCP error telemetry exists; a retry must always receive
@@ -131,7 +136,12 @@ a new `attemptId`.
   `market-research-archive.json`, and active terminal reference.
 - Worker only: Pi messages, tool calls, temporary candidate grants, and its
   attempt-local canvas state.
-- Workers set worker mode and skip project archive loading/writing.
+- Workers clear `MARKET_DATA_DIR`, set worker mode, and archive load/write
+  functions fail closed in that mode.
+- A complete worker canvas is staged in the parent, but the parent archives it
+  only after a validated `settled: complete` event. The job becomes complete
+  only after that archive write succeeds; persistence failure is surfaced as a
+  failed job.
 - Archive writes stay serialized in the parent process.  No worker may inherit
   the shared archive path as a writable destination.
 
@@ -152,8 +162,9 @@ Unit tests must cover:
 1. FIFO scheduling with a two-worker cap.
 2. Cancellation fencing and ignored late worker events.
 3. Worker crash/fatal handling releases a slot and continues the queue.
-4. Environment validation for the concurrency setting.
-5. Existing market tool-allowlist assertions.
+4. Parent deadline, terminal-without-exit, and disconnected-IPC cleanup.
+5. Environment validation for the concurrency setting.
+6. Existing market tool-allowlist assertions.
 
 Manual/live characterization before increasing the cap must measure queue wait,
 completion latency, worker startup time, provider/MCP 429s, memory use, and

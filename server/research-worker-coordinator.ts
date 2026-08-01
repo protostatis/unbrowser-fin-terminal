@@ -67,6 +67,17 @@ export interface ResearchWorkerCoordinatorOptions {
    * Default 5 000 ms. Set to 0 in tests to fire synchronously.
    */
   graceMs?: number;
+  /**
+   * Hard wall-clock limit from fork through terminal IPC or child exit.
+   * Default 12 minutes, which leaves room for the worker's 10-minute model
+   * deadline plus dispatch overhead.
+   */
+  deadlineMs?: number;
+  /**
+   * How long to wait for a terminal child to exit before SIGKILL. Terminal
+   * workers continue to consume a concurrency slot until their exit event.
+   */
+  terminalGraceMs?: number;
   /** Called with every validated, in-scope worker event. */
   onEvent?: (event: WorkerEvent) => void;
   /** Called when the coordinator observes a non-recoverable worker fault. */
@@ -95,14 +106,18 @@ interface ActiveAttempt {
   jobId: string;
   attemptId: string;
   worker: WorkerHandle;
-  /** True once we have forwarded a settled/fatal event (or the worker exited). */
-  settled: boolean;
+  /** True once a settled/fatal event has been forwarded. */
+  terminal: boolean;
   /** Greatest sequence number seen so far. Initialised to −1 so seq 0 is accepted. */
   lastSequence: number;
   /** True when cancellation has been requested for this attempt. */
   cancelled: boolean;
   /** Handle returned by `setTimeout` for the force-kill. */
   cancelTimer: ReturnType<typeof globalThis.setTimeout> | null;
+  /** Parent-enforced deadline that covers worker boot, model work, and IPC. */
+  deadlineTimer: ReturnType<typeof globalThis.setTimeout> | null;
+  /** Post-terminal cleanup deadline; the child still owns its slot until exit. */
+  terminalTimer: ReturnType<typeof globalThis.setTimeout> | null;
 }
 
 interface QueuedJob {
@@ -131,6 +146,8 @@ export class ResearchWorkerCoordinator {
   private readonly workerFactory: WorkerFactory;
   private readonly generateAttemptId: () => string;
   private readonly graceMs: number;
+  private readonly deadlineMs: number;
+  private readonly terminalGraceMs: number;
   private readonly onEvent?: (event: WorkerEvent) => void;
   private readonly onError?: (jobId: string, error: Error) => void;
   private readonly _setTimeout: typeof globalThis.setTimeout;
@@ -155,6 +172,8 @@ export class ResearchWorkerCoordinator {
     this.generateAttemptId =
       options.generateAttemptId ?? defaultAttemptIdGenerator();
     this.graceMs = Math.max(0, options.graceMs ?? 5_000);
+    this.deadlineMs = positiveTimeout(options.deadlineMs, 12 * 60_000);
+    this.terminalGraceMs = positiveTimeout(options.terminalGraceMs, 5_000);
     this.onEvent = options.onEvent;
     this.onError = options.onError;
     this._setTimeout = options.setTimeout ?? globalThis.setTimeout;
@@ -234,7 +253,14 @@ export class ResearchWorkerCoordinator {
       attempt.cancelled = true;
 
       // Ask the worker to abort.
-      attempt.worker.send(makeCancelMessage(jobId, attemptId));
+      try {
+        attempt.worker.send(makeCancelMessage(jobId, attemptId));
+      } catch {
+        // The IPC channel may already be gone. The parent has fenced this
+        // attempt, so terminate it immediately rather than leaking a slot.
+        this.killAndRelease(attemptId, attempt);
+        return { cancelled: true, status: "running-cancelled" };
+      }
 
       // Force-kill after the grace period.
       if (attempt.cancelTimer !== null) {
@@ -263,11 +289,8 @@ export class ResearchWorkerCoordinator {
     this.queue.length = 0;
 
     // Kill every active worker.
-    for (const [attemptId, attempt] of this.active) {
-      if (attempt.cancelTimer !== null) {
-        this._clearTimeout(attempt.cancelTimer);
-        attempt.cancelTimer = null;
-      }
+    for (const [, attempt] of this.active) {
+      this.clearAttemptTimers(attempt);
       try {
         attempt.worker.kill("SIGTERM");
       } catch {
@@ -314,14 +337,19 @@ export class ResearchWorkerCoordinator {
       jobId,
       attemptId,
       worker,
-      settled: false,
+      terminal: false,
       lastSequence: -1,
       cancelled: false,
       cancelTimer: null,
+      deadlineTimer: null,
+      terminalTimer: null,
     };
 
     this.active.set(attemptId, attempt);
     this.activeJobIds.add(jobId);
+    attempt.deadlineTimer = this._setTimeout(() => {
+      this.expireAttempt(attemptId, attempt);
+    }, this.deadlineMs);
 
     // ── Wire worker lifecycle ───────────────────────────────────────────
 
@@ -330,7 +358,7 @@ export class ResearchWorkerCoordinator {
       const current = this.active.get(attemptId);
 
       // Guard: attempt is gone (already released) or fenced.
-      if (!current || current.cancelled || current.settled) return;
+      if (!current || current.cancelled || current.terminal) return;
 
       if (!isWorkerEvent(raw)) return;
 
@@ -348,10 +376,15 @@ export class ResearchWorkerCoordinator {
         // Consumer callback must not crash the coordinator.
       }
 
-      // Terminal event → release the slot.
+      // A terminal event means the parent may finalize the job, but the child
+      // still owns its slot until it exits. This prevents process-count drift
+      // when cleanup stalls after an otherwise valid terminal IPC message.
       if (raw.type === "settled" || raw.type === "fatal") {
-        current.settled = true;
-        this.releaseSlot(attemptId);
+        current.terminal = true;
+        this.clearDeadlineTimer(current);
+        current.terminalTimer = this._setTimeout(() => {
+          this.killTerminalWorker(attemptId, current);
+        }, this.terminalGraceMs);
       }
     });
 
@@ -360,7 +393,7 @@ export class ResearchWorkerCoordinator {
       const current = this.active.get(attemptId);
       if (!current) return;
 
-      if (!current.settled && !current.cancelled) {
+      if (!current.terminal && !current.cancelled) {
         // Worker exited without a settled/fatal event → treat as crash.
         this.emitError(
           jobId,
@@ -375,10 +408,9 @@ export class ResearchWorkerCoordinator {
     worker.onError((err) => {
       if (this._disposed) return;
       const current = this.active.get(attemptId);
-      if (current && !current.settled) {
+      if (current && !current.terminal) {
         this.emitError(jobId, err);
-        current.settled = true;
-        this.releaseSlot(attemptId, true);
+        this.killAndRelease(attemptId, current);
       }
     });
 
@@ -391,7 +423,7 @@ export class ResearchWorkerCoordinator {
         jobId,
         err instanceof Error ? err : new Error(String(err)),
       );
-      this.releaseSlot(attemptId, true);
+      this.killAndRelease(attemptId, attempt);
       return false;
     }
     return true;
@@ -399,15 +431,11 @@ export class ResearchWorkerCoordinator {
 
   // ── Internal: slot management ───────────────────────────────────────────
 
-  private releaseSlot(attemptId: string, terminate = false): void {
+  private releaseSlot(attemptId: string): void {
     const attempt = this.active.get(attemptId);
     if (!attempt) return;
 
-    // Clear the force-kill timer if it was set.
-    if (attempt.cancelTimer !== null) {
-      this._clearTimeout(attempt.cancelTimer);
-      attempt.cancelTimer = null;
-    }
+    this.clearAttemptTimers(attempt);
 
     this.active.delete(attemptId);
     this.activeJobIds.delete(attempt.jobId);
@@ -416,19 +444,11 @@ export class ResearchWorkerCoordinator {
     // "not-found" even after the attempt record is gone.
     this.rememberSettledJob(attempt.jobId);
 
-    if (terminate) {
-      try {
-        attempt.worker.kill("SIGKILL");
-      } catch {
-        // Already dead.
-      }
-    }
-
     this.pumpQueue();
   }
 
   private killAndRelease(attemptId: string, attempt: ActiveAttempt): void {
-    // Only act if this exact attempt is still registered and unfenced.
+    // Only act if this exact attempt is still registered.
     const current = this.active.get(attemptId);
     if (current !== attempt) return;
 
@@ -438,7 +458,47 @@ export class ResearchWorkerCoordinator {
       // Already dead.
     }
 
-    this.releaseSlot(attemptId, true);
+    this.releaseSlot(attemptId);
+  }
+
+  private expireAttempt(attemptId: string, attempt: ActiveAttempt): void {
+    const current = this.active.get(attemptId);
+    if (current !== attempt || current.terminal || current.cancelled) return;
+    current.cancelled = true;
+    this.emitError(
+      current.jobId,
+      new Error(`Research worker exceeded its ${Math.round(this.deadlineMs / 1_000)}s parent deadline`),
+    );
+    this.killAndRelease(attemptId, current);
+  }
+
+  private killTerminalWorker(attemptId: string, attempt: ActiveAttempt): void {
+    const current = this.active.get(attemptId);
+    if (current !== attempt || !current.terminal) return;
+    current.terminalTimer = null;
+    try {
+      current.worker.kill("SIGKILL");
+    } catch {
+      // If the process is already gone, its exit listener will release the slot.
+    }
+  }
+
+  private clearDeadlineTimer(attempt: ActiveAttempt): void {
+    if (attempt.deadlineTimer === null) return;
+    this._clearTimeout(attempt.deadlineTimer);
+    attempt.deadlineTimer = null;
+  }
+
+  private clearAttemptTimers(attempt: ActiveAttempt): void {
+    if (attempt.cancelTimer !== null) {
+      this._clearTimeout(attempt.cancelTimer);
+      attempt.cancelTimer = null;
+    }
+    this.clearDeadlineTimer(attempt);
+    if (attempt.terminalTimer !== null) {
+      this._clearTimeout(attempt.terminalTimer);
+      attempt.terminalTimer = null;
+    }
   }
 
   private pumpQueue(): void {
@@ -484,6 +544,12 @@ function clampConcurrency(value: number): number {
   return Math.min(value, 4);
 }
 
+function positiveTimeout(value: number | undefined, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? Math.floor(value)
+    : fallback;
+}
+
 function defaultAttemptIdGenerator(): () => string {
   let counter = 0;
   const pidPrefix = typeof process !== "undefined" && process.pid
@@ -513,7 +579,15 @@ export function createDefaultWorkerFactory(): WorkerFactory {
     let child: ChildProcess;
     try {
       child = fork(scriptPath, [], {
-        env: { ...process.env, ...env },
+        env: {
+          ...process.env,
+          ...env,
+          MARKET_RESEARCH_WORKER: "1",
+          // The extension also fails archive operations closed in worker mode.
+          // Clearing this prevents accidental future code from targeting the
+          // parent's persistent data directory.
+          MARKET_DATA_DIR: "",
+        },
         execArgv,
         stdio: ["ignore", "pipe", "pipe", "ipc"],
         serialization: "advanced",

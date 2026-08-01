@@ -69,11 +69,6 @@ function encodedRunMessage(run: WorkerRunMessage): string {
   return Buffer.from(JSON.stringify(run), "utf8").toString("base64url");
 }
 
-function encodedFailure(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
-  return Buffer.from(message.slice(0, 500), "utf8").toString("base64url");
-}
-
 function waitForRunMessage(): Promise<WorkerRunMessage> {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error("Research worker did not receive a run message")), 30_000);
@@ -192,12 +187,13 @@ async function shutdown(): Promise<void> {
   if (process.connected) process.disconnect();
 }
 
-async function reportDispatchedFailure(error: unknown): Promise<void> {
+async function abortDispatchedFailure(): Promise<void> {
   if (!session || !runDispatched) return;
   try {
-    await session.prompt(`/market-worker-fail ${encodedFailure(error)}`);
+    await session.abort();
   } catch {
-    // The parent will still classify an unexpected worker exit as a failure.
+    // The coordinator has a hard deadline and will fence a child that cannot
+    // acknowledge its own abort.
   }
 }
 
@@ -223,12 +219,13 @@ async function main(): Promise<void> {
 
 main()
   .catch(async (error) => {
+    process.exitCode = 1;
     if (activeRun && !runDispatched) {
       sendBootstrapEvent(activeRun, "fatal", {
-        error: error instanceof Error ? error.message.slice(0, 1_000) : String(error).slice(0, 1_000),
+        error: error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500),
       });
     } else {
-      await reportDispatchedFailure(error);
+      await abortDispatchedFailure();
     }
   })
   .finally(() => {

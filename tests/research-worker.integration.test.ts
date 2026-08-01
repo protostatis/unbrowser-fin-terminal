@@ -3,17 +3,18 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { createDefaultWorkerFactory } from "../server/research-worker-coordinator.js";
 import {
-  isWorkerEvent,
-  type WorkerEvent,
-} from "../server/research-worker-protocol.js";
+  createDefaultWorkerFactory,
+  ResearchWorkerCoordinator,
+  type WorkerFactory,
+} from "../server/research-worker-coordinator.js";
+import type { WorkerEvent } from "../server/research-worker-protocol.js";
 
-test("one-shot worker emits a terminal failure without a configured model", async () => {
+test("coordinator reclaims a real worker after dispatch failure without a configured model", async () => {
   const agentDir = await mkdtemp(path.join(tmpdir(), "fin-terminal-worker-test-"));
-  const factory = createDefaultWorkerFactory();
-  const worker = factory({
-    MARKET_RESEARCH_WORKER: "1",
+  const childFactory = createDefaultWorkerFactory();
+  const workerFactory: WorkerFactory = (env) => childFactory({
+    ...env,
     MARKET_ROOT: path.resolve(import.meta.dirname, ".."),
     PI_CODING_AGENT_DIR: agentDir,
     HOME: agentDir,
@@ -27,48 +28,38 @@ test("one-shot worker emits a terminal failure without a configured model", asyn
     OPENROUTER_API_KEY_FILE: "",
   });
   const events: WorkerEvent[] = [];
+  let coordinator: ResearchWorkerCoordinator | undefined;
 
   try {
-    const exit = await new Promise<{ code: number | null; signal: string | null }>((resolve, reject) => {
+    const failure = await new Promise<Error>((resolve, reject) => {
       const timer = setTimeout(() => {
-        worker.kill("SIGKILL");
+        coordinator?.dispose();
         reject(new Error("research worker integration test timed out"));
       }, 30_000);
-      worker.onMessage((message) => {
-        if (isWorkerEvent(message)) events.push(message);
-      });
-      worker.onError((error) => {
-        clearTimeout(timer);
-        reject(error);
-      });
-      worker.onExit((code, signal) => {
-        clearTimeout(timer);
-        resolve({ code, signal });
-      });
-      worker.send({
-        version: 1,
-        type: "run",
-        jobId: "integration-job",
-        attemptId: "integration-attempt",
-        request: {
-          symbol: "AAPL",
-          question: "Verify worker lifecycle without model credentials",
-          chartScope: "day",
-          researchKey: "v1/ticker/brief",
-          intent: "brief",
-          contextLabel: "AAPL BRIEF",
+      coordinator = new ResearchWorkerCoordinator({
+        workerFactory,
+        onEvent: (event) => events.push(event),
+        onError: (_jobId, error) => {
+          clearTimeout(timer);
+          resolve(error);
         },
       });
+      const result = coordinator.enqueue("integration-job", {
+        symbol: "AAPL",
+        question: "Verify worker lifecycle without model credentials",
+        chartScope: "day",
+        researchKey: "v1/ticker/brief",
+        intent: "brief",
+        contextLabel: "AAPL BRIEF",
+      });
+      if (!result.accepted) reject(new Error(`worker was not dispatched: ${result.reason}`));
     });
 
-    assert.equal(exit.signal, null);
-    assert.equal(exit.code, 0);
-    assert.deepEqual(events.map((event) => event.type), ["started", "job", "job", "settled"]);
-    const terminal = events.at(-1);
-    assert.equal(terminal?.type, "settled");
-    if (terminal?.type === "settled") assert.equal(terminal.outcome, "failed");
+    assert.match(failure.message, /exited unexpectedly/);
+    assert.deepEqual(events.map((event) => event.type), ["started", "job"]);
+    assert.equal(coordinator.activeCount, 0);
   } finally {
-    worker.kill("SIGKILL");
+    coordinator?.dispose();
     await rm(agentDir, { recursive: true, force: true });
   }
 });

@@ -49,23 +49,32 @@ function sequentialAttemptId(): string {
 
 /** Fake `setTimeout` / `clearTimeout` pair for deterministic testing. */
 function createFakeTimers() {
-  const pending: Array<() => void> = [];
+  const pending = new Map<number, { dueAt: number; fn: () => void }>();
   let nextId = 0;
+  let now = 0;
   return {
-    setTimeout: (fn: () => void, _ms: number): ReturnType<typeof globalThis.setTimeout> => {
+    setTimeout: (fn: () => void, ms: number): ReturnType<typeof globalThis.setTimeout> => {
       const id = nextId++;
-      pending.push(fn);
+      pending.set(id, { dueAt: now + Math.max(0, ms), fn });
       return id as unknown as ReturnType<typeof globalThis.setTimeout>;
     },
-    clearTimeout: (_id: ReturnType<typeof globalThis.setTimeout> | undefined): void => {
-      // Simplified: we just let all timers run when flushed.
+    clearTimeout: (id: ReturnType<typeof globalThis.setTimeout> | undefined): void => {
+      if (typeof id === "number") pending.delete(id);
     },
-    /** Drain all pending timer callbacks synchronously. */
-    flush(): void {
-      while (pending.length > 0) {
-        const fn = pending.shift()!;
-        fn();
+    /** Advance virtual time and run due callbacks in deadline order. */
+    advance(ms: number): void {
+      const target = now + Math.max(0, ms);
+      for (;;) {
+        const due = [...pending.entries()]
+          .filter(([, timer]) => timer.dueAt <= target)
+          .sort((a, b) => a[1].dueAt - b[1].dueAt || a[0] - b[0])[0];
+        if (!due) break;
+        const [id, timer] = due;
+        pending.delete(id);
+        now = timer.dueAt;
+        timer.fn();
       }
+      now = target;
     },
   };
 }
@@ -78,8 +87,10 @@ class FakeWorker implements WorkerHandle {
   public sentMessages: ParentMessage[] = [];
   public killed = false;
   public killSignal: string | null = null;
+  public throwOnSend = false;
 
   send(message: ParentMessage): void {
+    if (this.throwOnSend) throw new Error("IPC disconnected");
     this.sentMessages.push(message);
   }
 
@@ -296,6 +307,7 @@ test("queued work uses an immutable request snapshot", () => {
 
   workers[0].emitMessage(started("job-1", "attempt-1", 0));
   workers[0].emitMessage(settled("job-1", "attempt-1", 1));
+  workers[0].emitExit(0, null);
 
   const run = workers[1].sentMessages[0];
   assert.equal(run.type, "run");
@@ -392,9 +404,23 @@ test("cancel fences a running worker and sends cancel message", () => {
   assert.equal(cancelMsg.attemptId, "attempt-1");
 
   // Cancel timer is set; flush it to force-kill.
-  timers.flush();
+  timers.advance(0);
   assert.equal(w.killed, true);
   assert.equal(w.killSignal, "SIGKILL");
+});
+
+test("cancel handles a disconnected IPC channel without leaking a slot", () => {
+  const { coordinator, workers } = createTestCoordinator({ concurrency: 1 });
+  coordinator.enqueue("job-1", sampleRequest);
+  const worker = workers[0];
+  worker.throwOnSend = true;
+
+  const result = coordinator.cancel("job-1");
+  assert.equal(result.cancelled, true);
+  assert.equal(result.status, "running-cancelled");
+  assert.equal(worker.killed, true);
+  assert.equal(worker.killSignal, "SIGKILL");
+  assert.equal(coordinator.activeCount, 0);
 });
 
 test("late events from a cancelled worker are ignored (fencing)", () => {
@@ -410,7 +436,7 @@ test("late events from a cancelled worker are ignored (fencing)", () => {
 
   // Cancel the job.
   coordinator.cancel("job-1");
-  timers.flush();
+  timers.advance(0);
 
   // Now the worker sends more events (late delivery).
   const eventsBefore = events.length;
@@ -420,7 +446,7 @@ test("late events from a cancelled worker are ignored (fencing)", () => {
   assert.equal(events.length, eventsBefore);
 });
 
-test("worker fatal event releases slot and pumps queue", () => {
+test("terminal worker retains its slot until exit, then pumps the queue", () => {
   const { coordinator, workers, events } = createTestCoordinator({ concurrency: 1, maxQueueSize: 4 });
   coordinator.enqueue("job-1", sampleRequest); // dispatched
   coordinator.enqueue("job-2", { ...sampleRequest, question: "Q2" }); // queued
@@ -440,10 +466,34 @@ test("worker fatal event releases slot and pumps queue", () => {
   assert.equal(fatalEvents.length, 1);
   assert.equal((fatalEvents[0] as ReturnType<typeof fatal>).error, "bootstrap failed");
 
-  // Slot should be released and job-2 dispatched.
+  // A terminal IPC is not enough to free a slot: the child must exit first.
+  assert.equal(coordinator.activeCount, 1);
+  assert.equal(coordinator.queuedCount, 1);
+  assert.equal(workers.length, 1);
+
+  w1.emitExit(0, null);
   assert.equal(coordinator.activeCount, 1);
   assert.equal(coordinator.queuedCount, 0);
-  assert.equal(workers.length, 2); // second worker forked
+  assert.equal(workers.length, 2);
+});
+
+test("terminal cleanup force-kills a child but still waits for its exit", () => {
+  const { coordinator, workers, timers } = createTestCoordinator({
+    concurrency: 1,
+    terminalGraceMs: 10,
+  });
+  coordinator.enqueue("job-1", sampleRequest);
+  const worker = workers[0];
+  worker.emitMessage(started("job-1", "attempt-1", 0));
+  worker.emitMessage(settled("job-1", "attempt-1", 1));
+
+  timers.advance(10);
+  assert.equal(worker.killed, true);
+  assert.equal(worker.killSignal, "SIGKILL");
+  assert.equal(coordinator.activeCount, 1);
+
+  worker.emitExit(null, "SIGKILL");
+  assert.equal(coordinator.activeCount, 0);
 });
 
 test("worker exit without settled event releases slot and continues queue", () => {
@@ -469,6 +519,25 @@ test("worker exit without settled event releases slot and continues queue", () =
   assert.ok(crashError.error.message.includes("exited unexpectedly"));
 
   // Slot is released.
+  assert.equal(coordinator.activeCount, 1);
+  assert.equal(coordinator.queuedCount, 0);
+  assert.equal(workers.length, 2);
+});
+
+test("parent deadline fences, kills, and releases a nonresponsive worker", () => {
+  const { coordinator, workers, timers, errors } = createTestCoordinator({
+    concurrency: 1,
+    maxQueueSize: 3,
+    deadlineMs: 100,
+  });
+  coordinator.enqueue("job-1", sampleRequest);
+  coordinator.enqueue("job-2", { ...sampleRequest, question: "Q2" });
+
+  timers.advance(100);
+
+  assert.ok(errors.some((entry) => entry.jobId === "job-1" && entry.error.message.includes("parent deadline")));
+  assert.equal(workers[0].killed, true);
+  assert.equal(workers[0].killSignal, "SIGKILL");
   assert.equal(coordinator.activeCount, 1);
   assert.equal(coordinator.queuedCount, 0);
   assert.equal(workers.length, 2);
@@ -555,12 +624,17 @@ test("malformed / non-protocol messages are silently dropped", () => {
   w.emitMessage({});
   w.emitMessage({ type: "started" }); // missing fields
   w.emitMessage({ version: 1, type: "started", jobId: "job-1", attemptId: "attempt-1" }); // no sequence
+  w.emitMessage({ ...jobEvent("job-1", "attempt-1", 1), error: 42 });
+  w.emitMessage({
+    ...canvasEvent("job-1", "attempt-1", 2),
+    canvas: { symbol: "AAPL", title: "Too large", content: "x".repeat(12_001), updatedAt: Date.now() },
+  });
 
   // None forwarded.
   assert.equal(events.length, 1);
 });
 
-test("settled event releases slot and pumps queue", () => {
+test("settled event releases its slot only after worker exit", () => {
   const { coordinator, workers, events } = createTestCoordinator({ concurrency: 1, maxQueueSize: 4 });
   coordinator.enqueue("job-1", sampleRequest); // dispatched
   coordinator.enqueue("job-2", { ...sampleRequest, question: "Q2" }); // queued
@@ -579,7 +653,12 @@ test("settled event releases slot and pumps queue", () => {
 
   assert.equal(events.length, 4);
 
-  // Slot released, queue pumped.
+  // The terminal child remains counted until it exits.
+  assert.equal(coordinator.activeCount, 1);
+  assert.equal(coordinator.queuedCount, 1);
+  assert.equal(workers.length, 1);
+
+  w1.emitExit(0, null);
   assert.equal(coordinator.activeCount, 1);
   assert.equal(coordinator.queuedCount, 0);
   assert.equal(workers.length, 2); // second worker forked for job-2
@@ -605,6 +684,7 @@ test("enqueue resumes queue after multiple workers finish", () => {
   const w1 = workers[0];
   w1.emitMessage(started("job-1", "attempt-1", 0));
   w1.emitMessage(settled("job-1", "attempt-1", 1, "complete"));
+  w1.emitExit(0, null);
 
   // Queue pumps: job-3 dispatched.
   assert.equal(coordinator.activeCount, 2);
@@ -615,6 +695,7 @@ test("enqueue resumes queue after multiple workers finish", () => {
   const w2 = workers[1];
   w2.emitMessage(started("job-2", "attempt-2", 0));
   w2.emitMessage(settled("job-2", "attempt-2", 1, "complete"));
+  w2.emitExit(0, null);
 
   // Queue pumps: job-4 dispatched.
   assert.equal(coordinator.activeCount, 2);
@@ -638,7 +719,7 @@ test("cancel of a running job releases slot after grace timer", () => {
   coordinator.cancel("job-1");
 
   // Grace timer was set; flush it to force-kill.
-  timers.flush();
+  timers.advance(0);
 
   // Slot released, queue pumped.
   assert.equal(coordinator.activeCount, 1); // job-2 dispatched
@@ -655,6 +736,7 @@ test("cancel of an already-settled job returns already-settled", () => {
   // Worker settles normally.
   w.emitMessage(started("job-1", "attempt-1", 0));
   w.emitMessage(settled("job-1", "attempt-1", 1, "complete"));
+  w.emitExit(0, null);
 
   // Now cancel.
   const result = coordinator.cancel("job-1");
