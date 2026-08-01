@@ -20,6 +20,7 @@ export interface TerminalFrameState {
   searchQuery?: string;
   cacheDecision?: unknown;
   research?: { active?: boolean };
+  demo?: boolean;
 }
 
 export interface MobileAction {

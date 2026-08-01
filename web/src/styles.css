@@ -756,3 +756,96 @@ strong {
     transform: none;
   }
 }
+
+/* ── Public demo kiosk ────────────────────────────────────────────────────
+ *
+ * The public demo deployment is a single shared seat. The banner marks the
+ * build; the waiting room covers the case where another visitor's tab holds
+ * the singleton session and the auto-reset has not fired yet.
+ */
+
+.demo-banner {
+  position: absolute;
+  top: max(8px, env(safe-area-inset-top));
+  right: 8px;
+  z-index: 40;
+  padding: 4px 8px;
+  color: #0b0e14;
+  background: #d29922;
+  border-radius: 3px;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  box-shadow: 0 4px 16px #0009;
+}
+
+.demo-waiting {
+  position: absolute;
+  inset: 0;
+  z-index: 260;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: #05070be8;
+  backdrop-filter: blur(4px);
+}
+
+.demo-waiting-card {
+  width: min(100%, 460px);
+  padding: 28px 24px;
+  background:
+    linear-gradient(135deg, #d2992214, transparent 42%),
+    #111722;
+  border: 1px solid #30363d;
+  border-top: 2px solid #d29922;
+  border-radius: 8px;
+  box-shadow: 0 20px 70px #000c;
+  text-align: center;
+}
+
+.demo-waiting-brand {
+  margin-bottom: 8px;
+  color: #d29922;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+}
+
+.demo-waiting-title {
+  color: #f0f6fc;
+  font-size: 17px;
+  font-weight: 700;
+}
+
+.demo-waiting-detail {
+  margin-top: 8px;
+  color: #8b949e;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.demo-waiting-retry {
+  min-height: 44px;
+  margin-top: 18px;
+  padding: 10px 22px;
+  appearance: none;
+  color: #0b0e14;
+  background: #d29922;
+  border: 1px solid #e3b341;
+  border-radius: 5px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+}
+
+.demo-waiting-retry:active {
+  transform: translateY(2px);
+}
+
+.demo-waiting-retry:focus-visible {
+  outline: 2px solid #58a6ff;
+  outline-offset: 2px;
+}

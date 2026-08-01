@@ -4,6 +4,7 @@ import { TerminalSocket } from "./socket";
 import { TerminalFrame } from "./TerminalFrame";
 import { MobileControls } from "./MobileControls";
 import { keyToData } from "./keyboard";
+import { PUBLIC_DEMO } from "./demo-mode";
 import type { FrameMessage, SelectRequestMessage } from "./socket";
 import "./styles.css";
 
@@ -42,6 +43,23 @@ function App() {
     options: string[];
   } | null>(null);
   const notifyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  /* ── Public demo kiosk state ──────────────────────────────────────────── */
+  const [demoWaiting, setDemoWaiting] = useState(false);
+  const demoRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const clearDemoRetry = () => {
+    if (demoRetryTimerRef.current) {
+      clearTimeout(demoRetryTimerRef.current);
+      demoRetryTimerRef.current = null;
+    }
+  };
+
+  const tryDemoSeat = () => {
+    setDemoWaiting(false);
+    clearDemoRetry();
+    socket.connect();
+  };
 
   /* ── Refs for overlays (keyboard handler reads these) ──────────────── */
   const selectReqRef = useRef(selectReq);
@@ -88,6 +106,10 @@ function App() {
     const unsubOpen = s.on("_open", () => {
       connectionStateRef.current = "connected";
       wasReplacedRef.current = false;
+      if (PUBLIC_DEMO) {
+        setDemoWaiting(false);
+        clearDemoRetry();
+      }
       // The first viewport measurement can happen while the socket is still
       // connecting, in which case sendResize() is intentionally a no-op.
       // Re-send the latest dimensions on every open so a fresh connection or
@@ -101,6 +123,15 @@ function App() {
       wasReplacedRef.current = Boolean(event.replaced);
       if (event.replaced) rowsRef.current = [];
       if (event.replaced) frameStateRef.current = undefined;
+      if (PUBLIC_DEMO && event.replaced) {
+        // Another visitor's tab claimed the singleton seat. Wait politely:
+        // the demo process resets itself after inactivity, so the seat frees
+        // on its own. Auto-retry slowly to avoid two tabs fighting.
+        setDemoWaiting(true);
+        if (!demoRetryTimerRef.current) {
+          demoRetryTimerRef.current = setTimeout(tryDemoSeat, 60_000);
+        }
+      }
       forceUpdate();
     });
 
@@ -124,6 +155,7 @@ function App() {
         clearTimeout(notifyTimerRef.current);
         notifyTimerRef.current = null;
       }
+      clearDemoRetry();
       s.disconnect();
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
@@ -313,6 +345,13 @@ function App() {
             : "Disconnected"}
       </div>
 
+      {/* Public demo banner */}
+      {frameStateRef.current?.demo && (
+        <div className="demo-banner" role="status">
+          PUBLIC DEMO — auto-resets after a few minutes of inactivity
+        </div>
+      )}
+
       <MobileControls
         state={frameStateRef.current}
         disabled={cs !== "connected" || Boolean(selectReq) || isClosedRef.current}
@@ -370,6 +409,25 @@ function App() {
               autoFocus
             >
               Reopen Market Map
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Public demo waiting room — the singleton seat is taken by another
+          visitor. The demo process resets after inactivity, so the wait is
+          bounded; the button and the slow auto-retry both try to claim it. */}
+      {PUBLIC_DEMO && demoWaiting && (
+        <div className="demo-waiting" role="dialog" aria-modal="true">
+          <div className="demo-waiting-card">
+            <div className="demo-waiting-brand">MARKET TERMINAL // PUBLIC DEMO</div>
+            <div className="demo-waiting-title">Demo in use by another visitor</div>
+            <div className="demo-waiting-detail">
+              The demo is a single shared seat and resets automatically after a
+              few minutes of inactivity. It will retry on its own.
+            </div>
+            <button className="demo-waiting-retry" onClick={tryDemoSeat}>
+              Try again now
             </button>
           </div>
         </div>

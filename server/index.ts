@@ -52,6 +52,14 @@ const PRINCIPAL_HEADER = "x-fin-terminal-user";
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 const CLIENT_REPLACED_CLOSE_CODE = 4001;
 
+// Public demo mode: a kiosk deployment for anonymous visitors. The edge proxy
+// injects a fixed guest principal, so the singleton lease is always claimable.
+// Because the lease is process-lifetime, the process self-resets after a period
+// of inactivity so the seat frees for the next visitor; the container restart
+// policy brings it back pristine (fresh tmpfs /data).
+const PUBLIC_DEMO = process.env.PUBLIC_DEMO === "1" || process.env.PUBLIC_DEMO === "true";
+const DEMO_IDLE_SECONDS = Math.max(60, Number(process.env.DEMO_IDLE_SECONDS) || 300);
+
 if (process.env.NODE_ENV === "production" && !PROXY_TOKEN) {
   throw new Error("MARKET_PROXY_TOKEN is required in production");
 }
@@ -126,6 +134,7 @@ let activeClient: WebSocket | null = null;
 let cols = 120;
 let sendToClient: (msg: object) => void = () => {};
 let renderScheduled = false;
+let lastDemoActivity = Date.now();
 
 function pushFrame(): void {
   if (renderScheduled) return;
@@ -136,7 +145,11 @@ function pushFrame(): void {
     try {
       const raw = activePanel.render(cols);
       const rows = raw.map((r) => ansiToHtml(r));
-      const state = typeof activePanel.debugState === "function" ? activePanel.debugState() : undefined;
+      const rawState =
+        typeof activePanel.debugState === "function" ? activePanel.debugState() : undefined;
+      const state = PUBLIC_DEMO
+        ? { ...(rawState ?? {}), demo: true }
+        : rawState;
       sendToClient({ type: "frame", rows, width: cols, rows_count: rows.length, state });
     } catch (err) {
       console.warn("[render] error:", err instanceof Error ? err.message : String(err));
@@ -291,6 +304,7 @@ const wss = new WebSocketServer({
 
 wss.on("connection", (ws: WebSocket) => {
   console.log("[ws] client connected");
+  lastDemoActivity = Date.now();
   const previousClient = activeClient;
   activeClient = ws;
   if (previousClient && previousClient.readyState === WebSocket.OPEN) {
@@ -320,6 +334,7 @@ wss.on("connection", (ws: WebSocket) => {
 
   ws.on("message", (raw) => {
     if (activeClient !== ws) return;
+    lastDemoActivity = Date.now();
     let msg: any;
     try {
       msg = JSON.parse(raw.toString());
@@ -439,3 +454,20 @@ async function shutdown(signal: string): Promise<void> {
 
 process.on("SIGINT", () => void shutdown("SIGINT"));
 process.on("SIGTERM", () => void shutdown("SIGTERM"));
+
+// Demo watchdog: the singleton lease is process-lifetime, so the demo process
+// must restart itself to hand the seat to the next visitor. Any WebSocket
+// connection or client message counts as activity.
+if (PUBLIC_DEMO) {
+  const demoWatchdog = setInterval(() => {
+    const idleFor = Math.round((Date.now() - lastDemoActivity) / 1000);
+    if (idleFor >= DEMO_IDLE_SECONDS) {
+      console.log(
+        `[demo] no activity for ${idleFor}s (limit ${DEMO_IDLE_SECONDS}s); resetting for the next visitor.`,
+      );
+      void shutdown("idle-reset");
+    }
+  }, 30_000);
+  demoWatchdog.unref();
+  console.log(`[demo] public demo mode active: idle reset after ${DEMO_IDLE_SECONDS}s`);
+}
