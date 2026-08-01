@@ -227,16 +227,120 @@ strong {
   white-space: nowrap;
 }
 
-.status-research {
-  min-width: 0;
-  overflow: hidden;
-  padding-left: 7px;
-  color: #d29922;
-  border-left: 1px solid #d2992266;
+.research-beacon {
+  --research-color: #d29922;
+  position: absolute;
+  top: 5px;
+  left: 50%;
+  z-index: 55;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: calc(100% - 250px);
+  min-height: 30px;
+  padding: 5px 9px;
+  color: var(--research-color);
+  background: #0d1117f2;
+  border: 1px solid #d2992288;
+  border-left: 3px solid var(--research-color);
+  box-shadow: 0 4px 18px #0008;
+  font-size: 11px;
   font-weight: 700;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.06em;
+  transform: translateX(-50%);
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.research-beacon-lamp,
+.mobile-research-lamp {
+  flex-shrink: 0;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--research-color);
+}
+
+.research-beacon-channel {
+  min-width: 0;
+  max-width: 180px;
+  overflow: hidden;
+  color: #8b949e;
+  font-size: 9px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.research-beacon-phase {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--research-color);
+  font-size: 12px;
+  text-overflow: ellipsis;
+}
+
+.research-beacon-live {
+  flex-shrink: 0;
+  padding-left: 8px;
+  color: #8b949e;
+  border-left: 1px solid #30363d;
+  font-size: 9px;
+}
+
+.research-beacon-updates {
+  flex-shrink: 0;
+  padding-left: 8px;
+  color: #c9d1d9;
+  border-left: 1px solid #30363d;
+  font-size: 9px;
+}
+
+.research-beacon-queued {
+  --research-color: #8b949e;
+  border-color: #484f58;
+}
+
+.research-beacon-active .research-beacon-lamp {
+  box-shadow: 0 0 7px #d29922b0;
+  animation: pulse 0.9s ease-in-out infinite;
+}
+
+.research-beacon-synthesizing {
+  --research-color: #58a6ff;
+  border-color: #58a6ff88;
+}
+
+.research-beacon-synthesizing .research-beacon-lamp {
+  box-shadow: 0 0 7px #58a6ffb0;
+  animation: pulse 0.75s ease-in-out infinite;
+}
+
+.research-beacon-failed,
+.research-beacon-cancelling {
+  --research-color: #f85149;
+  border-color: #f85149;
+  background: #2d1010f2;
+  box-shadow: 0 0 14px #f8514950;
+}
+
+.research-beacon-failed .research-beacon-lamp,
+.research-beacon-cancelling .research-beacon-lamp {
+  box-shadow: 0 0 7px #f85149c0;
+  animation: pulse 0.7s ease-in-out infinite;
+}
+
+.research-beacon-cancelled {
+  --research-color: #8b949e;
+  border-color: #484f58;
+}
+
+.research-beacon-complete {
+  --research-color: #3fb950;
+  border-color: #3fb95088;
+}
+
+.research-beacon-partial {
+  --research-color: #d29922;
 }
 
 .status-dot {
@@ -1017,6 +1121,60 @@ strong {
   text-align: right;
 }
 
+.mobile-research-status {
+  --research-color: #d29922;
+  display: inline-flex;
+  align-items: center;
+  max-width: 48vw;
+  min-width: 0;
+  gap: 5px;
+  overflow: hidden;
+  color: var(--research-color);
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mobile-research-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mobile-research-active .mobile-research-lamp {
+  box-shadow: 0 0 5px #d29922b0;
+  animation: pulse 0.9s ease-in-out infinite;
+}
+
+.mobile-research-synthesizing {
+  --research-color: #58a6ff;
+}
+
+.mobile-research-synthesizing .mobile-research-lamp {
+  box-shadow: 0 0 5px #58a6ffb0;
+  animation: pulse 0.75s ease-in-out infinite;
+}
+
+.mobile-research-failed,
+.mobile-research-cancelling {
+  --research-color: #f85149;
+}
+
+.mobile-research-failed .mobile-research-lamp,
+.mobile-research-cancelling .mobile-research-lamp {
+  box-shadow: 0 0 5px #f85149c0;
+  animation: pulse 0.7s ease-in-out infinite;
+}
+
+.mobile-research-complete {
+  --research-color: #3fb950;
+}
+
+.mobile-research-queued,
+.mobile-research-cancelled {
+  --research-color: #8b949e;
+}
+
 .mobile-nav,
 .mobile-actions,
 .mobile-scopes {
@@ -1254,6 +1412,10 @@ strong {
  */
 
 @container (max-width: 600px) {
+  .research-beacon {
+    display: none;
+  }
+
   .terminal {
     font-size: 10.5px;
     line-height: 1.25;
@@ -1323,6 +1485,10 @@ strong {
     display: none;
   }
 
+  .mobile-console-context {
+    display: none;
+  }
+
   .evidence-chip {
     gap: 4px;
     padding-inline: 6px;
@@ -1336,6 +1502,10 @@ strong {
 }
 
 @media (hover: none) and (pointer: coarse) {
+  .research-beacon {
+    display: none;
+  }
+
   .mobile-controls {
     display: block;
   }
@@ -1347,6 +1517,8 @@ strong {
 
 @media (prefers-reduced-motion: reduce) {
   .status-dot.connecting,
+  .research-beacon-lamp,
+  .mobile-research-lamp,
   .toast,
   .evidence-lamp,
   .evidence-chip-blocked,

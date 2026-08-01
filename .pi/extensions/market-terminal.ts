@@ -2509,6 +2509,33 @@ function researchSlotHeld(job: ResearchJob | undefined): boolean {
 	return Boolean(job?.slotHeld && job.phase !== "settled" && job.settledAt === undefined);
 }
 
+const RECENT_SETTLED_RESEARCH_WINDOW_MS = 30_000;
+
+function latestSettledResearchJobs(limit = 6, now = Date.now()): ResearchJob[] {
+	return [...researchJobs.values()]
+		.filter((job) => job.phase === "settled" && job.settledAt !== undefined && now >= job.settledAt && now - job.settledAt <= RECENT_SETTLED_RESEARCH_WINDOW_MS)
+		.sort((a, b) => (b.settledAt ?? 0) - (a.settledAt ?? 0) || b.updatedAt - a.updatedAt)
+		.slice(0, limit);
+}
+
+function researchDebugState(job: ResearchJob) {
+	return {
+		id: job.id,
+		contextLabel: job.contextLabel,
+		symbol: job.symbol,
+		outcome: job.outcome,
+		phase: job.phase,
+		activity: job.activity,
+		active: researchSlotHeld(job),
+		publishedBlocks: job.publishedBlocks,
+		chartScope: job.chartScope,
+		researchKey: job.researchKey,
+		intent: job.intent,
+		updatedAt: job.updatedAt,
+		settledAt: job.settledAt,
+	};
+}
+
 function createResearchJob(request: ResearchRequest): ResearchJob | undefined {
 	if (activeResearchJobForIdentity(request)) return undefined;
 	const now = Date.now();
@@ -3822,6 +3849,7 @@ class MarketTerminal {
 
 	debugState() {
 		const researchJob = this.currentResearchJob();
+		const recentResearch = latestSettledResearchJobs();
 		const displayCanvas = this.displayedCanvas();
 		const evidenceStatus = deriveEvidenceStatus(displayCanvas);
 		const dossierRead = canvasDossierRead(displayCanvas);
@@ -3845,21 +3873,11 @@ class MarketTerminal {
 				count: archivedResearchFor(this.symbol, this.chartScope, this.researchKey).length,
 				asOf: this.archivedCanvas?.updatedAt,
 			} : undefined,
-			research: researchJob ? {
-				id: researchJob.id,
-				symbol: researchJob.symbol,
-				outcome: researchJob.outcome,
-				phase: researchJob.phase,
-				activity: researchJob.activity,
-				active: researchSlotHeld(researchJob),
-				publishedBlocks: researchJob.publishedBlocks,
-				chartScope: researchJob.chartScope,
-				researchKey: researchJob.researchKey,
-				intent: researchJob.intent,
-			} : undefined,
+			research: researchJob ? researchDebugState(researchJob) : undefined,
+			recentResearch: recentResearch.map(researchDebugState),
 			researchQueue: [...new Map([...this.researchJobCache.values(), ...activeResearchJobs()].map((job) => [job.id, job])).values()]
 				.filter(researchSlotHeld)
-				.map((job) => ({ id: job.id, contextLabel: job.contextLabel, symbol: job.symbol, phase: job.phase, outcome: job.outcome, activity: job.activity })),
+				.map(researchDebugState),
 			dossier: displayCanvas ? {
 				title: displayCanvas.title,
 				intent: canvasIntent(displayCanvas) ?? researchIntentFromKey(this.researchKey) ?? "brief",
@@ -5009,6 +5027,7 @@ class MarketHub {
 	debugState() {
 		const entry = this.entries()[this.selected];
 		const researchJob = this.visibleResearchJob();
+		const recentResearch = latestSettledResearchJobs();
 		const displayCanvas = this.displayedMarketCanvas() ?? this.displayedEventCanvas();
 		const evidenceStatus = deriveEvidenceStatus(displayCanvas);
 		const dossierRead = canvasDossierRead(displayCanvas);
@@ -5054,19 +5073,9 @@ class MarketHub {
 				count: archivedResearchFor("MARKET", this.chartScope, canvasResearchKey(this.archivedMarketCanvas)).length,
 				asOf: this.archivedMarketCanvas?.updatedAt,
 			} : undefined,
-			research: researchJob ? {
-				id: researchJob.id,
-				symbol: researchJob.symbol,
-				outcome: researchJob.outcome,
-				phase: researchJob.phase,
-				activity: researchJob.activity,
-				active: researchSlotHeld(researchJob),
-				publishedBlocks: researchJob.publishedBlocks,
-				chartScope: researchJob.chartScope,
-				researchKey: researchJob.researchKey,
-				intent: researchJob.intent,
-			} : undefined,
-			researchQueue: this.knownResearchJobs().filter(researchSlotHeld).map((job) => ({ id: job.id, contextLabel: job.contextLabel, symbol: job.symbol, phase: job.phase, outcome: job.outcome, activity: job.activity })),
+			research: researchJob ? researchDebugState(researchJob) : undefined,
+			recentResearch: recentResearch.map(researchDebugState),
+			researchQueue: this.knownResearchJobs().filter(researchSlotHeld).map(researchDebugState),
 			dossier: displayCanvas ? {
 				title: displayCanvas.title,
 				intent: canvasIntent(displayCanvas) ?? "brief",

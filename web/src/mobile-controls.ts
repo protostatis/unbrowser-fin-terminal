@@ -16,11 +16,34 @@ export type ResearchPhase = "queued" | "dispatched" | "running" | "cancelling" |
 
 export interface TerminalResearchState {
   id?: string;
+  contextLabel?: string;
   symbol?: string;
   outcome?: "queued" | "running" | "partial" | "complete" | "failed" | "cancelled";
   phase?: ResearchPhase;
   activity?: ResearchActivity;
   active?: boolean;
+  updatedAt?: number;
+  settledAt?: number;
+}
+
+export type ResearchStatusTone =
+  | "queued"
+  | "active"
+  | "synthesizing"
+  | "failed"
+  | "cancelling"
+  | "cancelled"
+  | "complete"
+  | "partial";
+
+export interface ResearchActivityStatus {
+  id?: string;
+  contextLabel?: string;
+  symbol?: string;
+  label: string;
+  text: string;
+  tone: ResearchStatusTone;
+  active: boolean;
 }
 
 /** Scroll window emitted by the canonical extension's story/briefing panes. */
@@ -41,6 +64,7 @@ export interface TerminalFrameState {
   cacheDecision?: unknown;
   research?: TerminalResearchState;
   researchQueue?: TerminalResearchState[];
+  recentResearch?: TerminalResearchState[];
   /** Optional research dossier; absent on old server frames. */
   dossier?: TerminalDossier;
   demo?: boolean;
@@ -160,30 +184,70 @@ export function mobileActions(state?: TerminalFrameState): MobileAction[] {
   ];
 }
 
-function researchStatusFor(job: TerminalResearchState): string {
-  const prefix = job.symbol ? `RESEARCH ${job.symbol}` : "RESEARCH";
-  if (job.phase === "queued") return `${prefix} · QUEUED`;
-  if (job.phase === "dispatched") return `${prefix} · STARTING`;
-  if (job.phase === "cancelling" || job.outcome === "cancelled") return `${prefix} · CANCELLING`;
-  if (job.outcome === "complete") return `${prefix} · FINALIZING`;
+function researchStatusFor(job: TerminalResearchState): ResearchActivityStatus {
+  const id = job.id;
+  const contextLabel = job.contextLabel?.trim() || undefined;
+  const symbol = job.symbol?.trim() || undefined;
+  const prefix = contextLabel ? `RESEARCH ${contextLabel}` : symbol ? `RESEARCH ${symbol}` : "RESEARCH";
+  const status = (
+    label: string,
+    tone: ResearchStatusTone,
+    active: boolean,
+  ): ResearchActivityStatus => ({
+    id,
+    contextLabel,
+    symbol,
+    label,
+    text: `${prefix} · ${label}`,
+    tone,
+    active,
+  });
+  const isActive = job.active ?? (job.phase !== "settled");
+
+  if (job.outcome === "failed") return status("RESEARCH FAILED", "failed", false);
+  if (job.phase === "cancelling") return status("CANCELLING", "cancelling", true);
+  if (job.outcome === "cancelled") return status("CANCELLED", "cancelled", false);
+  if (job.phase === "queued") return status("QUEUED", "queued", true);
+  if (job.phase === "dispatched") return status("STARTING", "active", true);
+  if (job.outcome === "complete") {
+    return isActive
+      ? status("FINALIZING BRIEF", "synthesizing", true)
+      : status("RESULTS READY", "complete", false);
+  }
+  if (job.phase === "settled" && job.outcome === "partial") {
+    return status("PARTIAL RESULTS", "partial", false);
+  }
   switch (job.activity) {
-    case "seeding": return `${prefix} · SEARCHING SOURCES`;
-    case "fetching": return `${prefix} · FETCHING SOURCES`;
-    case "extracting": return `${prefix} · EXTRACTING EVIDENCE`;
-    case "synthesizing": return `${prefix} · BUILDING BRIEF`;
-    default: return `${prefix} · SEARCHING`;
+    case "seeding": return status("SEARCHING SOURCES", "active", true);
+    case "fetching": return status("FETCHING SOURCES", "active", true);
+    case "extracting": return status("EXTRACTING EVIDENCE", "active", true);
+    case "synthesizing": return status("BUILDING BRIEF", "synthesizing", true);
+    default: return status("SEARCHING", "active", isActive);
   }
 }
 
-/** Return the clearest active research status even when the user navigates away from its original context. */
-export function activeResearchStatus(state?: TerminalFrameState): string | undefined {
+/** Return the clearest currently active research job. */
+export function researchActivityStatus(state?: TerminalFrameState): ResearchActivityStatus | undefined {
   if (state?.research?.active) return researchStatusFor(state.research);
   const queued = state?.researchQueue ?? [];
   const active = queued.find((job) => job.phase === "running")
     ?? queued.find((job) => job.phase === "dispatched")
     ?? queued.find((job) => job.phase === "cancelling")
     ?? queued.find((job) => job.phase === "queued");
-  return active ? researchStatusFor(active) : undefined;
+  if (active) return researchStatusFor(active);
+  return undefined;
+}
+
+/** Settled jobs are buffered by the app shell so concurrent outcomes are not lost. */
+export function recentResearchStatuses(state?: TerminalFrameState): ResearchActivityStatus[] {
+  return (state?.recentResearch ?? [])
+    .filter((job) => job.phase === "settled")
+    .map(researchStatusFor);
+}
+
+/** Text-only form retained for compact consumers and terminal-status tests. */
+export function activeResearchStatus(state?: TerminalFrameState): string | undefined {
+  return researchActivityStatus(state)?.text;
 }
 
 /** Keep mobile symbol entry aligned with the extension's accepted ticker form. */

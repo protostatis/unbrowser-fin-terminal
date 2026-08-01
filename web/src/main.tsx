@@ -10,7 +10,11 @@ import { createRoot } from "react-dom/client";
 import { TerminalSocket } from "./socket";
 import { TerminalFrame } from "./TerminalFrame";
 import { MobileControls } from "./MobileControls";
-import { activeResearchStatus } from "./mobile-controls";
+import {
+  recentResearchStatuses,
+  researchActivityStatus,
+  type ResearchActivityStatus,
+} from "./mobile-controls";
 import { EvidenceControl, EvidenceInspector } from "./EvidenceInspector";
 import {
   InteractionOverlay,
@@ -21,6 +25,52 @@ import { PUBLIC_DEMO } from "./demo-mode";
 import { DEMO_BUSY_CLOSE_CODE } from "./socket";
 import type { FrameMessage, SelectRequestMessage } from "./socket";
 import "./styles.css";
+
+const RESEARCH_OUTCOME_DISPLAY_MS = 8_000;
+
+function useResearchStatus(state: FrameMessage["state"]) {
+  const activeStatus = researchActivityStatus(state);
+  const incomingOutcomes = recentResearchStatuses(state);
+  const [outcomes, setOutcomes] = useState<ResearchActivityStatus[]>([]);
+  const seenOutcomeIdsRef = useRef(new Set<string>());
+  const outcomeSignature = incomingOutcomes
+    .map((status) => `${status.id}:${status.tone}`)
+    .join("|");
+
+  useEffect(() => {
+    if (state) return;
+    setOutcomes([]);
+  }, [state]);
+
+  useEffect(() => {
+    const unseen = [...incomingOutcomes]
+      .reverse()
+      .filter((status) => {
+        if (!status.id || seenOutcomeIdsRef.current.has(status.id)) return false;
+        seenOutcomeIdsRef.current.add(status.id);
+        return true;
+      });
+    if (unseen.length === 0) return;
+    setOutcomes((current) => {
+      const queued = new Set(current.map((status) => status.id));
+      return [...current, ...unseen.filter((status) => !queued.has(status.id))];
+    });
+  }, [outcomeSignature]); // The signature is the stable transport identity for the current outcome batch.
+
+  const visibleOutcome = outcomes[0];
+  useEffect(() => {
+    if (activeStatus || !visibleOutcome?.id) return;
+    const timer = setTimeout(() => {
+      setOutcomes((current) => current.filter((status) => status.id !== visibleOutcome.id));
+    }, RESEARCH_OUTCOME_DISPLAY_MS);
+    return () => clearTimeout(timer);
+  }, [activeStatus?.id, visibleOutcome?.id]);
+
+  return {
+    researchStatus: activeStatus ?? visibleOutcome,
+    pendingResearchOutcomes: activeStatus ? outcomes.length : Math.max(0, outcomes.length - 1),
+  };
+}
 
 /**
  * Application shell for the Market Terminal Web UI.
@@ -45,6 +95,7 @@ function App() {
   const isClosedRef = useRef(false);
   const wasReplacedRef = useRef(false);
   const frameStateRef = useRef<FrameMessage["state"]>(undefined);
+  const { researchStatus, pendingResearchOutcomes } = useResearchStatus(frameStateRef.current);
 
   /* ── React state for overlays ──────────────────────────────────────── */
   const [notify, setNotify] = useState<{
@@ -354,7 +405,6 @@ function App() {
   const hasFrame = rowsRef.current.length > 0;
   const wasReplaced = wasReplacedRef.current;
   const dossier = frameStateRef.current?.dossier;
-  const researchStatus = activeResearchStatus(frameStateRef.current);
 
   useEffect(() => {
     // A new frame can replace or clear the active canvas while the locker is
@@ -400,6 +450,26 @@ function App() {
         terminalRef={terminalFrameRef}
       />
 
+      {cs === "connected" && researchStatus && (
+        <div
+          className={`research-beacon research-beacon-${researchStatus.tone}`}
+          role={researchStatus.tone === "failed" ? "alert" : "status"}
+          aria-live={researchStatus.tone === "failed" ? "assertive" : "polite"}
+          aria-atomic="true"
+          title={researchStatus.text}
+        >
+          <span className="research-beacon-lamp" aria-hidden="true" />
+          <span className="research-beacon-channel">
+            AGENT // {researchStatus.contextLabel ?? researchStatus.symbol ?? "MARKET"}
+          </span>
+          <strong className="research-beacon-phase">{researchStatus.label}</strong>
+          {researchStatus.active && <span className="research-beacon-live">LIVE</span>}
+          {pendingResearchOutcomes > 0 && (
+            <span className="research-beacon-updates">+{pendingResearchOutcomes} UPDATES</span>
+          )}
+        </div>
+      )}
+
       {/* Actionable startup / terminal-less reconnect state */}
       {!hasFrame && !isClosedRef.current && (
         <div className="connection-empty" role="status" aria-live="polite">
@@ -427,12 +497,6 @@ function App() {
               : "Disconnected"}
         </span>
 
-        {researchStatus && (
-          <span className="status-research" role="status" aria-live="polite">
-            {researchStatus}
-          </span>
-        )}
-
         {dossier && (
           <EvidenceControl
             dossier={dossier}
@@ -459,6 +523,7 @@ function App() {
 
       <MobileControls
         state={frameStateRef.current}
+        researchStatus={cs === "connected" ? researchStatus : undefined}
         disabled={cs !== "connected" || Boolean(selectReq) || evidenceOpen || isClosedRef.current}
         onInput={handleTouchInput}
         onReturnToTerminal={focusTerminal}

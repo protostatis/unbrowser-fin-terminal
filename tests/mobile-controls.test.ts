@@ -6,6 +6,8 @@ import {
   isValidSymbolInput,
   mobileActions,
   normalizeSymbolInput,
+  recentResearchStatuses,
+  researchActivityStatus,
   symbolSearchInputs,
   TERMINAL_INPUTS,
   verticalSwipeScroll,
@@ -109,6 +111,51 @@ test("research status names the active source-search and evidence phases", () =>
     "RESEARCH AAPL · EXTRACTING EVIDENCE",
   );
   assert.equal(activeResearchStatus({}), undefined);
+});
+
+test("research activity status exposes a visible active phase and buffers settled outcomes", () => {
+  assert.deepEqual(
+    researchActivityStatus({
+      research: { id: "job-active", active: true, symbol: "NVDA", phase: "running", activity: "extracting" },
+    }),
+    {
+      id: "job-active",
+      contextLabel: undefined,
+      symbol: "NVDA",
+      label: "EXTRACTING EVIDENCE",
+      text: "RESEARCH NVDA · EXTRACTING EVIDENCE",
+      tone: "active",
+      active: true,
+    },
+  );
+  assert.deepEqual(
+    recentResearchStatuses({
+      recentResearch: [
+        { id: "job-complete", contextLabel: "REUTERS HEADLINE", symbol: "MARKET", phase: "settled", outcome: "complete" },
+        { id: "job-failed", contextLabel: "AAPL BRIEF", symbol: "AAPL", phase: "settled", outcome: "failed" },
+      ],
+    }),
+    [
+      {
+        id: "job-complete",
+        contextLabel: "REUTERS HEADLINE",
+        symbol: "MARKET",
+        label: "RESULTS READY",
+        text: "RESEARCH REUTERS HEADLINE · RESULTS READY",
+        tone: "complete",
+        active: false,
+      },
+      {
+        id: "job-failed",
+        contextLabel: "AAPL BRIEF",
+        symbol: "AAPL",
+        label: "RESEARCH FAILED",
+        text: "RESEARCH AAPL BRIEF · RESEARCH FAILED",
+        tone: "failed",
+        active: false,
+      },
+    ],
+  );
 });
 
 test("vertical touch drags map to bounded terminal scroll actions", () => {
