@@ -30,12 +30,13 @@ deployment fallback for a normal terminal release.
    ```
 
 3. In `unchained-infra`, create a release branch from current `main`. Replace
-   the `fin-terminal.build.context` Git ref in `docker-compose.yml` with that
+   both the `fin-terminal.build.context` and
+   `fin-terminal-demo.build.context` Git refs in `docker-compose.yml` with that
    exact 40-character SHA. Never use a mutable branch ref such as
    `#feature/signal-dossier`.
 
-4. Update the matching SHA assertion in
-   `unchained/test_fin_terminal.py`, then run the infrastructure checks:
+4. Update both matching SHA assertions in `unchained/test_fin_terminal.py`,
+   then run the infrastructure checks:
 
    ```bash
    python deploy/test_fin_terminal_secrets.py
@@ -54,7 +55,9 @@ deployment fallback for a normal terminal release.
 
 ## Deployment Contract
 
-- Build with `PUBLIC_BASE_PATH=/unbrowser/fin-terminal/`.
+- Build the authenticated service with
+  `PUBLIC_BASE_PATH=/unbrowser/fin-terminal/` and the demo service with
+  `PUBLIC_BASE_PATH=/unbrowser/fin-terminal-demo/`.
 - The container listens on port `8787`; `/api/ready` is the readiness check.
 - Caddy owns route authorization and injects the terminal proxy token. Do not
   expose port `8787` directly or bypass Caddy.
@@ -74,6 +77,8 @@ deployment fallback for a normal terminal release.
   `/unbrowser/fin-terminal/ws` through Caddy.
 - Confirm a direct container-network request without the injected proxy token
   returns HTTP 403.
+- Confirm the independent public demo route
+  `/unbrowser/fin-terminal-demo/` loads without an authenticated session.
 
 The authoritative infrastructure details, including production secrets and
 host safety controls, live in
