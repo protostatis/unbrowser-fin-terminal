@@ -478,6 +478,10 @@ strong {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
+.mobile-actions-5 {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
 .mobile-scopes {
   grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 8px;
@@ -859,8 +863,9 @@ strong {
  *
  * A companion overlay for the browser projection of market actions. It is
  * positioned absolutely over .terminal so it never shifts cell measurement.
- * On wide screens it anchors as a compact edge panel; on narrow/coarse
- * screens it becomes a flex sibling directly above the mobile-controls deck.
+ * On wide screens it anchors as a compact edge panel. On narrow/coarse
+ * screens the compact trigger stays above the mobile command deck, while the
+ * expanded sheet intentionally overlays the canvas instead of shrinking it.
  */
 
 .interaction-overlay {
@@ -1270,8 +1275,8 @@ strong {
 
 /* ── Narrow containers ─────────────────────────────────────────────────────
  *
- * On narrow viewports the overlay becomes a full-width bottom sheet in the
- * flex flow, directly above the mobile-controls deck.
+ * On narrow viewports the closed trigger stays in the flex flow above the
+ * mobile deck. The expanded sheet becomes a temporary full-width overlay.
  */
 
 @container (max-width: 600px) {
@@ -1284,6 +1289,14 @@ strong {
     width: 100%;
     z-index: 59;
     flex-shrink: 0;
+  }
+
+  .interaction-overlay[data-overlay-open] {
+    position: absolute;
+    right: 0;
+    left: 0;
+    bottom: 0;
+    z-index: 60;
   }
 
   .interaction-toggle {
@@ -1322,6 +1335,14 @@ strong {
     width: 100%;
     z-index: 59;
     flex-shrink: 0;
+  }
+
+  .interaction-overlay[data-overlay-open] {
+    position: absolute;
+    right: 0;
+    left: 0;
+    bottom: 0;
+    z-index: 60;
   }
 
   .interaction-toggle {

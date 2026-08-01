@@ -38,7 +38,6 @@ test("editable targets are never captured by the terminal", () => {
   const editable = fakeTarget("editable");
   assert.equal(isEditableTarget(editable as never), true);
   assert.equal(keyToData(event({ key: "Tab", target: editable })), null);
-  assert.equal(keyToData(event({ key: "Tab", target: editable }), { captureTabOnControl: true }), null);
   assert.equal(keyToData(event({ key: "j", target: editable })), null);
   assert.equal(keyToData(event({ key: "ArrowDown", target: editable })), null);
 });
@@ -51,24 +50,6 @@ test("buttons and links keep browser Tab by default", () => {
   assert.equal(keyToData(event({ key: "j", target: control })), null);
   assert.equal(keyToData(event({ key: "Enter", target: control })), null);
   assert.equal(keyToData(event({ key: "ArrowUp", target: control })), null);
-});
-
-test("captureTabOnControl lets the terminal own Tab on button/link controls", () => {
-  const control = fakeTarget("control");
-  const opts = { captureTabOnControl: true };
-  assert.equal(keyToData(event({ key: "Tab", target: control }), opts), "\t");
-  // Only Tab is captured; everything else on a control stays uncaptured.
-  assert.equal(keyToData(event({ key: "Enter", target: control }), opts), null);
-  assert.equal(keyToData(event({ key: "j", target: control }), opts), null);
-  assert.equal(keyToData(event({ key: "ArrowDown", target: control }), opts), null);
-});
-
-test("modifier keys are preserved even with captureTabOnControl", () => {
-  const control = fakeTarget("control");
-  const opts = { captureTabOnControl: true };
-  assert.equal(keyToData(event({ key: "Tab", target: control, metaKey: true }), opts), null);
-  assert.equal(keyToData(event({ key: "Tab", target: control, ctrlKey: true }), opts), null);
-  assert.equal(keyToData(event({ key: "Tab", target: control, altKey: true }), opts), null);
 });
 
 test("default key mapping outside controls is unchanged", () => {

@@ -6,19 +6,6 @@
  * Verified against @earendil-works/pi-tui@0.83.0 matchesKey() legacy sequences.
  */
 
-/** Options controlling which keys the terminal may capture. */
-export interface KeyToDataOptions {
-  /**
-   * Capture Tab while focus sits on a button/link terminal control, so the
-   * terminal owns Tab instead of letting it escape into browser focus
-   * traversal. Editable content (input, textarea, select, contenteditable)
-   * is never captured regardless of this option, and every other key on a
-   * button/link stays uncaptured. Defaults to false, keeping the original
-   * behavior for buttons/links.
-   */
-  captureTabOnControl?: boolean;
-}
-
 function closestMatch(target: unknown, selector: string): boolean {
   if (typeof target !== "object" || target === null) return false;
   const closest = (target as { closest?: (selectors: string) => Element | null })
@@ -30,7 +17,7 @@ function closestMatch(target: unknown, selector: string): boolean {
  * True when the event target is (or is inside) an editable element
  * (`input`, `textarea`, `select`, or `[contenteditable="true"]`). These always
  * keep native browser keyboard behavior and are never captured by the
- * terminal, regardless of options.
+ * terminal.
  */
 export function isEditableTarget(target: EventTarget | null): boolean {
   return closestMatch(target, 'input, textarea, select, [contenteditable="true"]');
@@ -38,17 +25,14 @@ export function isEditableTarget(target: EventTarget | null): boolean {
 
 /**
  * True when the event target is (or is inside) a button or link — a terminal
- * control the browser may focus. By default the terminal never captures keys
- * from these; callers may opt in to capture only Tab (see KeyToDataOptions).
+ * control the browser may focus. The terminal never captures keys from these;
+ * its focusable frame owns keyboard navigation instead.
  */
 export function isTerminalControl(target: EventTarget | null): boolean {
   return closestMatch(target, "button, a[href]");
 }
 
-export function keyToData(
-  e: KeyboardEvent,
-  options: KeyToDataOptions = {},
-): string | null {
+export function keyToData(e: KeyboardEvent): string | null {
   // Ignore keys when the user is typing in an editable element so that native
   // text entry and modal inputs (search, select prompt) keep full browser
   // keyboard behavior, including Tab for focus traversal.
@@ -61,15 +45,8 @@ export function keyToData(
 
   const onTerminalControl = isTerminalControl(e.target);
 
-  // Tab is owned by the terminal: it is forwarded everywhere except while a
-  // button/link terminal control holds focus, where the original behavior
-  // (browser focus traversal) is kept unless the caller opts in.
-  if (e.key === "Tab") {
-    return onTerminalControl && !options.captureTabOnControl ? null : "\t";
-  }
-
-  // While a button/link terminal control holds focus, nothing else is
-  // forwarded (unchanged default behavior).
+  // Buttons and links retain their native keyboard behavior. The terminal
+  // frame itself is focusable and captures Tab while terminal mode is active.
   if (onTerminalControl) return null;
 
   const key = e.key;

@@ -18,14 +18,30 @@ import { TERMINAL_INPUTS } from "./mobile-controls";
  * Whitelisted semantic browser actions. The server validates each action
  * against the live terminal state before translating it to canonical inputs.
  */
+export type TerminalPane = "headlines" | "story" | "lanes" | "briefing";
+
+export type TerminalActionContext =
+  | {
+      mode: "market";
+      screen: string;
+      selectedIndex: number;
+      selected: string | null;
+      pane: TerminalPane | null;
+    }
+  | {
+      mode: "ticker";
+      screen: string;
+      symbol: string;
+    };
+
 export type TerminalWebAction =
   | { action: "select"; screen: string; index: number; item: string }
   | {
       action: "focus-pane";
-      pane: "headlines" | "story" | "lanes" | "briefing";
+      pane: TerminalPane;
     }
-  | { action: "primary" }
-  | { action: "why" }
+  | { action: "primary"; context: TerminalActionContext }
+  | { action: "why"; context: TerminalActionContext }
   | { action: "scroll"; direction: "up" | "down"; amount?: number };
 
 /* ── Selectable list ──────────────────────────────────────────────────── */
@@ -61,7 +77,7 @@ export function selectableItems(state?: TerminalFrameState): SelectableItem[] {
 /* ── Pane choices (SIGNALS / EVENTS) ──────────────────────────────────── */
 
 export interface PaneChoice {
-  id: "headlines" | "story" | "lanes" | "briefing";
+  id: TerminalPane;
   label: string;
   selected: boolean;
 }
@@ -180,6 +196,46 @@ export function canUsePointerScroll(state?: TerminalFrameState): boolean {
     arrowsMoveSelection(state) ||
     scrollControls(state).some((control) => control.scrollable)
   );
+}
+
+/**
+ * Snapshot the target of a primary or Why action. The server compares this
+ * identity against its live state so a delayed click cannot act on a different
+ * selection, pane, ticker, or tab than the one shown in the browser.
+ */
+export function terminalActionContext(
+  state?: TerminalFrameState,
+): TerminalActionContext | undefined {
+  if (!state?.mode || !state.screen) return undefined;
+
+  if (state.mode === "ticker") {
+    if (!state.symbol) return undefined;
+    return { mode: "ticker", screen: state.screen, symbol: state.symbol };
+  }
+
+  const selectedIndex = state.selectedIndex;
+  if (
+    typeof selectedIndex !== "number" ||
+    !Number.isInteger(selectedIndex) ||
+    selectedIndex < 0
+  ) {
+    return undefined;
+  }
+
+  const screen = state.screen.toUpperCase();
+  const pane: TerminalPane | null =
+    screen === "SIGNALS"
+      ? state.signalsFocus ?? "headlines"
+      : screen === "EVENTS"
+        ? state.eventsFocus ?? "lanes"
+        : null;
+  return {
+    mode: "market",
+    screen: state.screen,
+    selectedIndex,
+    selected: state.selected ?? null,
+    pane,
+  };
 }
 
 /* ── Key guidance ─────────────────────────────────────────────────────── */

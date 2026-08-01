@@ -257,7 +257,9 @@ function App() {
         return;
       }
 
-      const data = keyToData(e, { captureTabOnControl: true });
+      // Tab belongs to the terminal only while the focusable terminal frame
+      // owns focus. Buttons and dialogs retain normal browser Tab traversal.
+      const data = keyToData(e);
       if (data !== null) {
         e.preventDefault();
         s.sendInput(data);

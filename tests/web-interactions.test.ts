@@ -8,6 +8,7 @@ import {
   paneChoices,
   scrollControls,
   selectableItems,
+  terminalActionContext,
 } from "../web/src/web-interactions.js";
 
 test("selectable items come from the market available list with selection state", () => {
@@ -138,6 +139,30 @@ test("pointer scrolling is available only when a list or canvas can respond", ()
     }),
     true,
   );
+});
+
+test("action context binds primary actions to the rendered selection and pane", () => {
+  assert.deepEqual(
+    terminalActionContext({
+      mode: "market",
+      screen: "SIGNALS",
+      selectedIndex: 2,
+      selected: "Oil supply concern",
+      signalsFocus: "story",
+    }),
+    {
+      mode: "market",
+      screen: "SIGNALS",
+      selectedIndex: 2,
+      selected: "Oil supply concern",
+      pane: "story",
+    },
+  );
+  assert.deepEqual(
+    terminalActionContext({ mode: "ticker", screen: "RESEARCH", symbol: "AAPL" }),
+    { mode: "ticker", screen: "RESEARCH", symbol: "AAPL" },
+  );
+  assert.equal(terminalActionContext({ mode: "market", screen: "MARKET" }), undefined);
 });
 
 test("key hints foreground arrows, Enter, and Tab before J/K", () => {

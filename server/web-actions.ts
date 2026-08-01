@@ -16,8 +16,8 @@
  *   select      { action: "select", screen, index, item }
  *   focus-pane  { action: "focus-pane", pane: "headlines"|"story"|"lanes"|"briefing" }
  *   scroll      { action: "scroll", direction: "up"|"down", amount?: number }
- *   primary     { action: "primary" }
- *   why         { action: "why" }
+ *   primary     { action: "primary", context }
+ *   why         { action: "why", context }
  */
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -26,6 +26,7 @@ export type MarketDebugState = {
   mode: "market";
   screen: string;
   selectedIndex: number;
+  selected?: string;
   available: string[];
   signalsFocus?: "headlines" | "story";
   eventsFocus?: "lanes" | "briefing";
@@ -39,6 +40,7 @@ export type MarketDebugState = {
 export type TickerDebugState = {
   mode: "ticker";
   screen: string;
+  symbol: string;
   hasCanvas: boolean;
   cacheDecision?: unknown;
   searching?: boolean;
@@ -64,8 +66,24 @@ export type ScrollAction = {
   amount?: number;
 };
 
-export type PrimaryAction = { action: "primary" };
-export type WhyAction = { action: "why" };
+export type MarketActionContext = {
+  mode: "market";
+  screen: string;
+  selectedIndex: number;
+  selected: string | null;
+  pane: "headlines" | "story" | "lanes" | "briefing" | null;
+};
+
+export type TickerActionContext = {
+  mode: "ticker";
+  screen: string;
+  symbol: string;
+};
+
+export type WebActionContext = MarketActionContext | TickerActionContext;
+
+export type PrimaryAction = { action: "primary"; context: WebActionContext };
+export type WhyAction = { action: "why"; context: WebActionContext };
 
 export type WebAction =
   | SelectAction
@@ -146,9 +164,9 @@ export function resolveWebAction(
     case "scroll":
       return resolveScroll(action, state);
     case "primary":
-      return resolvePrimary(state);
+      return resolvePrimary(action, state);
     case "why":
-      return resolveWhy(state);
+      return resolveWhy(action, state);
     default:
       return reject(`unrecognized action: ${actionType}`);
   }
@@ -327,32 +345,89 @@ function resolveScroll(
   return reject("scroll requires a valid market or ticker debug state");
 }
 
-function resolvePrimary(state: unknown): string[] | WebActionRejection {
+function activeMarketPane(state: MarketDebugState): string | null {
+  if (state.screen === SIGNALS_SCREEN) return state.signalsFocus ?? "headlines";
+  if (state.screen === EVENTS_SCREEN) return state.eventsFocus ?? "lanes";
+  return null;
+}
+
+function resolveActionContext(
+  action: Record<string, unknown>,
+  state: AnyDebugState,
+): WebActionRejection | undefined {
+  const context = action.context;
+  if (!isObject(context)) return reject("action requires an expected context");
+
+  if (state.mode === "market") {
+    if (context.mode !== "market") return reject("action context mode is stale");
+    if (context.screen !== state.screen) return reject("action context screen is stale");
+    if (!isSafeNonNegativeInteger(context.selectedIndex)) {
+      return reject("action context requires a selected index");
+    }
+    if (context.selectedIndex !== state.selectedIndex) {
+      return reject("action context selection index is stale");
+    }
+    if (typeof context.selected !== "string" && context.selected !== null) {
+      return reject("action context requires a selected item");
+    }
+    const selected = state.selected ?? null;
+    if (context.selected !== selected) {
+      return reject("action context selection is stale");
+    }
+    const pane = activeMarketPane(state);
+    if (context.pane !== pane) return reject("action context pane is stale");
+    return undefined;
+  }
+
+  if (context.mode !== "ticker") return reject("action context mode is stale");
+  if (context.screen !== state.screen) return reject("action context screen is stale");
+  if (typeof context.symbol !== "string") {
+    return reject("action context requires a ticker symbol");
+  }
+  if (context.symbol !== state.symbol) return reject("action context ticker is stale");
+  return undefined;
+}
+
+function resolvePrimary(
+  action: Record<string, unknown>,
+  state: unknown,
+): string[] | WebActionRejection {
   if (isMarketState(state)) {
     const lockReason = isLocked(state);
     if (lockReason) return reject(`primary rejected: ${lockReason}`);
+    const contextError = resolveActionContext(action, state);
+    if (contextError) return contextError;
     return [K_ENTER];
   }
 
   if (isTickerState(state)) {
     const lockReason = isLocked(state);
     if (lockReason) return reject(`primary rejected: ${lockReason}`);
+    const contextError = resolveActionContext(action, state);
+    if (contextError) return contextError;
     return [K_ENTER];
   }
 
   return reject("primary requires a valid debug state");
 }
 
-function resolveWhy(state: unknown): string[] | WebActionRejection {
+function resolveWhy(
+  action: Record<string, unknown>,
+  state: unknown,
+): string[] | WebActionRejection {
   if (isMarketState(state)) {
     const lockReason = isLocked(state);
     if (lockReason) return reject(`why rejected: ${lockReason}`);
+    const contextError = resolveActionContext(action, state);
+    if (contextError) return contextError;
     return ["k"];
   }
 
   if (isTickerState(state)) {
     const lockReason = isLocked(state);
     if (lockReason) return reject(`why rejected: ${lockReason}`);
+    const contextError = resolveActionContext(action, state);
+    if (contextError) return contextError;
     return ["k"];
   }
 

@@ -21,6 +21,13 @@ function contextLabel(state?: TerminalFrameState): string {
   return state?.screen || "MARKET";
 }
 
+function primaryActionLabel(state?: TerminalFrameState): "Open" | "Brief" {
+  const screen = state?.screen?.toUpperCase();
+  return state?.mode === "ticker" || screen === "SIGNALS" || screen === "EVENTS"
+    ? "Brief"
+    : "Open";
+}
+
 export function MobileControls({
   state,
   disabled,
@@ -34,6 +41,7 @@ export function MobileControls({
   const searchSheetRef = useRef<HTMLFormElement>(null);
   const cacheLocked = Boolean(state?.cacheDecision);
   const actions = mobileActions(state);
+  const primaryLabel = primaryActionLabel(state);
 
   const closeSearch = () => {
     setSearchOpen(false);
@@ -133,11 +141,11 @@ export function MobileControls({
           <button
             type="button"
             className="mobile-key mobile-key-open"
-            aria-label="Open selected item or run primary action"
+            aria-label={`${primaryLabel} selected item or run primary action`}
             disabled={disabled || cacheLocked}
             onClick={() => onInput(TERMINAL_INPUTS.enter)}
           >
-            <span>OPEN</span>
+            <span>{primaryLabel}</span>
             <small>ENTER</small>
           </button>
           <button

@@ -5,6 +5,7 @@ import {
   paneChoices,
   scrollControls,
   contextKeyHints,
+  terminalActionContext,
   type TerminalWebAction,
   type PaneModel,
   type ScrollControl,
@@ -22,24 +23,6 @@ export interface InteractionOverlayProps {
   onReturnToTerminal?(): void;
 }
 
-/* ── Safe matchMedia helper (browser only) ─────────────────────────── */
-
-function useMediaQuery(query: string): boolean {
-  const [matches, setMatches] = useState<boolean>(() => {
-    if (typeof window === "undefined") return false;
-    return window.matchMedia(query).matches;
-  });
-
-  useEffect(() => {
-    const mql = window.matchMedia(query);
-    const onchange = (e: MediaQueryListEvent) => setMatches(e.matches);
-    mql.addEventListener("change", onchange);
-    return () => mql.removeEventListener("change", onchange);
-  }, [query]);
-
-  return matches;
-}
-
 /* ── Component ──────────────────────────────────────────────────────── */
 
 export function InteractionOverlay({
@@ -48,20 +31,7 @@ export function InteractionOverlay({
   onAction,
   onReturnToTerminal,
 }: InteractionOverlayProps) {
-  /* Open-state defaults to true on coarse/touch pointers. */
-  const isCoarsePointer = useMediaQuery(
-    "(hover: none) and (pointer: coarse)",
-  );
-  const [open, setOpen] = useState<boolean>(isCoarsePointer);
-
-  /* Sync open when coarse-pointer media-query first resolves. The useEffect
-   * only fires when the query result changes (e.g. dev-tool emulation toggle),
-   * giving the user a chance to close the overlay without it fighting back on
-   * every render. */
-  useEffect(() => {
-    setOpen(isCoarsePointer);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isCoarsePointer]);
+  const [open, setOpen] = useState(false);
 
   /* Close the overlay when the terminal becomes fully disabled (e.g. panel
    * was closed remotely), so the toggle starts collapsed for the next session. */
@@ -75,10 +45,12 @@ export function InteractionOverlay({
   const paneModel = useMemo(() => paneChoices(state), [state]);
   const scrollCtrls = useMemo(() => scrollControls(state), [state]);
   const hints = useMemo(() => contextKeyHints(state), [state]);
+  const actionContext = useMemo(() => terminalActionContext(state), [state]);
 
   const cacheLocked = Boolean(state?.cacheDecision);
   const searching = Boolean(state?.searching);
-  const actionDisabled = disabled || !state || cacheLocked || searching;
+  const actionDisabled =
+    disabled || !state || !actionContext || cacheLocked || searching;
 
   const hasSplitPane =
     paneModel !== undefined && paneModel.panes.length > 1;
@@ -199,7 +171,11 @@ export function InteractionOverlay({
               type="button"
               className="interaction-primary-btn"
               disabled={actionDisabled}
-              onClick={() => emit({ action: "primary" })}
+              onClick={() => {
+                if (actionContext) {
+                  emit({ action: "primary", context: actionContext });
+                }
+              }}
               aria-label={
                 isTicker
                   ? "Brief on current ticker"
@@ -218,8 +194,16 @@ export function InteractionOverlay({
               type="button"
               className="interaction-why-btn"
               disabled={actionDisabled}
-              onClick={() => emit({ action: "why" })}
-              aria-label="Show why — market context"
+              onClick={() => {
+                if (actionContext) {
+                  emit({ action: "why", context: actionContext });
+                }
+              }}
+              aria-label={
+                isTicker
+                  ? "Explain why this ticker is moving"
+                  : "Explain why the selected market context matters"
+              }
             >
               <span className="interaction-btn-key">K</span>
               <span className="interaction-btn-label">Why</span>

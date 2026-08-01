@@ -311,6 +311,7 @@ const wss = new WebSocketServer({
 
 wss.on("connection", (ws: WebSocket, request: IncomingMessage) => {
   const socketIp = request.socket.remoteAddress ?? "unknown";
+  let lastWebScrollAt = 0;
   // The edge proxy overwrites this with the visitor's real IP; never trust a
   // client-supplied header (Caddy strips it from the request first).
   const clientIp = (request.headers["x-real-ip"] as string | undefined)?.trim() || socketIp;
@@ -409,6 +410,28 @@ wss.on("connection", (ws: WebSocket, request: IncomingMessage) => {
         break;
       }
       case "web_action": {
+        const isScrollAction =
+          typeof msg.data === "object" &&
+          msg.data !== null &&
+          (msg.data as { action?: unknown }).action === "scroll";
+        const now = Date.now();
+        // High-resolution trackpads can emit dozens of wheel events per
+        // second. Silently throttle them here as a server-side backstop so a
+        // legitimate scroll gesture cannot exhaust the public-demo budget.
+        if (isScrollAction && now - lastWebScrollAt < 500) break;
+
+        let inputs: string[] | undefined;
+        try {
+          const rawState =
+            typeof activePanel?.debugState === "function"
+              ? activePanel.debugState()
+              : undefined;
+          const result = resolveWebAction(msg.data, rawState);
+          if (Array.isArray(result)) inputs = result;
+        } catch {
+          // Defensive: any unexpected exception is swallowed.
+        }
+        if (!inputs) break;
         if (PUBLIC_DEMO) {
           if (!demoLimiter!.allowInput(clientIp)) {
             console.log("[demo] input rate limit hit:", clientIp);
@@ -416,22 +439,8 @@ wss.on("connection", (ws: WebSocket, request: IncomingMessage) => {
             return;
           }
         }
-        // Resolve against the live panel state. Invalid or unrecognized
-        // actions are a silent no-op (we never throw across the WebSocket).
-        try {
-          const rawState =
-            typeof activePanel?.debugState === "function"
-              ? activePanel.debugState()
-              : undefined;
-          const result = resolveWebAction(msg.data, rawState);
-          if (Array.isArray(result)) {
-            for (const input of result) web.sendInput(input);
-          }
-        } catch {
-          // Defensive: any unexpected exception is swallowed.
-        }
-        // Push a frame regardless so the browser sees the result of any
-        // internal inputs we emitted.
+        for (const input of inputs) web.sendInput(input);
+        if (isScrollAction) lastWebScrollAt = now;
         pushFrame();
         handled = true;
         break;

@@ -4,6 +4,7 @@ import {
   resolveWebAction,
   type MarketDebugState,
   type TickerDebugState,
+  type WebActionContext,
 } from "../server/web-actions.js";
 
 // ── Raw terminal sequences (verified against pi-tui matchesKey() legacy seqs) ─
@@ -19,6 +20,7 @@ function marketState(overrides: Partial<MarketDebugState> = {}): MarketDebugStat
     mode: "market",
     screen: "MARKET",
     selectedIndex: 2,
+    selected: "GOOGL",
     available: ["AAPL", "MSFT", "GOOGL", "AMZN", "META"],
     searching: false,
     ...overrides,
@@ -29,6 +31,7 @@ function tickerState(overrides: Partial<TickerDebugState> = {}): TickerDebugStat
   return {
     mode: "ticker",
     screen: "QUOTE",
+    symbol: "AAPL",
     hasCanvas: false,
     ...overrides,
   };
@@ -40,6 +43,27 @@ function reject(value: unknown): asserts value is { error: true; reason: string 
 
 function accepted(value: unknown): asserts value is string[] {
   assert.ok(Array.isArray(value));
+}
+
+function actionContext(
+  state: MarketDebugState | TickerDebugState,
+): WebActionContext {
+  if (state.mode === "ticker") {
+    return { mode: "ticker", screen: state.screen, symbol: state.symbol };
+  }
+  const pane =
+    state.screen === "SIGNALS"
+      ? state.signalsFocus ?? "headlines"
+      : state.screen === "EVENTS"
+        ? state.eventsFocus ?? "lanes"
+        : null;
+  return {
+    mode: "market",
+    screen: state.screen,
+    selectedIndex: state.selectedIndex,
+    selected: state.selected ?? null,
+    pane,
+  };
 }
 
 // ── select action ────────────────────────────────────────────────────────────
@@ -510,46 +534,43 @@ test("scroll rejects zero or negative amount", () => {
 // ── primary action ───────────────────────────────────────────────────────────
 
 test("primary returns raw enter on unlocked market state", () => {
-  const result = resolveWebAction(
-    { action: "primary" },
-    marketState(),
-  );
+  const state = marketState();
+  const result = resolveWebAction({ action: "primary", context: actionContext(state) }, state);
+  accepted(result);
+  assert.deepEqual(result, [K_ENTER]);
+});
+
+test("primary keeps a market-level action available when no item is selected", () => {
+  const state = marketState({ available: [], selected: undefined, selectedIndex: 0 });
+  const result = resolveWebAction({ action: "primary", context: actionContext(state) }, state);
   accepted(result);
   assert.deepEqual(result, [K_ENTER]);
 });
 
 test("primary returns raw enter on unlocked ticker state", () => {
-  const result = resolveWebAction(
-    { action: "primary" },
-    tickerState({ screen: "RESEARCH", hasCanvas: true }),
-  );
+  const state = tickerState({ screen: "RESEARCH", hasCanvas: true });
+  const result = resolveWebAction({ action: "primary", context: actionContext(state) }, state);
   accepted(result);
   assert.deepEqual(result, [K_ENTER]);
 });
 
 test("primary rejects on locked market (searching)", () => {
-  const result = resolveWebAction(
-    { action: "primary" },
-    marketState({ searching: true }),
-  );
+  const state = marketState({ searching: true });
+  const result = resolveWebAction({ action: "primary", context: actionContext(state) }, state);
   reject(result);
   assert.match(result.reason, /search/);
 });
 
 test("primary rejects on locked market (cache)", () => {
-  const result = resolveWebAction(
-    { action: "primary" },
-    marketState({ cacheDecision: {} }),
-  );
+  const state = marketState({ cacheDecision: {} });
+  const result = resolveWebAction({ action: "primary", context: actionContext(state) }, state);
   reject(result);
   assert.match(result.reason, /cache decision/);
 });
 
 test("primary rejects on locked ticker", () => {
-  const result = resolveWebAction(
-    { action: "primary" },
-    tickerState({ cacheDecision: {} }),
-  );
+  const state = tickerState({ cacheDecision: {} });
+  const result = resolveWebAction({ action: "primary", context: actionContext(state) }, state);
   reject(result);
   assert.match(result.reason, /cache decision/);
 });
@@ -557,29 +578,70 @@ test("primary rejects on locked ticker", () => {
 // ── why action ───────────────────────────────────────────────────────────────
 
 test("why returns literal k on unlocked market state", () => {
-  const result = resolveWebAction(
-    { action: "why" },
-    marketState(),
-  );
+  const state = marketState();
+  const result = resolveWebAction({ action: "why", context: actionContext(state) }, state);
   accepted(result);
   assert.deepEqual(result, ["k"]);
 });
 
 test("why returns literal k on unlocked ticker state", () => {
-  const result = resolveWebAction(
-    { action: "why" },
-    tickerState(),
-  );
+  const state = tickerState();
+  const result = resolveWebAction({ action: "why", context: actionContext(state) }, state);
   accepted(result);
   assert.deepEqual(result, ["k"]);
 });
 
 test("why rejects on locked state", () => {
-  const result = resolveWebAction(
-    { action: "why" },
-    marketState({ searching: true, cacheDecision: {} }),
-  );
+  const state = marketState({ searching: true, cacheDecision: {} });
+  const result = resolveWebAction({ action: "why", context: actionContext(state) }, state);
   reject(result);
+});
+
+test("primary rejects a stale market selection or pane", () => {
+  const state = marketState({
+    screen: "SIGNALS",
+    selectedIndex: 1,
+    selected: "Headline B",
+    signalsFocus: "headlines",
+    available: ["Headline A", "Headline B"],
+  });
+  const staleSelection = resolveWebAction(
+    {
+      action: "primary",
+      context: {
+        ...actionContext(state),
+        selectedIndex: 0,
+        selected: "Headline A",
+      },
+    },
+    state,
+  );
+  reject(staleSelection);
+  assert.match(staleSelection.reason, /selection index is stale/);
+
+  const stalePane = resolveWebAction(
+    {
+      action: "why",
+      context: { ...actionContext(state), pane: "story" },
+    },
+    state,
+  );
+  reject(stalePane);
+  assert.match(stalePane.reason, /pane is stale/);
+});
+
+test("contextual actions reject a stale ticker or missing context", () => {
+  const state = tickerState({ symbol: "MSFT" });
+  const staleTicker = resolveWebAction(
+    { action: "primary", context: { mode: "ticker", screen: "QUOTE", symbol: "AAPL" } },
+    state,
+  );
+  reject(staleTicker);
+  assert.match(staleTicker.reason, /ticker is stale/);
+
+  const missingContext = resolveWebAction({ action: "why" }, state);
+  reject(missingContext);
+  assert.match(missingContext.reason, /expected context/);
 });
 
 // ── Rejection of malformed / unrecognized actions ────────────────────────────

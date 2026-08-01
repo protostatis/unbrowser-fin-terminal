@@ -134,13 +134,10 @@ export function mobileActions(state?: TerminalFrameState): MobileAction[] {
 
   return [
     contextAction,
-    {
-      id: "brief",
-      label: !isTicker && !hasSplitPane ? "Open" : "Brief",
-      keyHint: "J",
-      input: "j",
-    },
-    { id: "why", label: "Why", keyHint: "K", input: "k", tone: "accent" },
+    // The center Enter action in the navigation row is the primary Open/Brief
+    // path. Keep Why available as an explicit, quieter secondary action
+    // instead of duplicating the legacy J/K pair in the touch deck.
+    { id: "why", label: "Why", keyHint: "K", input: "k" },
     contextualAction,
     { id: "sync", label: "Sync", keyHint: "R", input: "r" },
     { id: "search", label: "Symbol", keyHint: "/", tone: "accent" },

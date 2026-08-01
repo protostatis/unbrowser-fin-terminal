@@ -216,7 +216,9 @@ Client → server:
   and translates it to canonical raw inputs, so a click on a distant mover does
   not send dozens of client messages. Supported actions are `select`
   (`screen`, `index`, `item`), `focus-pane` (`pane`), `scroll` (`direction`,
-  optional `amount`), `primary`, and `why`.
+  optional `amount`), `primary`, and `why`. Primary and Why actions include
+  the rendered mode/screen/selection-or-symbol context and are rejected when
+  that identity is stale.
 - `{ "type": "resize", "cols": number, "rows": number }` — update
   `webTui.terminal.rows` and re-render at `cols`
 - `{ "type": "command", "name": "market", "args": "AAPL" }` — (re)open a panel
