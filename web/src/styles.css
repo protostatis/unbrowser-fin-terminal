@@ -849,3 +849,500 @@ strong {
   outline: 2px solid #58a6ff;
   outline-offset: 2px;
 }
+
+/* ── Interaction overlay ───────────────────────────────────────────────────
+ *
+ * A companion overlay for the browser projection of market actions. It is
+ * positioned absolutely over .terminal so it never shifts cell measurement.
+ * On wide screens it anchors as a compact edge panel; on narrow/coarse
+ * screens it becomes an anchored bottom sheet that clears the mobile-controls
+ * deck.
+ */
+
+.interaction-overlay {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  z-index: 60;
+  max-width: 380px;
+  width: min(100%, 380px);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+}
+
+/* ── Toggle button (always visible) ──────────────────────────────────────── */
+
+.interaction-toggle {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0 8px 8px auto;
+  padding: 4px 9px;
+  color: #8b949e;
+  background: #0d1117ee;
+  border: 1px solid #30363d;
+  border-radius: 5px;
+  font: inherit;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  cursor: pointer;
+  white-space: nowrap;
+  backdrop-filter: blur(6px);
+}
+
+.interaction-toggle-label {
+  color: #8b949e;
+}
+
+.interaction-toggle-chevron {
+  color: #58a6ff;
+  font-size: 9px;
+}
+
+.interaction-toggle:hover {
+  color: #c9d1d9;
+  border-color: #1f6feb;
+}
+
+.interaction-toggle:hover .interaction-toggle-label {
+  color: #c9d1d9;
+}
+
+.interaction-toggle:focus-visible {
+  outline: 2px solid #58a6ff;
+  outline-offset: 2px;
+}
+
+.interaction-toggle:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* ── Panel ───────────────────────────────────────────────────────────────── */
+
+.interaction-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0 8px 8px;
+  padding: 10px;
+  max-height: calc(85vh - 48px);
+  overflow-y: auto;
+  background: #0d1117f2;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  box-shadow: 0 8px 32px #000b;
+  backdrop-filter: blur(10px);
+}
+
+/* ── Selectable list ─────────────────────────────────────────────────────── */
+
+.interaction-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: min(50vh, 420px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.interaction-list-item {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 6px 10px;
+  color: #c9d1d9;
+  background: #0d1117;
+  border: 1px solid #21262d;
+  border-radius: 4px;
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+.interaction-list-item:hover {
+  background: #1f6feb18;
+  border-color: #30363d;
+}
+
+.interaction-list-item:focus-visible {
+  outline: 2px solid #58a6ff;
+  outline-offset: 1px;
+}
+
+.interaction-list-item[aria-selected="true"] {
+  border-color: #1f6feb;
+  background: #1f6feb14;
+}
+
+.interaction-list-item:disabled {
+  opacity: 0.48;
+  cursor: default;
+}
+
+.interaction-item-index {
+  flex-shrink: 0;
+  color: #484f58;
+  font-size: 10px;
+  font-weight: 700;
+  min-width: 20px;
+}
+
+.interaction-item-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.interaction-item-selected {
+  flex-shrink: 0;
+  color: #58a6ff;
+  font-size: 9px;
+}
+
+/* ── Pane buttons ────────────────────────────────────────────────────────── */
+
+.interaction-panes {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 5px;
+}
+
+.interaction-pane-btn {
+  appearance: none;
+  min-height: 44px;
+  padding: 7px 6px;
+  color: #8b949e;
+  background: linear-gradient(180deg, #1a202b, #0d1117);
+  border: 1px solid #30363d;
+  border-radius: 5px;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow:
+    inset 0 1px #ffffff0d,
+    0 2px 0 #05070a;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+.interaction-pane-btn:hover {
+  color: #c9d1d9;
+  border-color: #1f6feb;
+}
+
+.interaction-pane-btn:focus-visible {
+  outline: 2px solid #58a6ff;
+  outline-offset: 1px;
+}
+
+.interaction-pane-btn[aria-pressed="true"] {
+  color: #58a6ff;
+  border-color: #1f6feb;
+  background: linear-gradient(180deg, #1f2c3a, #131b25);
+}
+
+.interaction-pane-btn:disabled {
+  opacity: 0.48;
+  cursor: default;
+}
+
+/* ── Core actions (primary + why) ─────────────────────────────────────────── */
+
+.interaction-core-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 5px;
+}
+
+.interaction-primary-btn,
+.interaction-why-btn {
+  appearance: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  min-height: 44px;
+  padding: 6px 4px;
+  border: 1px solid #30363d;
+  border-radius: 5px;
+  font: inherit;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  cursor: pointer;
+  box-shadow:
+    inset 0 1px #ffffff0d,
+    0 2px 0 #05070a;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+.interaction-primary-btn {
+  color: #08111c;
+  background: linear-gradient(180deg, #79c0ff, #388bfd);
+  border-color: #79c0ff;
+  box-shadow:
+    inset 0 1px #ffffff55,
+    0 2px 0 #0b3c72;
+}
+
+.interaction-primary-btn:hover {
+  background: linear-gradient(180deg, #88cdff, #4898fd);
+}
+
+.interaction-primary-btn:focus-visible {
+  outline: 2px solid #58a6ff;
+  outline-offset: 2px;
+}
+
+.interaction-primary-btn:disabled {
+  opacity: 0.48;
+  cursor: default;
+}
+
+.interaction-why-btn {
+  color: #79c0ff;
+  background: linear-gradient(180deg, #1a202b, #0d1117);
+  border-color: #1f6feb;
+}
+
+.interaction-why-btn:hover {
+  color: #a5d0ff;
+}
+
+.interaction-why-btn:focus-visible {
+  outline: 2px solid #58a6ff;
+  outline-offset: 1px;
+}
+
+.interaction-why-btn:disabled {
+  opacity: 0.48;
+  cursor: default;
+}
+
+.interaction-btn-key {
+  color: inherit;
+  opacity: 0.6;
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+.interaction-btn-label {
+  font-size: 10px;
+}
+
+/* ── Scroll controls ─────────────────────────────────────────────────────── */
+
+.interaction-scroll {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 5px;
+}
+
+.interaction-scroll-btn {
+  appearance: none;
+  min-height: 44px;
+  padding: 7px 6px;
+  color: #8b949e;
+  background: linear-gradient(180deg, #1a202b, #0d1117);
+  border: 1px solid #30363d;
+  border-radius: 5px;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow:
+    inset 0 1px #ffffff0d,
+    0 2px 0 #05070a;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+.interaction-scroll-btn:hover {
+  color: #c9d1d9;
+  border-color: #1f6feb;
+}
+
+.interaction-scroll-btn:focus-visible {
+  outline: 2px solid #58a6ff;
+  outline-offset: 1px;
+}
+
+.interaction-scroll-btn:disabled {
+  opacity: 0.48;
+  cursor: default;
+}
+
+/* ── Keyboard legend ─────────────────────────────────────────────────────── */
+
+.interaction-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 8px;
+  padding: 6px 8px;
+  background: #080b10cc;
+  border: 1px solid #21262d;
+  border-radius: 4px;
+  font-size: 10px;
+}
+
+.interaction-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  white-space: nowrap;
+  color: #8b949e;
+}
+
+.interaction-legend-item kbd {
+  display: inline-block;
+  padding: 0 3px;
+  min-width: 18px;
+  text-align: center;
+  font: inherit;
+  font-size: 9px;
+  font-weight: 700;
+  color: #c9d1d9;
+  background: #1c2128;
+  border: 1px solid #30363d;
+  border-radius: 3px;
+  line-height: 1.6;
+}
+
+.interaction-legend-label {
+  color: #6e7681;
+  font-size: 9px;
+}
+
+/* Primary tone: arrows, Enter, Tab — visual emphasis */
+.interaction-legend-primary kbd {
+  color: #d2e6ff;
+  background: #1f2c3a;
+  border-color: #1f6feb;
+}
+
+.interaction-legend-primary .interaction-legend-label {
+  color: #8b949e;
+}
+
+/* Why tone: K is deliberately de-emphasized */
+.interaction-legend-why kbd {
+  color: #6e7681;
+  background: #161b22;
+  border-color: #21262d;
+}
+
+.interaction-legend-why .interaction-legend-label {
+  color: #484f58;
+}
+
+/* ── Unavailable state ───────────────────────────────────────────────────── */
+
+.interaction-unavailable {
+  padding: 14px 12px;
+  color: #6e7681;
+  background: #080b10cc;
+  border: 1px solid #21262d;
+  border-radius: 4px;
+  font-size: 11px;
+  text-align: center;
+  font-style: italic;
+}
+
+/* ── Narrow containers ─────────────────────────────────────────────────────
+ *
+ * On narrow viewports the overlay becomes a full-width anchored bottom sheet
+ * positioned above the mobile-controls deck so the two decks never overlap.
+ */
+
+@container (max-width: 600px) {
+  .interaction-overlay {
+    right: 0;
+    left: 0;
+    bottom: 0;
+    max-width: none;
+    width: 100%;
+    z-index: 59;
+  }
+
+  .interaction-toggle {
+    position: relative;
+    margin: 0 8px 4px auto;
+    /* Pull the toggle above the mobile-controls area */
+    bottom: auto;
+  }
+
+  .interaction-panel {
+    margin: 0 6px 6px;
+    border-radius: 8px 8px 0 0;
+    max-height: 55vh;
+    padding-bottom: max(10px, calc(10px + env(safe-area-inset-bottom)));
+  }
+}
+
+@container (max-width: 340px) {
+  .interaction-panel {
+    max-height: 50vh;
+    padding: 8px;
+    gap: 6px;
+  }
+
+  .interaction-list {
+    max-height: 36vh;
+  }
+}
+
+@media (hover: none) and (pointer: coarse) {
+  .interaction-overlay {
+    right: 0;
+    left: 0;
+    bottom: 0;
+    max-width: none;
+    width: 100%;
+    z-index: 59;
+  }
+
+  .interaction-toggle {
+    position: relative;
+    margin: 0 8px 4px auto;
+    bottom: auto;
+  }
+
+  .interaction-panel {
+    margin: 0 6px 6px;
+    border-radius: 8px 8px 0 0;
+    max-height: 55vh;
+    padding-bottom: max(10px, calc(10px + env(safe-area-inset-bottom)));
+  }
+}
+
+/* ── Reduced motion ──────────────────────────────────────────────────────── */
+
+@media (prefers-reduced-motion: reduce) {
+  .interaction-list-item {
+    transition: none;
+  }
+
+  .interaction-primary-btn:active:not(:disabled),
+  .interaction-why-btn:active:not(:disabled),
+  .interaction-scroll-btn:active:not(:disabled),
+  .interaction-pane-btn:active:not(:disabled),
+  .interaction-list-item:active:not(:disabled) {
+    transform: none;
+  }
+}
