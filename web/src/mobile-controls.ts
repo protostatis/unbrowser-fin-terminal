@@ -1,3 +1,5 @@
+import type { TerminalDossier } from "./dossier";
+
 export const TERMINAL_INPUTS = {
   up: "\x1b[A",
   down: "\x1b[B",
@@ -20,6 +22,8 @@ export interface TerminalFrameState {
   searchQuery?: string;
   cacheDecision?: unknown;
   research?: { active?: boolean };
+  /** Optional research dossier; absent on old server frames. */
+  dossier?: TerminalDossier;
   demo?: boolean;
 }
 

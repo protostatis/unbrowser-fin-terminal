@@ -1,8 +1,16 @@
-import { StrictMode, useEffect, useReducer, useRef, useState } from "react";
+import {
+  StrictMode,
+  useCallback,
+  useEffect,
+  useReducer,
+  useRef,
+  useState,
+} from "react";
 import { createRoot } from "react-dom/client";
 import { TerminalSocket } from "./socket";
 import { TerminalFrame } from "./TerminalFrame";
 import { MobileControls } from "./MobileControls";
+import { EvidenceControl, EvidenceInspector } from "./EvidenceInspector";
 import { keyToData } from "./keyboard";
 import { PUBLIC_DEMO } from "./demo-mode";
 import { DEMO_BUSY_CLOSE_CODE } from "./socket";
@@ -48,6 +56,18 @@ function App() {
   /* ── Public demo kiosk state ──────────────────────────────────────────── */
   const [demoWaiting, setDemoWaiting] = useState(false);
   const demoRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  /* ── Evidence locker (research dossier) state ──────────────────────────── */
+  const [evidenceOpen, setEvidenceOpen] = useState(false);
+  const evidenceOpenRef = useRef(false);
+  evidenceOpenRef.current = evidenceOpen;
+  const evidenceTriggerRef = useRef<HTMLButtonElement>(null);
+
+  const closeEvidence = useCallback(() => {
+    setEvidenceOpen(false);
+    // Return keyboard focus to the status chip that opened the locker.
+    requestAnimationFrame(() => evidenceTriggerRef.current?.focus());
+  }, []);
 
   const clearDemoRetry = () => {
     if (demoRetryTimerRef.current) {
@@ -101,6 +121,7 @@ function App() {
       rowsRef.current = [];
       frameStateRef.current = undefined;
       isClosedRef.current = true;
+      setEvidenceOpen(false);
       forceUpdate();
     });
 
@@ -241,6 +262,16 @@ function App() {
         return;
       }
 
+      // Evidence locker is open: Escape ejects it, and no key reaches the
+      // terminal while the cartridge is in view.
+      if (evidenceOpenRef.current && frameStateRef.current?.dossier) {
+        if (e.key === "Escape") {
+          e.preventDefault();
+          closeEvidence();
+        }
+        return;
+      }
+
       const data = keyToData(e);
       if (data !== null) {
         e.preventDefault();
@@ -290,6 +321,13 @@ function App() {
   const cs = connectionStateRef.current;
   const hasFrame = rowsRef.current.length > 0;
   const wasReplaced = wasReplacedRef.current;
+  const dossier = frameStateRef.current?.dossier;
+
+  useEffect(() => {
+    // A new frame can replace or clear the active canvas while the locker is
+    // open. Close it rather than leaving the keyboard behind an invisible dialog.
+    if (!dossier && evidenceOpen) setEvidenceOpen(false);
+  }, [dossier, evidenceOpen]);
 
   const emptyTitle =
     cs === "connected"
@@ -339,13 +377,24 @@ function App() {
       )}
 
       {/* Status line */}
-      <div className="status-line" aria-live="polite">
-        <span className={`status-dot ${cs}`} />
-        {cs === "connected"
-          ? `${colsRef.current}×${rowsCountRef.current}`
-          : cs === "connecting"
-            ? "Connecting…"
-            : "Disconnected"}
+      <div className="status-line">
+        <span className="status-conn" aria-live="polite">
+          <span className={`status-dot ${cs}`} />
+          {cs === "connected"
+            ? `${colsRef.current}×${rowsCountRef.current}`
+            : cs === "connecting"
+              ? "Connecting…"
+              : "Disconnected"}
+        </span>
+
+        {dossier && (
+          <EvidenceControl
+            dossier={dossier}
+            open={evidenceOpen}
+            onOpen={() => setEvidenceOpen(true)}
+            triggerRef={evidenceTriggerRef}
+          />
+        )}
       </div>
 
       {/* Public demo banner */}
@@ -399,6 +448,11 @@ function App() {
             </button>
           </div>
         </div>
+      )}
+
+      {/* Evidence locker — the research dossier inspector */}
+      {evidenceOpen && dossier && (
+        <EvidenceInspector dossier={dossier} onClose={closeEvidence} />
       )}
 
       {/* Closed overlay */}
