@@ -60,6 +60,9 @@ const RECONNECT_MAX_MS = 8_000;
 const MAX_RETRIES = 20;
 const CLIENT_REPLACED_CLOSE_CODE = 4001;
 
+/** Server close code for the public demo: seat busy or rate-limited. */
+export const DEMO_BUSY_CLOSE_CODE = 1013;
+
 export class TerminalSocket {
   private ws: WebSocket | null = null;
   private handlers = new Map<string, Set<Handler>>();

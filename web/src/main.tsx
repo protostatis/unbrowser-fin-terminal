@@ -5,6 +5,7 @@ import { TerminalFrame } from "./TerminalFrame";
 import { MobileControls } from "./MobileControls";
 import { keyToData } from "./keyboard";
 import { PUBLIC_DEMO } from "./demo-mode";
+import { DEMO_BUSY_CLOSE_CODE } from "./socket";
 import type { FrameMessage, SelectRequestMessage } from "./socket";
 import "./styles.css";
 
@@ -123,13 +124,15 @@ function App() {
       wasReplacedRef.current = Boolean(event.replaced);
       if (event.replaced) rowsRef.current = [];
       if (event.replaced) frameStateRef.current = undefined;
-      if (PUBLIC_DEMO && event.replaced) {
-        // Another visitor's tab claimed the singleton seat. Wait politely:
-        // the demo process resets itself after inactivity, so the seat frees
-        // on its own. Auto-retry slowly to avoid two tabs fighting.
+      if (PUBLIC_DEMO && (event.replaced || event.code === DEMO_BUSY_CLOSE_CODE)) {
+        // The singleton seat is held by another visitor (or this client was
+        // rate-limited). Wait politely: the demo process resets itself after
+        // inactivity, so the seat frees on its own. Retry with jitter to
+        // avoid two tabs fighting.
         setDemoWaiting(true);
         if (!demoRetryTimerRef.current) {
-          demoRetryTimerRef.current = setTimeout(tryDemoSeat, 60_000);
+          const delay = 30_000 + Math.random() * 15_000;
+          demoRetryTimerRef.current = setTimeout(tryDemoSeat, delay);
         }
       }
       forceUpdate();

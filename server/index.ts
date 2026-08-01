@@ -39,6 +39,7 @@ import {
   PrincipalLease,
   singleHeader,
 } from "./proxy-auth.js";
+import { createDemoRateLimiter, type DemoRateLimiter } from "./demo-guards.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -56,9 +57,12 @@ const CLIENT_REPLACED_CLOSE_CODE = 4001;
 // injects a fixed guest principal, so the singleton lease is always claimable.
 // Because the lease is process-lifetime, the process self-resets after a period
 // of inactivity so the seat frees for the next visitor; the container restart
-// policy brings it back pristine (fresh tmpfs /data).
+// policy brings it back pristine (fresh tmpfs /data). A hard session cap bounds
+// even an actively hostile client, and per-IP rate limits slow scripted use.
 const PUBLIC_DEMO = process.env.PUBLIC_DEMO === "1" || process.env.PUBLIC_DEMO === "true";
 const DEMO_IDLE_SECONDS = Math.max(60, Number(process.env.DEMO_IDLE_SECONDS) || 300);
+const DEMO_MAX_SESSION_SECONDS = Math.max(300, Number(process.env.DEMO_MAX_SESSION_SECONDS) || 1800);
+const DEMO_BUSY_CLOSE_CODE = 1013;
 
 if (process.env.NODE_ENV === "production" && !PROXY_TOKEN) {
   throw new Error("MARKET_PROXY_TOKEN is required in production");
@@ -135,6 +139,8 @@ let cols = 120;
 let sendToClient: (msg: object) => void = () => {};
 let renderScheduled = false;
 let lastDemoActivity = Date.now();
+const demoLimiter: DemoRateLimiter | null = PUBLIC_DEMO ? createDemoRateLimiter() : null;
+const processStartedAt = Date.now();
 
 function pushFrame(): void {
   if (renderScheduled) return;
@@ -302,9 +308,25 @@ const wss = new WebSocketServer({
   },
 });
 
-wss.on("connection", (ws: WebSocket) => {
+wss.on("connection", (ws: WebSocket, request: IncomingMessage) => {
+  const clientIp = request.socket.remoteAddress ?? "unknown";
+  if (PUBLIC_DEMO) {
+    // One seat at a time: a newcomer must wait rather than evict the current
+    // visitor. 1013 gives the browser a distinct close code so the UI can
+    // show the waiting room instead of fighting for the seat.
+    if (activeClient && activeClient.readyState === WebSocket.OPEN) {
+      console.log("[demo] seat busy; rejecting newcomer");
+      ws.close(DEMO_BUSY_CLOSE_CODE, "Demo seat is in use by another visitor");
+      return;
+    }
+    if (!demoLimiter!.allowConnection(clientIp)) {
+      console.log("[demo] connection rate limit hit:", clientIp);
+      ws.close(DEMO_BUSY_CLOSE_CODE, "Too many demo connections");
+      return;
+    }
+    lastDemoActivity = Date.now();
+  }
   console.log("[ws] client connected");
-  lastDemoActivity = Date.now();
   const previousClient = activeClient;
   activeClient = ws;
   if (previousClient && previousClient.readyState === WebSocket.OPEN) {
@@ -334,17 +356,26 @@ wss.on("connection", (ws: WebSocket) => {
 
   ws.on("message", (raw) => {
     if (activeClient !== ws) return;
-    lastDemoActivity = Date.now();
     let msg: any;
     try {
       msg = JSON.parse(raw.toString());
     } catch {
       return;
     }
+    if (!msg || typeof msg !== "object") return;
+    if (PUBLIC_DEMO) {
+      if (!demoLimiter!.allowInput(clientIp)) {
+        console.log("[demo] input rate limit hit:", clientIp);
+        ws.close(DEMO_BUSY_CLOSE_CODE, "Too many demo inputs");
+        return;
+      }
+    }
+    let handled = false;
     switch (msg.type) {
       case "input":
         web.sendInput(String(msg.data ?? ""));
         pushFrame(); // ensure a frame after state mutation
+        handled = true;
         break;
       case "resize": {
         const c = Number(msg.cols);
@@ -352,11 +383,13 @@ wss.on("connection", (ws: WebSocket) => {
         if (Number.isFinite(c) && c > 0) cols = c;
         if (Number.isFinite(r) && r > 0) web.webTui.terminal.rows = r;
         pushFrame();
+        handled = true;
         break;
       }
       case "command":
         // Open a panel by name. "market" with args opens a ticker, e.g. {args:"NKE"}.
         if (msg.name === "market") openMarket(typeof msg.args === "string" ? msg.args : "");
+        handled = true;
         break;
       case "select_response": {
         const id = String(msg.id ?? "");
@@ -365,11 +398,13 @@ wss.on("connection", (ws: WebSocket) => {
           pendingSelects.delete(id);
           pending.resolve(msg.cancelled ? undefined : msg.value);
         }
+        handled = true;
         break;
       }
       default:
         break;
     }
+    if (PUBLIC_DEMO && handled) lastDemoActivity = Date.now();
   });
 
   ws.on("close", () => {
@@ -456,18 +491,24 @@ process.on("SIGINT", () => void shutdown("SIGINT"));
 process.on("SIGTERM", () => void shutdown("SIGTERM"));
 
 // Demo watchdog: the singleton lease is process-lifetime, so the demo process
-// must restart itself to hand the seat to the next visitor. Any WebSocket
-// connection or client message counts as activity.
+// must restart itself to hand the seat to the next visitor. Only validated
+// client messages count as activity, and an absolute session cap bounds even a
+// hostile client that keeps sending traffic.
 if (PUBLIC_DEMO) {
   const demoWatchdog = setInterval(() => {
     const idleFor = Math.round((Date.now() - lastDemoActivity) / 1000);
-    if (idleFor >= DEMO_IDLE_SECONDS) {
+    const sessionFor = Math.round((Date.now() - processStartedAt) / 1000);
+    if (idleFor >= DEMO_IDLE_SECONDS || sessionFor >= DEMO_MAX_SESSION_SECONDS) {
+      const reason =
+        sessionFor >= DEMO_MAX_SESSION_SECONDS ? "session-limit" : "idle-reset";
       console.log(
-        `[demo] no activity for ${idleFor}s (limit ${DEMO_IDLE_SECONDS}s); resetting for the next visitor.`,
+        `[demo] ${reason}: idle ${idleFor}s (limit ${DEMO_IDLE_SECONDS}s), session ${sessionFor}s (cap ${DEMO_MAX_SESSION_SECONDS}s); resetting for the next visitor.`,
       );
-      void shutdown("idle-reset");
+      void shutdown(reason);
     }
   }, 30_000);
   demoWatchdog.unref();
-  console.log(`[demo] public demo mode active: idle reset after ${DEMO_IDLE_SECONDS}s`);
+  console.log(
+    `[demo] public demo mode active: idle reset after ${DEMO_IDLE_SECONDS}s, session cap ${DEMO_MAX_SESSION_SECONDS}s`,
+  );
 }
