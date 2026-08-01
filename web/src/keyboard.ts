@@ -5,22 +5,49 @@
  *
  * Verified against @earendil-works/pi-tui@0.83.0 matchesKey() legacy sequences.
  */
+
+function closestMatch(target: unknown, selector: string): boolean {
+  if (typeof target !== "object" || target === null) return false;
+  const closest = (target as { closest?: (selectors: string) => Element | null })
+    .closest;
+  return typeof closest === "function" && closest.call(target, selector) !== null;
+}
+
+/**
+ * True when the event target is (or is inside) an editable element
+ * (`input`, `textarea`, `select`, or `[contenteditable="true"]`). These always
+ * keep native browser keyboard behavior and are never captured by the
+ * terminal.
+ */
+export function isEditableTarget(target: EventTarget | null): boolean {
+  return closestMatch(target, 'input, textarea, select, [contenteditable="true"]');
+}
+
+/**
+ * True when the event target is (or is inside) a button or link — a terminal
+ * control the browser may focus. The terminal never captures keys from these;
+ * its focusable frame owns keyboard navigation instead.
+ */
+export function isTerminalControl(target: EventTarget | null): boolean {
+  return closestMatch(target, "button, a[href]");
+}
+
 export function keyToData(e: KeyboardEvent): string | null {
-  // Ignore keys when the user is typing in an interactive element so that
-  // browser-native inputs (search, select prompt) work without interference.
-  const target = e.target;
-  if (
-    target instanceof Element &&
-    target.closest(
-      'input, textarea, select, button, a[href], [contenteditable="true"]',
-    )
-  )
-    return null;
+  // Ignore keys when the user is typing in an editable element so that native
+  // text entry and modal inputs (search, select prompt) keep full browser
+  // keyboard behavior, including Tab for focus traversal.
+  if (isEditableTarget(e.target)) return null;
 
   // Preserve browser and OS shortcuts (Cmd/Ctrl+R, Cmd/Ctrl+L, Alt+Left,
   // copy/paste, etc.) instead of turning them into terminal commands. Shift is
   // intentionally allowed because it determines printable character casing.
   if (e.metaKey || e.ctrlKey || e.altKey) return null;
+
+  const onTerminalControl = isTerminalControl(e.target);
+
+  // Buttons and links retain their native keyboard behavior. The terminal
+  // frame itself is focusable and captures Tab while terminal mode is active.
+  if (onTerminalControl) return null;
 
   const key = e.key;
 

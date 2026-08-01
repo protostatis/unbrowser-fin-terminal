@@ -13,6 +13,7 @@ interface MobileControlsProps {
   state?: TerminalFrameState;
   disabled: boolean;
   onInput: (data: string) => void;
+  onReturnToTerminal?(): void;
 }
 
 function contextLabel(state?: TerminalFrameState): string {
@@ -20,25 +21,33 @@ function contextLabel(state?: TerminalFrameState): string {
   return state?.screen || "MARKET";
 }
 
+function primaryActionLabel(state?: TerminalFrameState): "Open" | "Brief" {
+  const screen = state?.screen?.toUpperCase();
+  return state?.mode === "ticker" || screen === "SIGNALS" || screen === "EVENTS"
+    ? "Brief"
+    : "Open";
+}
+
 export function MobileControls({
   state,
   disabled,
   onInput,
+  onReturnToTerminal,
 }: MobileControlsProps) {
   const [searchOpen, setSearchOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [searchError, setSearchError] = useState("");
   const searchInputRef = useRef<HTMLInputElement>(null);
   const searchSheetRef = useRef<HTMLFormElement>(null);
-  const searchTriggerRef = useRef<HTMLButtonElement>(null);
   const cacheLocked = Boolean(state?.cacheDecision);
   const actions = mobileActions(state);
+  const primaryLabel = primaryActionLabel(state);
 
   const closeSearch = () => {
     setSearchOpen(false);
     setQuery("");
     setSearchError("");
-    requestAnimationFrame(() => searchTriggerRef.current?.focus());
+    requestAnimationFrame(() => onReturnToTerminal?.());
   };
 
   useEffect(() => {
@@ -132,11 +141,11 @@ export function MobileControls({
           <button
             type="button"
             className="mobile-key mobile-key-open"
-            aria-label="Open selected item or run primary action"
+            aria-label={`${primaryLabel} selected item or run primary action`}
             disabled={disabled || cacheLocked}
             onClick={() => onInput(TERMINAL_INPUTS.enter)}
           >
-            <span>OPEN</span>
+            <span>{primaryLabel}</span>
             <small>ENTER</small>
           </button>
           <button
@@ -169,7 +178,6 @@ export function MobileControls({
             <button
               type="button"
               key={action.id}
-              ref={action.id === "search" ? searchTriggerRef : undefined}
               className={`mobile-key mobile-key-action mobile-key-${action.tone || "default"}`}
               disabled={disabled || action.disabled}
               onClick={() => activate(action)}

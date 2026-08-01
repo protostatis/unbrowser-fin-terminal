@@ -12,6 +12,13 @@ export const TERMINAL_INPUTS = {
 
 export type ChartScope = "day" | "week" | "month" | "year" | "max";
 
+/** Scroll window emitted by the canonical extension's story/briefing panes. */
+export interface TerminalScrollWindow {
+  offset: number;
+  rows: number;
+  viewportRows: number;
+}
+
 export interface TerminalFrameState {
   mode?: "market" | "ticker";
   screen?: string;
@@ -25,6 +32,18 @@ export interface TerminalFrameState {
   /** Optional research dossier; absent on old server frames. */
   dossier?: TerminalDossier;
   demo?: boolean;
+  // Fields emitted by the canonical extension's debugState() and consumed by
+  // the browser interaction layer (web-interactions.ts). They only exist for
+  // states the extension actually publishes them for.
+  status?: string;
+  selectedIndex?: number;
+  selected?: string;
+  available?: string[];
+  signalsFocus?: "headlines" | "story";
+  eventsFocus?: "lanes" | "briefing";
+  storyScroll?: TerminalScrollWindow;
+  eventScroll?: TerminalScrollWindow;
+  hasCanvas?: boolean;
 }
 
 export interface MobileAction {
@@ -119,13 +138,10 @@ export function mobileActions(state?: TerminalFrameState): MobileAction[] {
 
   return [
     contextAction,
-    {
-      id: "brief",
-      label: !isTicker && !hasSplitPane ? "Open" : "Brief",
-      keyHint: "J",
-      input: "j",
-    },
-    { id: "why", label: "Why", keyHint: "K", input: "k", tone: "accent" },
+    // The center Enter action in the navigation row is the primary Open/Brief
+    // path. Keep Why available as an explicit, quieter secondary action
+    // instead of duplicating the legacy J/K pair in the touch deck.
+    { id: "why", label: "Why", keyHint: "K", input: "k" },
     contextualAction,
     { id: "sync", label: "Sync", keyHint: "R", input: "r" },
     { id: "search", label: "Symbol", keyHint: "/", tone: "accent" },
