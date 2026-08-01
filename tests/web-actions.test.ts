@@ -6,6 +6,12 @@ import {
   type TickerDebugState,
 } from "../server/web-actions.js";
 
+// ── Raw terminal sequences (verified against pi-tui matchesKey() legacy seqs) ─
+const K_TAB = "\t";
+const K_UP = "\x1b[A";
+const K_DOWN = "\x1b[B";
+const K_ENTER = "\r";
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function marketState(overrides: Partial<MarketDebugState> = {}): MarketDebugState {
@@ -38,13 +44,13 @@ function accepted(value: unknown): asserts value is string[] {
 
 // ── select action ────────────────────────────────────────────────────────────
 
-test("select navigates to the target index with up/down", () => {
+test("select navigates to the target index with down keys", () => {
   const result = resolveWebAction(
     { action: "select", screen: "MARKET", index: 4, item: "META" },
     marketState({ screen: "MARKET", selectedIndex: 2 }),
   );
   accepted(result);
-  assert.deepEqual(result, ["down", "down"]);
+  assert.deepEqual(result, [K_DOWN, K_DOWN]);
 });
 
 test("select when current index is above target emits up keys", () => {
@@ -53,7 +59,7 @@ test("select when current index is above target emits up keys", () => {
     marketState({ screen: "MARKET", selectedIndex: 3 }),
   );
   accepted(result);
-  assert.deepEqual(result, ["up", "up"]);
+  assert.deepEqual(result, [K_UP, K_UP]);
 });
 
 test("select at current index emits empty array", () => {
@@ -65,7 +71,7 @@ test("select at current index emits empty array", () => {
   assert.deepEqual(result, []);
 });
 
-test("select from story reading pane emits Tab first", () => {
+test("select from story reading pane emits Tab first then down", () => {
   const state = marketState({
     screen: "SIGNALS",
     selectedIndex: 1,
@@ -77,10 +83,10 @@ test("select from story reading pane emits Tab first", () => {
     state,
   );
   accepted(result);
-  assert.deepEqual(result, ["tab", "down"]);
+  assert.deepEqual(result, [K_TAB, K_DOWN]);
 });
 
-test("select from briefing reading pane emits Tab first", () => {
+test("select from briefing reading pane emits Tab first then down keys", () => {
   const state = marketState({
     screen: "EVENTS",
     selectedIndex: 0,
@@ -92,7 +98,7 @@ test("select from briefing reading pane emits Tab first", () => {
     state,
   );
   accepted(result);
-  assert.deepEqual(result, ["tab", "down", "down"]);
+  assert.deepEqual(result, [K_TAB, K_DOWN, K_DOWN]);
 });
 
 test("select supports large movers lists (100 items)", () => {
@@ -108,8 +114,8 @@ test("select supports large movers lists (100 items)", () => {
   );
   accepted(result);
   assert.equal(result.length, 99);
-  assert.deepEqual(result[0], "down");
-  assert.deepEqual(result[98], "down");
+  assert.deepEqual(result[0], K_DOWN);
+  assert.deepEqual(result[98], K_DOWN);
 });
 
 test("select rejects non-market mode", () => {
@@ -194,7 +200,7 @@ test("focus-pane returns empty array when already on the desired pane", () => {
   assert.deepEqual(result, []);
 });
 
-test("focus-pane emits Tab to switch from headlines to story", () => {
+test("focus-pane emits raw Tab to switch from headlines to story", () => {
   const state = marketState({
     screen: "SIGNALS",
     signalsFocus: "headlines",
@@ -204,10 +210,10 @@ test("focus-pane emits Tab to switch from headlines to story", () => {
     state,
   );
   accepted(result);
-  assert.deepEqual(result, ["tab"]);
+  assert.deepEqual(result, [K_TAB]);
 });
 
-test("focus-pane emits Tab to switch from story to headlines", () => {
+test("focus-pane emits raw Tab to switch from story to headlines", () => {
   const state = marketState({
     screen: "SIGNALS",
     signalsFocus: "story",
@@ -217,10 +223,10 @@ test("focus-pane emits Tab to switch from story to headlines", () => {
     state,
   );
   accepted(result);
-  assert.deepEqual(result, ["tab"]);
+  assert.deepEqual(result, [K_TAB]);
 });
 
-test("focus-pane emits Tab to switch from lanes to briefing", () => {
+test("focus-pane emits raw Tab to switch from lanes to briefing", () => {
   const state = marketState({
     screen: "EVENTS",
     eventsFocus: "lanes",
@@ -230,10 +236,10 @@ test("focus-pane emits Tab to switch from lanes to briefing", () => {
     state,
   );
   accepted(result);
-  assert.deepEqual(result, ["tab"]);
+  assert.deepEqual(result, [K_TAB]);
 });
 
-test("focus-pane emits Tab to switch from briefing to lanes", () => {
+test("focus-pane emits raw Tab to switch from briefing to lanes", () => {
   const state = marketState({
     screen: "EVENTS",
     eventsFocus: "briefing",
@@ -243,7 +249,7 @@ test("focus-pane emits Tab to switch from briefing to lanes", () => {
     state,
   );
   accepted(result);
-  assert.deepEqual(result, ["tab"]);
+  assert.deepEqual(result, [K_TAB]);
 });
 
 test("focus-pane rejects wrong screen for headlines", () => {
@@ -308,7 +314,7 @@ test("scroll market list moves selection (up)", () => {
     marketState({ screen: "MARKET" }),
   );
   accepted(result);
-  assert.deepEqual(result, ["up"]);
+  assert.deepEqual(result, [K_UP]);
 });
 
 test("scroll market list moves selection (down)", () => {
@@ -317,10 +323,10 @@ test("scroll market list moves selection (down)", () => {
     marketState({ screen: "MARKET" }),
   );
   accepted(result);
-  assert.deepEqual(result, ["down"]);
+  assert.deepEqual(result, [K_DOWN]);
 });
 
-test("scroll SIGNALS story pane when scrollable", () => {
+test("scroll SIGNALS story pane when scrollable (down)", () => {
   const state = marketState({
     screen: "SIGNALS",
     signalsFocus: "story",
@@ -331,10 +337,10 @@ test("scroll SIGNALS story pane when scrollable", () => {
     state,
   );
   accepted(result);
-  assert.deepEqual(result, ["down", "down", "down"]);
+  assert.deepEqual(result, [K_DOWN, K_DOWN, K_DOWN]);
 });
 
-test("scroll EVENTS briefing pane when scrollable", () => {
+test("scroll EVENTS briefing pane when scrollable (up)", () => {
   const state = marketState({
     screen: "EVENTS",
     eventsFocus: "briefing",
@@ -345,7 +351,7 @@ test("scroll EVENTS briefing pane when scrollable", () => {
     state,
   );
   accepted(result);
-  assert.deepEqual(result, ["up", "up"]);
+  assert.deepEqual(result, [K_UP, K_UP]);
 });
 
 test("scroll rejects story pane when not scrollable", () => {
@@ -376,7 +382,7 @@ test("scroll rejects briefing pane when not scrollable", () => {
   assert.match(result.reason, /no scrollable content/);
 });
 
-test("scroll rejects SIGNALS headlines list when no story scroll info", () => {
+test("scroll rejects SIGNALS story when no story scroll info", () => {
   const state = marketState({
     screen: "SIGNALS",
     signalsFocus: "story",
@@ -389,7 +395,7 @@ test("scroll rejects SIGNALS headlines list when no story scroll info", () => {
   reject(result);
 });
 
-test("scroll SIGNALS headlines focus moves selection", () => {
+test("scroll SIGNALS headlines focus moves selection (down)", () => {
   const state = marketState({
     screen: "SIGNALS",
     signalsFocus: "headlines",
@@ -399,25 +405,25 @@ test("scroll SIGNALS headlines focus moves selection", () => {
     state,
   );
   accepted(result);
-  assert.deepEqual(result, ["down", "down"]);
+  assert.deepEqual(result, [K_DOWN, K_DOWN]);
 });
 
-test("scroll MOVERS list moves selection", () => {
+test("scroll MOVERS list moves selection (up)", () => {
   const result = resolveWebAction(
     { action: "scroll", direction: "up", amount: 4 },
     marketState({ screen: "MOVERS" }),
   );
   accepted(result);
-  assert.deepEqual(result, ["up", "up", "up", "up"]);
+  assert.deepEqual(result, [K_UP, K_UP, K_UP, K_UP]);
 });
 
-test("scroll ticker RESEARCH with canvas", () => {
+test("scroll ticker RESEARCH with canvas (down)", () => {
   const result = resolveWebAction(
     { action: "scroll", direction: "down", amount: 3 },
     tickerState({ screen: "RESEARCH", hasCanvas: true }),
   );
   accepted(result);
-  assert.deepEqual(result, ["down", "down", "down"]);
+  assert.deepEqual(result, [K_DOWN, K_DOWN, K_DOWN]);
 });
 
 test("scroll rejects ticker QUOTE tab", () => {
@@ -453,7 +459,7 @@ test("scroll defaults amount to 1 when unspecified", () => {
     marketState({ screen: "WATCH" }),
   );
   accepted(result);
-  assert.deepEqual(result, ["up"]);
+  assert.deepEqual(result, [K_UP]);
 });
 
 test("scroll rejects locked state (searching)", () => {
@@ -503,22 +509,22 @@ test("scroll rejects zero or negative amount", () => {
 
 // ── primary action ───────────────────────────────────────────────────────────
 
-test("primary returns enter on unlocked market state", () => {
+test("primary returns raw enter on unlocked market state", () => {
   const result = resolveWebAction(
     { action: "primary" },
     marketState(),
   );
   accepted(result);
-  assert.deepEqual(result, ["enter"]);
+  assert.deepEqual(result, [K_ENTER]);
 });
 
-test("primary returns enter on unlocked ticker state", () => {
+test("primary returns raw enter on unlocked ticker state", () => {
   const result = resolveWebAction(
     { action: "primary" },
     tickerState({ screen: "RESEARCH", hasCanvas: true }),
   );
   accepted(result);
-  assert.deepEqual(result, ["enter"]);
+  assert.deepEqual(result, [K_ENTER]);
 });
 
 test("primary rejects on locked market (searching)", () => {
@@ -550,7 +556,7 @@ test("primary rejects on locked ticker", () => {
 
 // ── why action ───────────────────────────────────────────────────────────────
 
-test("why returns k on unlocked market state", () => {
+test("why returns literal k on unlocked market state", () => {
   const result = resolveWebAction(
     { action: "why" },
     marketState(),
@@ -559,7 +565,7 @@ test("why returns k on unlocked market state", () => {
   assert.deepEqual(result, ["k"]);
 });
 
-test("why returns k on unlocked ticker state", () => {
+test("why returns literal k on unlocked ticker state", () => {
   const result = resolveWebAction(
     { action: "why" },
     tickerState(),
@@ -665,4 +671,38 @@ test("select rejects negative index", () => {
   );
   reject(result);
   assert.match(result.reason, /integer index/);
+});
+
+// ── Verify raw byte values to guard against accidental string-literal drift ───
+
+test("raw sequences match expected hex bytes", () => {
+  assert.equal(K_TAB, "\x09");
+  assert.equal(K_UP, "\x1b[A");
+  assert.equal(K_DOWN, "\x1b[B");
+  assert.equal(K_ENTER, "\x0d");
+  assert.equal("k", "k"); // literal: no escape sequence needed
+});
+
+test("raw up/down are distinct 3-byte sequences", () => {
+  assert.notEqual(K_UP, K_DOWN);
+  assert.equal(K_UP.length, 3);
+  assert.equal(K_DOWN.length, 3);
+  assert.equal(K_UP.charCodeAt(0), 0x1b);
+  assert.equal(K_DOWN.charCodeAt(0), 0x1b);
+});
+
+test("different directions produce different arrays via scroll", () => {
+  const upResult = resolveWebAction(
+    { action: "scroll", direction: "up", amount: 1 },
+    marketState({ screen: "MARKET" }),
+  );
+  const downResult = resolveWebAction(
+    { action: "scroll", direction: "down", amount: 1 },
+    marketState({ screen: "MARKET" }),
+  );
+  accepted(upResult);
+  accepted(downResult);
+  assert.notDeepEqual(upResult, downResult);
+  assert.equal(upResult[0], K_UP);
+  assert.equal(downResult[0], K_DOWN);
 });

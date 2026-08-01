@@ -1,14 +1,16 @@
 /**
  * Web Action Bridge — parses a web-originated semantic action (JSON) and the
  * current `activePanel.debugState()` and returns a deterministic array of
- * canonical terminal input strings, or a typed rejection.
+ * raw terminal input sequences, or a typed rejection.
  *
- * NEVER injects arbitrary raw-key sequences. Every emitted input is a canonical
- * key the market-terminal extension already understands:
- *   tab      — focus-pane toggle (SIGNALS: headlines↔story, EVENTS: lanes↔briefing)
- *   up/down  — list selection or content scrolling (context-dependent)
- *   enter    — primary action (open ticker, start brief research)
- *   k        — why action (deep research)
+ * NEVER injects arbitrary data. Every emitted byte sequence is one of the
+ * exact raw terminal sequences the market-terminal extension's handleInput
+ * already understands (verified against pi-tui matchesKey() legacy sequences):
+ *   Tab      "\t"        — focus-pane toggle (SIGNALS: headlines↔story, EVENTS: lanes↔briefing)
+ *   Up       "\x1b[A"    — list selection or content scrolling (context-dependent)
+ *   Down     "\x1b[B"    — list selection or content scrolling (context-dependent)
+ *   Enter    "\r"        — primary action (open ticker, start brief research)
+ *   k        "k"         — why action (deep research, literal printable)
  *
  * Supported web actions:
  *   select      { action: "select", screen, index, item }
@@ -84,6 +86,13 @@ const MAX_SCROLL_AMOUNT = 8;
 const SIGNALS_SCREEN = "SIGNALS";
 const EVENTS_SCREEN = "EVENTS";
 const MARKET_SCREEN_NAMES = new Set(["MARKET", "SIGNALS", "EVENTS", "MOVERS", "WATCH"]);
+
+// Raw terminal sequences that the extension's handleInput / matchesKey() accepts.
+// Verified against @earendil-works/pi-tui@0.83.0 and web/src/mobile-controls.ts TERMINAL_INPUTS.
+const K_TAB = "\t";
+const K_UP = "\x1b[A";
+const K_DOWN = "\x1b[B";
+const K_ENTER = "\r";
 
 // ── Guards ───────────────────────────────────────────────────────────────────
 
@@ -200,14 +209,14 @@ function resolveSelect(
     (state.screen === EVENTS_SCREEN && state.eventsFocus === "briefing");
 
   if (inReadingPane) {
-    inputs.push("tab");
+    inputs.push(K_TAB);
   }
 
   // Navigate from current index to target
   if (index < currentIndex) {
-    for (let i = 0; i < currentIndex - index; i++) inputs.push("up");
+    for (let i = 0; i < currentIndex - index; i++) inputs.push(K_UP);
   } else if (index > currentIndex) {
-    for (let i = 0; i < index - currentIndex; i++) inputs.push("down");
+    for (let i = 0; i < index - currentIndex; i++) inputs.push(K_DOWN);
   }
 
   return inputs;
@@ -249,7 +258,7 @@ function resolveFocusPane(
   // Tab only when a change is needed
   if (currentFocus === desiredFocus) return [];
 
-  return ["tab"];
+  return [K_TAB];
 }
 
 function resolveScroll(
@@ -274,7 +283,7 @@ function resolveScroll(
     amount = Math.min(action.amount, MAX_SCROLL_AMOUNT);
   }
 
-  const key = direction;
+  const key = direction === "up" ? K_UP : K_DOWN;
 
   // ── Market mode ──────────────────────────────────────────────────────────
   if (isMarketState(state)) {
@@ -322,13 +331,13 @@ function resolvePrimary(state: unknown): string[] | WebActionRejection {
   if (isMarketState(state)) {
     const lockReason = isLocked(state);
     if (lockReason) return reject(`primary rejected: ${lockReason}`);
-    return ["enter"];
+    return [K_ENTER];
   }
 
   if (isTickerState(state)) {
     const lockReason = isLocked(state);
     if (lockReason) return reject(`primary rejected: ${lockReason}`);
-    return ["enter"];
+    return [K_ENTER];
   }
 
   return reject("primary requires a valid debug state");
