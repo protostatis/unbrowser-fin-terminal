@@ -11,14 +11,27 @@
  * This module is deliberately React/DOM-free and never parses terminal rows:
  * everything is derived from state fields the extension already publishes.
  */
-import type { TerminalFrameState } from "./mobile-controls";
-import { TERMINAL_INPUTS } from "./mobile-controls";
+import {
+  TERMINAL_INPUTS,
+  type ChartScope,
+  type TerminalFrameState,
+} from "./mobile-controls";
 
 /**
  * Whitelisted semantic browser actions. The server validates each action
  * against the live terminal state before translating it to canonical inputs.
  */
 export type TerminalPane = "headlines" | "story" | "lanes" | "briefing";
+
+export const MARKET_SCREENS = [
+  "MARKET",
+  "SIGNALS",
+  "EVENTS",
+  "MOVERS",
+  "WATCH",
+] as const;
+
+export type MarketScreen = (typeof MARKET_SCREENS)[number];
 
 export type TerminalActionContext =
   | {
@@ -35,6 +48,8 @@ export type TerminalActionContext =
     };
 
 export type TerminalWebAction =
+  | { action: "navigate-screen"; screen: MarketScreen }
+  | { action: "set-chart-scope"; scope: ChartScope }
   | { action: "select"; screen: string; index: number; item: string }
   | {
       action: "focus-pane";
@@ -42,7 +57,15 @@ export type TerminalWebAction =
     }
   | { action: "primary"; context: TerminalActionContext }
   | { action: "why"; context: TerminalActionContext }
-  | { action: "scroll"; direction: "up" | "down"; amount?: number };
+  | {
+      action: "scroll";
+      direction: "up" | "down";
+      amount?: number;
+      /** A hovered split pane, so the first wheel step uses that pane. */
+      pane?: TerminalPane;
+      /** Rendered screen identity; the server rejects a delayed stale wheel action. */
+      screen?: string;
+    };
 
 /* ── Selectable list ──────────────────────────────────────────────────── */
 
@@ -191,7 +214,28 @@ export function arrowsMoveSelection(state?: TerminalFrameState): boolean {
  * Whether a mouse wheel / trackpad gesture has a meaningful canonical action
  * in the current view. Lists move the selection; canvases scroll their content.
  */
-export function canUsePointerScroll(state?: TerminalFrameState): boolean {
+export function canUsePointerScroll(
+  state?: TerminalFrameState,
+  pane?: TerminalPane,
+): boolean {
+  if (pane) {
+    if (state?.mode !== "market") return false;
+    const screen = state.screen?.toUpperCase();
+    if (pane === "headlines") return screen === "SIGNALS";
+    if (pane === "lanes") return screen === "EVENTS";
+    if (pane === "story") {
+      return Boolean(
+        screen === "SIGNALS" &&
+          state.storyScroll &&
+          state.storyScroll.rows > state.storyScroll.viewportRows,
+      );
+    }
+    return Boolean(
+      screen === "EVENTS" &&
+        state.eventScroll &&
+        state.eventScroll.rows > state.eventScroll.viewportRows,
+    );
+  }
   return (
     arrowsMoveSelection(state) ||
     scrollControls(state).some((control) => control.scrollable)

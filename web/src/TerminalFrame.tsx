@@ -1,5 +1,6 @@
 import {
   memo,
+  useEffect,
   useRef,
   type MouseEvent,
   type PointerEvent,
@@ -10,10 +11,13 @@ import { horizontalSwipeInput, type SwipePoint } from "./mobile-controls";
 import type { TerminalFrameState } from "./mobile-controls";
 import {
   canUsePointerScroll,
+  type TerminalPane,
   type TerminalWebAction,
 } from "./web-interactions";
 import {
+  terminalPaneAtPosition,
   terminalPaneHitTarget,
+  terminalRowHasPointerTarget,
   terminalRowHitTarget,
 } from "./terminal-hit-targets";
 
@@ -30,6 +34,7 @@ interface TerminalFrameProps {
 }
 
 const WHEEL_STEP_PIXELS = 48;
+const WHEEL_ACTION_INTERVAL_MS = 520;
 const WHEEL_DELTA_LINE = 1;
 const WHEEL_DELTA_PAGE = 2;
 
@@ -63,7 +68,24 @@ export const TerminalFrame = memo(function TerminalFrame({
   const activeTouchPointersRef = useRef(new Set<number>());
   const wheelRemainderRef = useRef(0);
   const wheelDirectionRef = useRef<"up" | "down" | null>(null);
+  const wheelFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastWheelActionAtRef = useRef(0);
+  const pendingWheelRef = useRef<{
+    direction: "up" | "down";
+    pane?: TerminalPane;
+    screen?: string;
+  } | null>(null);
   const suppressClickRef = useRef(false);
+  const hoveredPaneRef = useRef<TerminalPane | null>(null);
+
+  useEffect(
+    () => () => {
+      if (wheelFlushTimerRef.current !== null) {
+        clearTimeout(wheelFlushTimerRef.current);
+      }
+    },
+    [],
+  );
 
   const pointerPoint = (event: PointerEvent<HTMLDivElement>): SwipePoint => ({
     x: event.clientX,
@@ -91,6 +113,8 @@ export const TerminalFrame = memo(function TerminalFrame({
       columns,
       rowCount: rows.length,
       xFraction,
+      targetText:
+        event.target instanceof Element ? event.target.textContent ?? undefined : undefined,
     });
     if (rowTarget) {
       onWebAction(rowTarget.action);
@@ -105,6 +129,77 @@ export const TerminalFrame = memo(function TerminalFrame({
       xFraction,
     );
     if (paneTarget) onWebAction(paneTarget.action);
+  };
+
+  const handleRowPointerMove = (
+    event: PointerEvent<HTMLDivElement>,
+    rowIndex: number,
+  ) => {
+    if (!onWebAction || event.pointerType === "touch") return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    if (rect.width <= 0) return;
+    const pane = terminalPaneAtPosition(
+      state,
+      columns,
+      rowIndex,
+      rows.length,
+      (event.clientX - rect.left) / rect.width,
+    );
+    if (!pane) {
+      hoveredPaneRef.current = null;
+      return;
+    }
+    // Keep hover non-mutating; the next wheel action focuses and scrolls atomically.
+    hoveredPaneRef.current = pane;
+  };
+
+  const hoveredPaneForScreen = (): TerminalPane | undefined => {
+    const pane = hoveredPaneRef.current;
+    const screen = state?.screen?.toUpperCase();
+    if (screen === "SIGNALS" && (pane === "headlines" || pane === "story")) {
+      return pane;
+    }
+    if (screen === "EVENTS" && (pane === "lanes" || pane === "briefing")) {
+      return pane;
+    }
+    return undefined;
+  };
+
+  const flushWheel = () => {
+    const pending = pendingWheelRef.current;
+    if (!pending || !onWebAction) return;
+    const amount = Math.min(
+      8,
+      Math.floor(wheelRemainderRef.current / WHEEL_STEP_PIXELS),
+    );
+    if (amount < 1) return;
+
+    wheelRemainderRef.current -= amount * WHEEL_STEP_PIXELS;
+    pendingWheelRef.current = null;
+    lastWheelActionAtRef.current = performance.now();
+    onWebAction({
+      action: "scroll",
+      direction: pending.direction,
+      amount,
+      ...(pending.pane ? { pane: pending.pane } : {}),
+      ...(pending.screen ? { screen: pending.screen } : {}),
+    });
+  };
+
+  const flushWheelWhenAllowed = () => {
+    const elapsed = performance.now() - lastWheelActionAtRef.current;
+    if (
+      lastWheelActionAtRef.current === 0 ||
+      elapsed >= WHEEL_ACTION_INTERVAL_MS
+    ) {
+      flushWheel();
+      return;
+    }
+    if (wheelFlushTimerRef.current !== null) return;
+    wheelFlushTimerRef.current = setTimeout(() => {
+      wheelFlushTimerRef.current = null;
+      flushWheel();
+    }, WHEEL_ACTION_INTERVAL_MS - elapsed);
   };
 
   return (
@@ -150,8 +245,12 @@ export const TerminalFrame = memo(function TerminalFrame({
         activeTouchPointersRef.current.delete(event.pointerId);
         swipeStartRef.current = null;
       }}
+      onPointerLeave={() => {
+        hoveredPaneRef.current = null;
+      }}
       onWheel={(event) => {
-        if (!onWebAction || !canUsePointerScroll(state)) return;
+        const pane = hoveredPaneForScreen();
+        if (!onWebAction || !canUsePointerScroll(state, pane)) return;
         const pixels = normalizedWheelPixels(event);
         if (!Number.isFinite(pixels) || pixels === 0) return;
 
@@ -168,25 +267,37 @@ export const TerminalFrame = memo(function TerminalFrame({
           WHEEL_STEP_PIXELS * 8,
           wheelRemainderRef.current + Math.abs(pixels),
         );
-
-        const amount = Math.min(
-          8,
-          Math.floor(wheelRemainderRef.current / WHEEL_STEP_PIXELS),
-        );
-        if (amount < 1) return;
-
-        wheelRemainderRef.current -= amount * WHEEL_STEP_PIXELS;
-        onWebAction({ action: "scroll", direction, amount });
+        pendingWheelRef.current = {
+          direction,
+          ...(pane ? { pane } : {}),
+          ...(state?.screen ? { screen: state.screen } : {}),
+        };
+        if (wheelRemainderRef.current < WHEEL_STEP_PIXELS) return;
+        flushWheelWhenAllowed();
       }}
     >
       {rows.map((row, i) => {
         const hitTarget = terminalRowHitTarget(state, row);
+        const pane =
+          terminalPaneAtPosition(state, columns, i, rows.length, 0.1) ??
+          terminalPaneAtPosition(state, columns, i, rows.length, 0.9);
+        const interactive = terminalRowHasPointerTarget(state, row) || Boolean(pane);
         return (
           <div
             key={i}
-            className={`term-row${hitTarget ? " term-row-interactive" : ""}`}
-            title={hitTarget?.label}
+            className={`term-row${interactive ? " term-row-interactive" : ""}`}
+            title={
+              hitTarget?.label ??
+              (interactive
+                ? pane
+                  ? "Focus this pane for scrolling"
+                  : "Select terminal control"
+                : undefined)
+            }
             onClick={onWebAction ? (event) => handleRowClick(event, row, i) : undefined}
+            onPointerMove={
+              onWebAction ? (event) => handleRowPointerMove(event, i) : undefined
+            }
             dangerouslySetInnerHTML={{ __html: row || "&nbsp;" }}
           />
         );

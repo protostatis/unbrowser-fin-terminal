@@ -139,6 +139,21 @@ test("pointer scrolling is available only when a list or canvas can respond", ()
     }),
     true,
   );
+  const storyView: TerminalFrameState = {
+    mode: "market",
+    screen: "SIGNALS",
+    signalsFocus: "story",
+    storyScroll: { offset: 0, rows: 8, viewportRows: 8 },
+  };
+  assert.equal(canUsePointerScroll(storyView, "headlines"), true);
+  assert.equal(canUsePointerScroll(storyView, "story"), false);
+  assert.equal(
+    canUsePointerScroll(
+      { ...storyView, storyScroll: { offset: 0, rows: 9, viewportRows: 8 } },
+      "story",
+    ),
+    true,
+  );
 });
 
 test("action context binds primary actions to the rendered selection and pane", () => {

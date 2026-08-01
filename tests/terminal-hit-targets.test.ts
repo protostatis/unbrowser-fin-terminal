@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  terminalPaneAtPosition,
   terminalPaneHitTarget,
+  terminalRowHasPointerTarget,
   terminalRowHitTarget,
   terminalRowText,
 } from "../web/src/terminal-hit-targets.js";
@@ -10,6 +12,46 @@ test("terminal row text removes trusted web-theme markup", () => {
   assert.equal(
     terminalRowText('<span class="tc tc-accent">Earnings &amp; guidance</span>&nbsp;'),
     "Earnings & guidance ",
+  );
+});
+
+test("screen and chart scope selector spans map to validated actions", () => {
+  const market = {
+    mode: "market" as const,
+    screen: "MARKET",
+    chartScope: "day" as const,
+    available: ["SPY"],
+    selectedIndex: 0,
+    selected: "SPY",
+  };
+  const screenRow = " MARKET   SIGNALS   EVENTS   MOVERS   WATCH ";
+  const scopeRow = " 1:DAY  2:WEEK  3:MONTH  4:YEAR  5:TOTAL ";
+
+  assert.deepEqual(
+    terminalRowHitTarget(market, screenRow, { targetText: " MOVERS " }),
+    { action: { action: "navigate-screen", screen: "MOVERS" }, label: "Open MOVERS" },
+  );
+  assert.equal(
+    terminalRowHitTarget(market, screenRow, { targetText: " MARKET " }),
+    undefined,
+  );
+  assert.deepEqual(
+    terminalRowHitTarget(market, scopeRow, { targetText: " 3:MONTH " }),
+    {
+      action: { action: "set-chart-scope", scope: "month" },
+      label: "Set month chart scope",
+    },
+  );
+  assert.equal(terminalRowHasPointerTarget(market, screenRow), true);
+  assert.equal(terminalRowHasPointerTarget(market, scopeRow), true);
+
+  assert.deepEqual(
+    terminalRowHitTarget(
+      { mode: "ticker", screen: "QUOTE", symbol: "AAPL", chartScope: "week" },
+      scopeRow,
+      { targetText: " 5:TOTAL " },
+    )?.action,
+    { action: "set-chart-scope", scope: "max" },
   );
 });
 
@@ -57,6 +99,14 @@ test("watch and movers rows select a new ticker, then open the selected one", ()
   assert.equal(
     terminalRowHitTarget(movers, "> #02 ▲ MSFT +3.02% VOL 32M")?.action.action,
     "primary",
+  );
+  assert.equal(
+    terminalRowHitTarget(
+      movers,
+      "> #02 ▲ MSFT +3.02% VOL 32M │ SELECTED MOVER",
+      { columns: 120, rowCount: 30, xFraction: 0.8 },
+    ),
+    undefined,
   );
 });
 
@@ -138,6 +188,7 @@ test("pane headings and wide pane bodies change focus without changing selection
     terminalPaneHitTarget(events, 120, 10, 30, 0.7)?.action,
     { action: "focus-pane", pane: "briefing" },
   );
+  assert.equal(terminalPaneAtPosition(events, 120, 10, 30, 0.7), "briefing");
   assert.deepEqual(
     terminalRowHitTarget(
       events,

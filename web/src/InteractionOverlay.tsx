@@ -228,6 +228,7 @@ export function InteractionOverlay({
                         action: "scroll",
                         direction: "up",
                         amount: 3,
+                        screen: state?.screen,
                       })
                     }
                   >
@@ -242,6 +243,7 @@ export function InteractionOverlay({
                         action: "scroll",
                         direction: "down",
                         amount: 3,
+                        screen: state?.screen,
                       })
                     }
                   >

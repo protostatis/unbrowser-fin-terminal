@@ -13,9 +13,11 @@
  *   k        "k"         — why action (deep research, literal printable)
  *
  * Supported web actions:
+ *   navigate-screen { action: "navigate-screen", screen: "MARKET"|... }
+ *   set-chart-scope { action: "set-chart-scope", scope: "day"|... }
  *   select      { action: "select", screen, index, item }
  *   focus-pane  { action: "focus-pane", pane: "headlines"|"story"|"lanes"|"briefing" }
- *   scroll      { action: "scroll", direction: "up"|"down", amount?: number }
+ *   scroll      { action: "scroll", direction: "up"|"down", amount?: number, pane?: ..., screen?: string }
  *   primary     { action: "primary", context }
  *   why         { action: "why", context }
  */
@@ -25,6 +27,7 @@
 export type MarketDebugState = {
   mode: "market";
   screen: string;
+  chartScope?: "day" | "week" | "month" | "year" | "max";
   selectedIndex: number;
   selected?: string;
   available: string[];
@@ -41,6 +44,7 @@ export type TickerDebugState = {
   mode: "ticker";
   screen: string;
   symbol: string;
+  chartScope?: "day" | "week" | "month" | "year" | "max";
   hasCanvas: boolean;
   cacheDecision?: unknown;
   searching?: boolean;
@@ -55,6 +59,16 @@ export type SelectAction = {
   item: string;
 };
 
+export type NavigateScreenAction = {
+  action: "navigate-screen";
+  screen: string;
+};
+
+export type SetChartScopeAction = {
+  action: "set-chart-scope";
+  scope: string;
+};
+
 export type FocusPaneAction = {
   action: "focus-pane";
   pane: "headlines" | "story" | "lanes" | "briefing";
@@ -64,6 +78,8 @@ export type ScrollAction = {
   action: "scroll";
   direction: "up" | "down";
   amount?: number;
+  pane?: "headlines" | "story" | "lanes" | "briefing";
+  screen?: string;
 };
 
 export type MarketActionContext = {
@@ -86,6 +102,8 @@ export type PrimaryAction = { action: "primary"; context: WebActionContext };
 export type WhyAction = { action: "why"; context: WebActionContext };
 
 export type WebAction =
+  | NavigateScreenAction
+  | SetChartScopeAction
   | SelectAction
   | FocusPaneAction
   | ScrollAction
@@ -103,13 +121,23 @@ export type WebActionRejection = {
 const MAX_SCROLL_AMOUNT = 8;
 const SIGNALS_SCREEN = "SIGNALS";
 const EVENTS_SCREEN = "EVENTS";
-const MARKET_SCREEN_NAMES = new Set(["MARKET", "SIGNALS", "EVENTS", "MOVERS", "WATCH"]);
+const MARKET_SCREEN_ORDER = ["MARKET", "SIGNALS", "EVENTS", "MOVERS", "WATCH"] as const;
+const MARKET_SCREEN_NAMES = new Set<string>(MARKET_SCREEN_ORDER);
+const CHART_SCOPE_INPUTS = {
+  day: "1",
+  week: "2",
+  month: "3",
+  year: "4",
+  max: "5",
+} as const;
 
 // Raw terminal sequences that the extension's handleInput / matchesKey() accepts.
 // Verified against @earendil-works/pi-tui@0.83.0 and web/src/mobile-controls.ts TERMINAL_INPUTS.
 const K_TAB = "\t";
 const K_UP = "\x1b[A";
 const K_DOWN = "\x1b[B";
+const K_LEFT = "\x1b[D";
+const K_RIGHT = "\x1b[C";
 const K_ENTER = "\r";
 
 // ── Guards ───────────────────────────────────────────────────────────────────
@@ -157,6 +185,10 @@ export function resolveWebAction(
   if (typeof actionType !== "string") return reject(`invalid action: missing or non-string "action" field`);
 
   switch (actionType) {
+    case "navigate-screen":
+      return resolveNavigateScreen(action, state);
+    case "set-chart-scope":
+      return resolveSetChartScope(action, state);
     case "select":
       return resolveSelect(action, state);
     case "focus-pane":
@@ -173,6 +205,54 @@ export function resolveWebAction(
 }
 
 // ── Action resolvers ─────────────────────────────────────────────────────────
+
+function resolveNavigateScreen(
+  action: Record<string, unknown>,
+  state: unknown,
+): string[] | WebActionRejection {
+  if (!isMarketState(state)) return reject("navigate-screen requires market mode");
+
+  const screen = action.screen;
+  if (typeof screen !== "string" || !MARKET_SCREEN_NAMES.has(screen)) {
+    return reject(`navigate-screen requires a valid market screen, got: ${String(screen)}`);
+  }
+
+  const lockReason = isLocked(state);
+  if (lockReason) return reject(`navigate-screen rejected: ${lockReason}`);
+
+  const currentIndex = MARKET_SCREEN_ORDER.indexOf(state.screen as (typeof MARKET_SCREEN_ORDER)[number]);
+  const targetIndex = MARKET_SCREEN_ORDER.indexOf(screen as (typeof MARKET_SCREEN_ORDER)[number]);
+  if (currentIndex < 0 || targetIndex < 0) {
+    return reject(`navigate-screen rejected: current screen is invalid: ${state.screen}`);
+  }
+  if (currentIndex === targetIndex) return [];
+
+  const forward = (targetIndex - currentIndex + MARKET_SCREEN_ORDER.length) % MARKET_SCREEN_ORDER.length;
+  const backward = (currentIndex - targetIndex + MARKET_SCREEN_ORDER.length) % MARKET_SCREEN_ORDER.length;
+  return Array<string>(Math.min(forward, backward)).fill(forward < backward ? K_RIGHT : K_LEFT);
+}
+
+function resolveSetChartScope(
+  action: Record<string, unknown>,
+  state: unknown,
+): string[] | WebActionRejection {
+  if (!isMarketState(state) && !isTickerState(state)) {
+    return reject("set-chart-scope requires a valid market or ticker debug state");
+  }
+
+  const scope = action.scope;
+  if (
+    typeof scope !== "string" ||
+    !Object.prototype.hasOwnProperty.call(CHART_SCOPE_INPUTS, scope)
+  ) {
+    return reject(`set-chart-scope requires a valid scope, got: ${String(scope)}`);
+  }
+
+  const lockReason = isLocked(state);
+  if (lockReason) return reject(`set-chart-scope rejected: ${lockReason}`);
+  if (state.chartScope === scope) return [];
+  return [CHART_SCOPE_INPUTS[scope as keyof typeof CHART_SCOPE_INPUTS]];
+}
 
 function resolveSelect(
   action: Record<string, unknown>,
@@ -307,29 +387,58 @@ function resolveScroll(
   if (isMarketState(state)) {
     const lockReason = isLocked(state);
     if (lockReason) return reject(`scroll rejected: ${lockReason}`);
+    if (action.screen !== undefined && typeof action.screen !== "string") {
+      return reject(`scroll screen must be a string, got: ${typeof action.screen}`);
+    }
+    if (typeof action.screen === "string" && action.screen !== state.screen) {
+      return reject(`scroll rejected: screen "${action.screen}" is stale`);
+    }
 
-    // SIGNALS story pane: scroll only when scrollable
-    if (state.screen === SIGNALS_SCREEN && state.signalsFocus === "story") {
+    let focusedPane = activeMarketPane(state);
+    const focusInputs: string[] = [];
+    if (action.pane !== undefined) {
+      const pane = action.pane;
+      if (pane !== "headlines" && pane !== "story" && pane !== "lanes" && pane !== "briefing") {
+        return reject(`scroll pane must be a valid pane, got: ${String(pane)}`);
+      }
+      const expectedScreen =
+        pane === "headlines" || pane === "story" ? SIGNALS_SCREEN : EVENTS_SCREEN;
+      if (state.screen !== expectedScreen) {
+        return reject(`scroll pane "${pane}" requires screen "${expectedScreen}", currently "${state.screen}"`);
+      }
+      if (focusedPane !== pane) focusInputs.push(K_TAB);
+      focusedPane = pane;
+    }
+
+    // SIGNALS story pane: scroll only when scrollable.
+    if (state.screen === SIGNALS_SCREEN && focusedPane === "story") {
       if (!state.storyScroll || state.storyScroll.rows <= state.storyScroll.viewportRows) {
         return reject("scroll rejected: story pane has no scrollable content");
       }
-      return Array<string>(amount).fill(key);
+      return [...focusInputs, ...Array<string>(amount).fill(key)];
     }
 
-    // EVENTS briefing pane: scroll only when scrollable
-    if (state.screen === EVENTS_SCREEN && state.eventsFocus === "briefing") {
+    // EVENTS briefing pane: scroll only when scrollable.
+    if (state.screen === EVENTS_SCREEN && focusedPane === "briefing") {
       if (!state.eventScroll || state.eventScroll.rows <= state.eventScroll.viewportRows) {
         return reject("scroll rejected: briefing pane has no scrollable content");
       }
-      return Array<string>(amount).fill(key);
+      return [...focusInputs, ...Array<string>(amount).fill(key)];
     }
 
-    // Regular lists: move selection
-    return Array<string>(amount).fill(key);
+    // Regular lists: move selection, after focusing a hovered list if needed.
+    return [...focusInputs, ...Array<string>(amount).fill(key)];
   }
 
   // ── Ticker mode ──────────────────────────────────────────────────────────
   if (isTickerState(state)) {
+    if (action.pane !== undefined) return reject("scroll pane requires market mode");
+    if (action.screen !== undefined && typeof action.screen !== "string") {
+      return reject(`scroll screen must be a string, got: ${typeof action.screen}`);
+    }
+    if (typeof action.screen === "string" && action.screen !== state.screen) {
+      return reject(`scroll rejected: screen "${action.screen}" is stale`);
+    }
     if (state.screen !== "RESEARCH") {
       return reject("scroll rejected: ticker QUOTE tab does not support scroll");
     }

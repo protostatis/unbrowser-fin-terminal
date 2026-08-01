@@ -1,5 +1,6 @@
 import type { TerminalFrameState } from "./mobile-controls";
 import {
+  MARKET_SCREENS,
   selectableItems,
   terminalActionContext,
   type TerminalPane,
@@ -16,21 +17,37 @@ export interface TerminalHitPosition {
   columns?: number;
   rowCount?: number;
   xFraction?: number;
+  /** Text in the exact ANSI-to-HTML span beneath the pointer, when available. */
+  targetText?: string;
 }
+
+const SCOPE_SELECTOR_TOKENS: Record<string, NonNullable<TerminalFrameState["chartScope"]>> = {
+  "1:DAY": "day",
+  "2:WEEK": "week",
+  "3:MONTH": "month",
+  "4:YEAR": "year",
+  "5:TOTAL": "max",
+};
 
 function normalized(value: string): string {
   return value.replace(/\s+/g, " ").trim().toUpperCase();
 }
 
+function isUnlockedState(
+  state?: TerminalFrameState,
+): state is TerminalFrameState & { mode: "market" | "ticker"; screen: string } {
+  return Boolean(
+    state?.mode &&
+    state.screen &&
+    !state.cacheDecision &&
+    !state.searching,
+  );
+}
+
 function isUnlockedMarketState(
   state?: TerminalFrameState,
 ): state is TerminalFrameState & { mode: "market"; screen: string } {
-  return Boolean(
-    state?.mode === "market" &&
-      state.screen &&
-      !state.cacheDecision &&
-      !state.searching,
-  );
+  return isUnlockedState(state) && state.mode === "market";
 }
 
 function selectTarget(
@@ -82,12 +99,51 @@ function isWideSplitPane(position: TerminalHitPosition): boolean {
 
 function inListPane(screen: string, position: TerminalHitPosition): boolean {
   if (!isWideSplitPane(position) || position.xFraction === undefined) return true;
-  return position.xFraction < (screen === "SIGNALS" ? 0.59 : 0.43);
+  return position.xFraction < (screen === "EVENTS" ? 0.43 : 0.59);
 }
 
 function inDetailPane(screen: string, position: TerminalHitPosition): boolean {
   if (!isWideSplitPane(position) || position.xFraction === undefined) return true;
   return !inListPane(screen, position);
+}
+
+function isScreenSelectorRow(row: string): boolean {
+  return MARKET_SCREENS.every((screen) => row.includes(screen));
+}
+
+function isScopeSelectorRow(row: string): boolean {
+  return Object.keys(SCOPE_SELECTOR_TOKENS).every((token) => row.includes(token));
+}
+
+function selectorTarget(
+  state: TerminalFrameState | undefined,
+  row: string,
+  targetText: string | undefined,
+): TerminalHitTarget | undefined {
+  if (!isUnlockedState(state) || !targetText) return undefined;
+  const token = normalized(targetText);
+
+  if (state.mode === "market" && isScreenSelectorRow(row)) {
+    const screen = MARKET_SCREENS.find((candidate) => candidate === token);
+    if (screen && screen !== state.screen.toUpperCase()) {
+      return {
+        action: { action: "navigate-screen", screen },
+        label: `Open ${screen}`,
+      };
+    }
+  }
+
+  if (isScopeSelectorRow(row)) {
+    const scope = SCOPE_SELECTOR_TOKENS[token];
+    if (scope && scope !== state.chartScope) {
+      return {
+        action: { action: "set-chart-scope", scope },
+        label: `Set ${token.slice(2).toLowerCase()} chart scope`,
+      };
+    }
+  }
+
+  return undefined;
 }
 
 /**
@@ -106,20 +162,24 @@ export function terminalRowText(markup: string): string {
 }
 
 /**
- * Return an action only for stable, visibly rendered list tokens and headings.
- * Quote rows use a second tap to open the already-selected ticker; headline
- * and event taps only select, so they never start costly research by accident.
+ * Return an action only for stable, visibly rendered selector spans, list
+ * tokens, and headings. Quote rows use a second tap to open the already-
+ * selected ticker; headline and event taps only select, so they never start
+ * costly research by accident.
  */
 export function terminalRowHitTarget(
   state: TerminalFrameState | undefined,
   rowMarkup: string,
   position: TerminalHitPosition = {},
 ): TerminalHitTarget | undefined {
+  const row = normalized(terminalRowText(rowMarkup));
+  if (!row) return undefined;
+
+  const selector = selectorTarget(state, row, position.targetText);
+  if (selector) return selector;
   if (!isUnlockedMarketState(state)) return undefined;
 
   const screen = state.screen.toUpperCase();
-  const row = normalized(terminalRowText(rowMarkup));
-  if (!row) return undefined;
 
   if (screen === "SIGNALS") {
     if (row.includes("MARKET STORY") && inDetailPane(screen, position)) {
@@ -146,6 +206,7 @@ export function terminalRowHitTarget(
 
   const items = selectableItems(state);
   if (screen === "MOVERS" || screen === "WATCH") {
+    if (!inListPane(screen, position)) return undefined;
     if (!quoteListRow(screen, row)) return undefined;
     const item = items.find((candidate) => row.includes(normalized(candidate.label)));
     if (!item) return undefined;
@@ -174,10 +235,47 @@ export function terminalRowHitTarget(
   return undefined;
 }
 
+/** True when a selector row has at least one direct browser interaction. */
+export function terminalRowHasPointerTarget(
+  state: TerminalFrameState | undefined,
+  rowMarkup: string,
+): boolean {
+  if (terminalRowHitTarget(state, rowMarkup)) return true;
+  if (!isUnlockedState(state)) return false;
+
+  const row = normalized(terminalRowText(rowMarkup));
+  return (
+    (state.mode === "market" && isScreenSelectorRow(row)) ||
+    isScopeSelectorRow(row)
+  );
+}
+
 /**
  * Wide SIGNALS/EVENTS layouts render a stable two-column split. Clicking a
  * pane body changes focus just like Tab; compact layouts use their headings.
  */
+export function terminalPaneAtPosition(
+  state: TerminalFrameState | undefined,
+  columns: number | undefined,
+  rowIndex: number,
+  rowCount: number,
+  xFraction: number,
+): TerminalPane | undefined {
+  if (!isUnlockedMarketState(state) || columns === undefined) return undefined;
+  if (columns < 84 || rowCount < 24 || rowIndex < 5 || rowIndex >= rowCount - 4) {
+    return undefined;
+  }
+
+  const screen = state.screen.toUpperCase();
+  if (screen === "SIGNALS") {
+    return xFraction < 0.59 ? "headlines" : "story";
+  }
+  if (screen === "EVENTS") {
+    return xFraction < 0.43 ? "lanes" : "briefing";
+  }
+  return undefined;
+}
+
 export function terminalPaneHitTarget(
   state: TerminalFrameState | undefined,
   columns: number | undefined,
@@ -185,17 +283,6 @@ export function terminalPaneHitTarget(
   rowCount: number,
   xFraction: number,
 ): TerminalHitTarget | undefined {
-  if (!isUnlockedMarketState(state) || columns === undefined) return undefined;
-  if (columns < 84 || rowCount < 24 || rowIndex < 4 || rowIndex >= rowCount - 4) {
-    return undefined;
-  }
-
-  const screen = state.screen.toUpperCase();
-  if (screen === "SIGNALS") {
-    return paneTarget(state, xFraction < 0.59 ? "headlines" : "story");
-  }
-  if (screen === "EVENTS") {
-    return paneTarget(state, xFraction < 0.43 ? "lanes" : "briefing");
-  }
-  return undefined;
+  const pane = terminalPaneAtPosition(state, columns, rowIndex, rowCount, xFraction);
+  return pane && isUnlockedMarketState(state) ? paneTarget(state, pane) : undefined;
 }

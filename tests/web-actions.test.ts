@@ -11,6 +11,8 @@ import {
 const K_TAB = "\t";
 const K_UP = "\x1b[A";
 const K_DOWN = "\x1b[B";
+const K_LEFT = "\x1b[D";
+const K_RIGHT = "\x1b[C";
 const K_ENTER = "\r";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -65,6 +67,56 @@ function actionContext(
     pane,
   };
 }
+
+// ── Top selectors ─────────────────────────────────────────────────────────────
+
+test("navigate-screen takes the shortest canonical screen path", () => {
+  const forward = resolveWebAction(
+    { action: "navigate-screen", screen: "SIGNALS" },
+    marketState({ screen: "MARKET" }),
+  );
+  accepted(forward);
+  assert.deepEqual(forward, [K_RIGHT]);
+
+  const backward = resolveWebAction(
+    { action: "navigate-screen", screen: "MOVERS" },
+    marketState({ screen: "MARKET" }),
+  );
+  accepted(backward);
+  assert.deepEqual(backward, [K_LEFT, K_LEFT]);
+});
+
+test("top selector actions reject invalid or locked state", () => {
+  const invalidScreen = resolveWebAction(
+    { action: "navigate-screen", screen: "QUOTE" },
+    marketState(),
+  );
+  reject(invalidScreen);
+  assert.match(invalidScreen.reason, /valid market screen/);
+
+  const locked = resolveWebAction(
+    { action: "set-chart-scope", scope: "month" },
+    marketState({ cacheDecision: {} }),
+  );
+  reject(locked);
+  assert.match(locked.reason, /cache decision/);
+});
+
+test("set-chart-scope emits only the mapped scope key", () => {
+  const market = resolveWebAction(
+    { action: "set-chart-scope", scope: "month" },
+    marketState({ chartScope: "day" }),
+  );
+  accepted(market);
+  assert.deepEqual(market, ["3"]);
+
+  const ticker = resolveWebAction(
+    { action: "set-chart-scope", scope: "max" },
+    tickerState({ chartScope: "week" }),
+  );
+  accepted(ticker);
+  assert.deepEqual(ticker, ["5"]);
+});
 
 // ── select action ────────────────────────────────────────────────────────────
 
@@ -362,6 +414,44 @@ test("scroll SIGNALS story pane when scrollable (down)", () => {
   );
   accepted(result);
   assert.deepEqual(result, [K_DOWN, K_DOWN, K_DOWN]);
+});
+
+test("hovered pane scroll focuses the pane before applying the wheel step", () => {
+  const story = resolveWebAction(
+    { action: "scroll", direction: "down", amount: 2, pane: "story" },
+    marketState({
+      screen: "SIGNALS",
+      signalsFocus: "headlines",
+      storyScroll: { offset: 0, rows: 30, viewportRows: 10 },
+    }),
+  );
+  accepted(story);
+  assert.deepEqual(story, [K_TAB, K_DOWN, K_DOWN]);
+
+  const headlines = resolveWebAction(
+    { action: "scroll", direction: "up", pane: "headlines" },
+    marketState({ screen: "SIGNALS", signalsFocus: "story" }),
+  );
+  accepted(headlines);
+  assert.deepEqual(headlines, [K_TAB, K_UP]);
+});
+
+test("hovered scroll pane must belong to the visible screen", () => {
+  const result = resolveWebAction(
+    { action: "scroll", direction: "down", pane: "briefing" },
+    marketState({ screen: "SIGNALS", signalsFocus: "headlines" }),
+  );
+  reject(result);
+  assert.match(result.reason, /requires screen/);
+});
+
+test("scroll rejects a delayed action from a different rendered screen", () => {
+  const result = resolveWebAction(
+    { action: "scroll", direction: "down", screen: "MOVERS" },
+    marketState({ screen: "SIGNALS", signalsFocus: "headlines" }),
+  );
+  reject(result);
+  assert.match(result.reason, /stale/);
 });
 
 test("scroll EVENTS briefing pane when scrollable (up)", () => {
