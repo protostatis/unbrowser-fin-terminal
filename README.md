@@ -15,6 +15,7 @@ A keyboard-first market terminal for the [Pi coding agent](https://github.com/ea
 - Scope-aware snapshot age, quote coverage, stale/sync state, mover eligibility, and watchlist coverage
 - Project-local research history with explicit `AS OF` timestamps
 - Full-height layouts for narrow and wide terminals
+- Responsive mobile command deck with touch navigation, scope controls, symbol entry, and horizontal view swipes
 
 ## Requirements
 
@@ -113,6 +114,14 @@ The web agent is restricted to `market_technicals`, `market_discover`,
 registered in the model-facing runtime.
 
 ## Controls
+
+On touch or narrow screens, the web UI adds a bottom command deck. It exposes
+previous/next view, selection movement, OPEN, BRIEF, WHY, watch/cancel, sync,
+pane/back, chart-range controls, and a native symbol-entry sheet. Swipe left or
+right over the terminal canvas to change screens or ticker tabs. The controls
+send the same canonical key inputs listed below; connecting from a newer tab or
+phone for the same authenticated principal takes control of the singleton
+session and preserves its current state.
 
 | Key | Action |
 |---|---|

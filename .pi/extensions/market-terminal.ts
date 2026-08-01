@@ -4004,7 +4004,7 @@ class MarketHub {
 			}
 		} else if (matchesKey(data, "backspace") || data === "\b" || data === "\x7f") {
 				this.searchQuery = this.searchQuery.slice(0, -1);
-			} else if (/^[A-Z0-9.\^]$/.test(data.toUpperCase())) {
+			} else if (/^[A-Z0-9.\^-]$/.test(data.toUpperCase())) {
 				this.searchQuery += data.toUpperCase();
 			}
 			this.tui.requestRender();
@@ -4632,6 +4632,7 @@ class MarketHub {
 			selectedIndex: this.selected,
 			selectedByScreen: [...this.selectedByScreen],
 			selected: entry?.type === "quote" ? entry.quote.symbol : entry?.type === "headline" ? entry.headline.title : entry?.type === "event" ? entry.lane.title : undefined,
+			watched: entry?.type === "quote" ? this.viewWatchlist.includes(entry.quote.symbol) : undefined,
 			available: this.entries().map((item) => item.type === "quote" ? item.quote.symbol : item.type === "headline" ? item.headline.title : item.lane.title),
 			chartScope: this.chartScope,
 			signalsFocus: this.screen === MARKET_SCREEN.signals ? this.signalsFocus : undefined,

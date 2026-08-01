@@ -1,3 +1,5 @@
+import type { TerminalFrameState } from "./mobile-controls";
+
 /**
  * WebSocket client for the Pi market-terminal backend.
  *
@@ -25,7 +27,7 @@ export interface FrameMessage {
   rows: string[];
   width: number;
   rows_count: number;
-  state?: Record<string, unknown>;
+  state?: TerminalFrameState;
 }
 
 export interface NotifyMessage {

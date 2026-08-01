@@ -13,6 +13,15 @@ body,
   margin: 0;
   padding: 0;
   overflow: hidden;
+  overscroll-behavior: none;
+}
+
+@supports (height: 100dvh) {
+  html,
+  body,
+  #root {
+    height: 100dvh;
+  }
 }
 
 #root {
@@ -39,6 +48,7 @@ body,
 
 .terminal-frame {
   flex: 1;
+  min-height: 0;
   overflow: hidden;
   padding: 8px 12px;
 }
@@ -390,6 +400,283 @@ strong {
   outline-offset: 2px;
 }
 
+/* ── Mobile command deck ──────────────────────────────────────────────────
+ *
+ * The canonical terminal remains keyboard-first. On touch and narrow screens,
+ * this compact hardware-console layer sends those same input sequences rather
+ * than maintaining a second interaction model.
+ */
+
+.mobile-controls {
+  display: none;
+  position: relative;
+  z-index: 50;
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  flex-shrink: 0;
+  padding: 7px 8px max(8px, env(safe-area-inset-bottom));
+  color: #c9d1d9;
+  background:
+    linear-gradient(180deg, #111722 0%, #090c12 100%);
+  border-top: 1px solid #30363d;
+  box-shadow: 0 -10px 30px #0008;
+}
+
+.mobile-console-head {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 18px;
+  margin-bottom: 6px;
+  color: #8b949e;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+.mobile-console-brand {
+  color: #58a6ff;
+}
+
+.mobile-console-context {
+  min-width: 0;
+  overflow: hidden;
+  color: #8b949e;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mobile-swipe-hint {
+  text-align: right;
+}
+
+.mobile-nav,
+.mobile-actions,
+.mobile-scopes {
+  display: grid;
+  gap: 5px;
+}
+
+.mobile-nav {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+.mobile-actions {
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  margin-top: 5px;
+}
+
+.mobile-actions-3 {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.mobile-scopes {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.mobile-key,
+.mobile-scope,
+.symbol-search-actions button {
+  appearance: none;
+  border: 1px solid #30363d;
+  border-radius: 5px;
+  color: #c9d1d9;
+  background: linear-gradient(180deg, #1a202b, #0d1117);
+  box-shadow:
+    inset 0 1px #ffffff0d,
+    0 2px 0 #05070a;
+  font: inherit;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+.mobile-key {
+  min-width: 0;
+  min-height: 44px;
+  padding: 4px 2px 3px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.mobile-key span {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mobile-key small {
+  color: #8b949e;
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+.mobile-key-nav > span {
+  color: #d2e6ff;
+  font-size: 17px;
+  line-height: 1;
+}
+
+.mobile-key-open {
+  color: #08111c;
+  background: linear-gradient(180deg, #79c0ff, #388bfd);
+  border-color: #79c0ff;
+  box-shadow:
+    inset 0 1px #ffffff55,
+    0 2px 0 #0b3c72;
+}
+
+.mobile-key-open small {
+  color: #102f50;
+}
+
+.mobile-key-accent {
+  color: #79c0ff;
+  border-color: #1f6feb;
+}
+
+.mobile-key-warning {
+  color: #ffb4ae;
+  border-color: #6e2b2b;
+  background: linear-gradient(180deg, #321b20, #160d10);
+}
+
+.mobile-key:active:not(:disabled),
+.mobile-scope:active:not(:disabled),
+.symbol-search-actions button:active:not(:disabled) {
+  transform: translateY(2px);
+  box-shadow: inset 0 1px 4px #0008;
+}
+
+.mobile-key:focus-visible,
+.mobile-scope:focus-visible,
+.symbol-search-actions button:focus-visible,
+.symbol-search-sheet input:focus-visible {
+  outline: 2px solid #58a6ff;
+  outline-offset: 1px;
+}
+
+.mobile-key:disabled,
+.mobile-scope:disabled {
+  opacity: 0.52;
+  box-shadow: none;
+}
+
+.mobile-scope {
+  min-height: 44px;
+  padding: 8px 4px;
+  color: #8b949e;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.mobile-scope[aria-pressed="true"] {
+  color: #0b0e14;
+  background: #3fb950;
+  border-color: #56d364;
+  box-shadow: inset 0 1px #ffffff55;
+}
+
+.symbol-search-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 240;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding: 16px 12px max(16px, env(safe-area-inset-bottom));
+  background: #05070bd9;
+  backdrop-filter: blur(4px);
+}
+
+.symbol-search-sheet {
+  width: min(100%, 520px);
+  padding: 18px;
+  background:
+    linear-gradient(135deg, #1f6feb14, transparent 42%),
+    #111722;
+  border: 1px solid #30363d;
+  border-top: 2px solid #58a6ff;
+  border-radius: 8px;
+  box-shadow: 0 20px 70px #000c;
+}
+
+.symbol-search-kicker {
+  margin-bottom: 6px;
+  color: #58a6ff;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+}
+
+.symbol-search-sheet label {
+  display: block;
+  color: #f0f6fc;
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.symbol-search-sheet input {
+  width: 100%;
+  margin-top: 12px;
+  padding: 13px 14px;
+  color: #f0f6fc;
+  background: #070a0f;
+  border: 1px solid #484f58;
+  border-radius: 5px;
+  font: 700 18px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.symbol-search-sheet input::placeholder {
+  color: #484f58;
+}
+
+.symbol-search-sheet p {
+  min-height: 15px;
+  margin: 7px 0 0;
+  color: #8b949e;
+  font-size: 10px;
+}
+
+.symbol-search-sheet .symbol-search-error {
+  color: #ff7b72;
+}
+
+.symbol-search-actions {
+  display: grid;
+  grid-template-columns: 1fr 1.35fr;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.symbol-search-actions button {
+  min-height: 44px;
+  padding: 10px 12px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.symbol-search-actions .symbol-search-go {
+  color: #07111d;
+  background: #58a6ff;
+  border-color: #79c0ff;
+}
+
 /* ── Narrow containers ─────────────────────────────────────────────────────
  *
  * The extension's compact layout requires at least 54 columns. Scale the
@@ -420,8 +707,16 @@ strong {
 
   .toast {
     inset-inline: 8px;
-    top: 8px;
+    top: max(8px, env(safe-area-inset-top));
     max-width: none;
+  }
+
+  .mobile-controls {
+    display: block;
+  }
+
+  .terminal-frame {
+    touch-action: pan-y pinch-zoom;
   }
 }
 
@@ -429,11 +724,35 @@ strong {
   .terminal {
     font-size: 9px;
   }
+
+  .mobile-console-head {
+    grid-template-columns: 1fr auto;
+  }
+
+  .mobile-swipe-hint {
+    display: none;
+  }
+}
+
+@media (hover: none) and (pointer: coarse) {
+  .mobile-controls {
+    display: block;
+  }
+
+  .terminal-frame {
+    touch-action: pan-y pinch-zoom;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
   .status-dot.connecting,
   .toast {
     animation: none;
+  }
+
+  .mobile-key:active:not(:disabled),
+  .mobile-scope:active:not(:disabled),
+  .symbol-search-actions button:active:not(:disabled) {
+    transform: none;
   }
 }
