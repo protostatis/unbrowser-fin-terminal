@@ -21,9 +21,10 @@ import {
   type TerminalWebAction,
 } from "./InteractionOverlay";
 import { keyToData } from "./keyboard";
-import { PUBLIC_DEMO } from "./demo-mode";
+import { PUBLIC_DEMO, REPLAY_DEMO } from "./demo-mode";
 import { DEMO_BUSY_CLOSE_CODE } from "./socket";
 import type { FrameMessage, SelectRequestMessage } from "./socket";
+import { ReplayApp } from "./ReplayApp";
 import "./styles.css";
 
 const RESEARCH_OUTCOME_DISPLAY_MS = 8_000;
@@ -616,8 +617,15 @@ function App() {
 
 const rootEl = document.getElementById("root");
 if (!rootEl) throw new Error("#root element not found");
+
+// Replay-only demo builds (base path /unbrowser/fin-terminal-demo/) render the
+// static ReplayApp instead of the live terminal, so no TerminalSocket is ever
+// constructed in that deployment. The live terminal is unchanged everywhere
+// else.
+const RootApp = REPLAY_DEMO ? ReplayApp : App;
+
 createRoot(rootEl).render(
   <StrictMode>
-    <App />
+    <RootApp />
   </StrictMode>,
 );

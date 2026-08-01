@@ -10,10 +10,28 @@ if (!/^\/(?:[A-Za-z0-9._~-]+\/)*$/.test(publicBasePath)) {
   throw new Error("PUBLIC_BASE_PATH must start and end with / and contain URL-safe path segments");
 }
 
+// Determine build mode from PUBLIC_BASE_PATH: if the path contains the
+// "fin-terminal-demo" segment the build is for replay-only kiosk mode;
+// otherwise it is a live agent build.
+const buildMode: "replay" | "live" = publicBasePath.split("/").filter(Boolean).includes("fin-terminal-demo")
+  ? "replay"
+  : "live";
+
 export default defineConfig({
   root: "web",
   base: publicBasePath,
-  plugins: [react()],
+  plugins: [
+    react(),
+    {
+      name: "inject-build-mode",
+      transformIndexHtml(html) {
+        return html.replace(
+          "</head>",
+          `  <meta name="x-build-mode" content="${buildMode}">\n  </head>`,
+        );
+      },
+    },
+  ],
   server: {
     port: 5173,
     proxy: {

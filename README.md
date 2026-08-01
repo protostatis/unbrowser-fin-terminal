@@ -74,6 +74,18 @@ production deployment should use a dedicated Docker-internal isolated endpoint,
 such as `http://unbrowser-mcp:8767/mcp`. Production startup fails closed when
 `UNBROWSER_MCP_URL` is missing.
 
+Open the Vite URL printed in the terminal (normally
+`http://localhost:5173`). Quote browsing works immediately; agent research
+uses your local Pi model/auth configuration and may consume configured model
+resources.
+
+If port `8787` is occupied, start both processes against another backend port,
+for example `PORT=8788 npm run dev`.
+
+The bridge listens on `127.0.0.1` by default and accepts browser connections
+only from loopback origins. Do not expose it remotely without authentication
+and TLS; `ALLOWED_ORIGINS` alone is not authentication.
+
 ### Container deployment
 
 The included multi-stage image accepts `PUBLIC_BASE_PATH` at build time. For a
@@ -91,49 +103,16 @@ must also provide an authenticated, opaque `X-Fin-Terminal-User` value. The
 first WebSocket principal owns the singleton terminal session until the process
 restarts, preventing state transfer between users.
 
+Live production must set `PUBLIC_DEMO=0` explicitly; the replay demo sets
+`PUBLIC_DEMO=1` (see "Public demo deployment"). The client build and server
+mode must match — a client built for `/unbrowser/fin-terminal-demo/` pairs
+with a replay server, and one built for `/unbrowser/fin-terminal/` pairs with
+a live server.
+
 Set `MARKET_ROOT=/app`, `MARKET_DATA_DIR=/data`, and mount `/data` as the only
 persistent volume. `/api/health` is liveness-only; use `/api/ready` for the
 container health check. A dedicated, provider-capped OpenRouter key is strongly
 recommended rather than sharing another service's key.
-
-Run `npm run typecheck` to validate the extension, backend, and browser client,
-or `npm run build` for a production browser bundle.
-
-For the production release workflow, including the immutable source-SHA handoff
-to `unchained-infra` and GitHub Actions production approval, see
-[`docs/deployment.md`](docs/deployment.md).
-
-### Public demo deployment
-
-An anonymous kiosk deployment is supported for public demos. Build with the
-demo base path and set `PUBLIC_DEMO=1`:
-
-```bash
-docker build \
-  --build-arg PUBLIC_BASE_PATH=/unbrowser/fin-terminal-demo/ \
-  -t unbrowser-fin-terminal-demo .
-```
-
-In demo mode the trusted proxy injects a fixed `guest` principal instead of an
-authenticated one, the frame state carries `demo: true` (the UI shows a PUBLIC
-DEMO banner and a waiting room when the singleton seat is taken), and the
-process exits after `DEMO_IDLE_SECONDS` (default 300, minimum 60) without any
-WebSocket activity so the container restart policy hands the seat to the next
-visitor. Use a tmpfs `/data` so every reset starts pristine. Research (BRIEF/WHY)
-remains enabled; prefer a dedicated, provider-capped OpenRouter key for the
-demo build.
-
-Open the Vite URL printed in the terminal (normally
-`http://localhost:5173`). Quote browsing works immediately; agent research
-uses your local Pi model/auth configuration and may consume configured model
-resources.
-
-If port `8787` is occupied, start both processes against another backend port,
-for example `PORT=8788 npm run dev`.
-
-The bridge listens on `127.0.0.1` by default and accepts browser connections
-only from loopback origins. Do not expose it remotely without authentication
-and TLS; `ALLOWED_ORIGINS` alone is not authentication.
 
 The web agent is restricted to `market_technicals`, `market_discover`,
 `market_extract`, and `market_canvas`. Pi's shell and filesystem tools are not
@@ -144,6 +123,43 @@ to `6` and accepts integers from `1` through `6`; keep it at `1` when
 characterizing a new model or MCP endpoint. Workers inherit the configured
 model policy and expose the same four model-facing tools, but the canonical
 terminal process remains the sole archive writer.
+
+Run `npm run typecheck` to validate the extension, backend, and browser client,
+or `npm run build` for a production browser bundle.
+
+For the production release workflow, including the immutable source-SHA handoff
+to `unchained-infra` and GitHub Actions production approval, see
+[`docs/deployment.md`](docs/deployment.md).
+
+### Public demo deployment
+
+The public demo is a static replay site, not a live kiosk. It serves
+checked-in, immutable replay artifacts of the terminal and an informational
+pilot placeholder. It starts no AgentSession, performs no WebSocket, model, or
+source work, and creates no auth, entitlement, workspace, or source-check
+state. There is no singleton seat, waiting room, or idle watchdog.
+
+Build with the demo base path and set `PUBLIC_DEMO=1`:
+
+```bash
+docker build \
+  --build-arg PUBLIC_BASE_PATH=/unbrowser/fin-terminal-demo/ \
+  -t unbrowser-fin-terminal-demo .
+```
+
+`PUBLIC_DEMO` must be set explicitly in production: `PUBLIC_DEMO=0` for the
+live terminal and `PUBLIC_DEMO=1` for the replay demo. The client build must
+match the server mode. A client built with `/unbrowser/fin-terminal-demo/`
+must pair with a replay server, and a client built with
+`/unbrowser/fin-terminal/` must pair with a live server. A mismatched pair is
+unsafe and fails closed.
+
+Replay-mode verification:
+
+- `GET /api/ready` returns HTTP 200.
+- The static replay artifacts and pilot placeholder are served with no
+  authenticated user session.
+- `GET /ws` is rejected without an HTTP 101 WebSocket upgrade.
 
 ## Controls
 

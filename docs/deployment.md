@@ -55,9 +55,21 @@ deployment fallback for a normal terminal release.
 
 ## Deployment Contract
 
-- Build the authenticated service with
+- Build the authenticated live service with
   `PUBLIC_BASE_PATH=/unbrowser/fin-terminal/` and the demo service with
   `PUBLIC_BASE_PATH=/unbrowser/fin-terminal-demo/`.
+- `PUBLIC_DEMO` is explicit and must be set in production: `PUBLIC_DEMO=0` for
+  the live terminal and `PUBLIC_DEMO=1` for the replay demo. It is never
+  derived from the build path alone.
+- The client build and server mode must pair. A client built for
+  `/unbrowser/fin-terminal-demo/` must be served by a replay-mode server; a
+  client built for `/unbrowser/fin-terminal/` must be served by a live-mode
+  server. A mismatched pair is unsafe and must fail closed.
+- The public demo is a static replay site, not a live kiosk. It serves
+  checked-in, immutable replay artifacts and an informational pilot
+  placeholder. It starts no AgentSession, performs no WebSocket/model/source
+  work, and creates no auth, entitlement, workspace, or source-check state.
+  There is no singleton seat, waiting room, or idle watchdog.
 - The container listens on port `8787`; `/api/ready` is the readiness check.
 - Caddy owns route authorization and injects the terminal proxy token. Do not
   expose port `8787` directly or bypass Caddy.
@@ -77,8 +89,11 @@ deployment fallback for a normal terminal release.
   `/unbrowser/fin-terminal/ws` through Caddy.
 - Confirm a direct container-network request without the injected proxy token
   returns HTTP 403.
-- Confirm the independent public demo route
-  `/unbrowser/fin-terminal-demo/` loads without an authenticated session.
+- Confirm the demo service reports `GET /api/ready` HTTP 200.
+- Confirm `/unbrowser/fin-terminal-demo/` serves the checked-in static replay
+  artifacts and pilot placeholder with no authenticated user session created.
+- Confirm `/unbrowser/fin-terminal-demo/ws` is rejected without an HTTP 101
+  WebSocket upgrade.
 
 The authoritative infrastructure details, including production secrets and
 host safety controls, live in
