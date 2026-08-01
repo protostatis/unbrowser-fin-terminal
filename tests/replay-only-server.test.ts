@@ -16,6 +16,9 @@ import { randomInt } from "node:crypto";
 import { createConnection } from "node:net";
 import test from "node:test";
 
+const PROXY_TOKEN_HEADER = "x-fin-terminal-proxy-token";
+const PROXY_TOKEN = "replay-test-token";
+
 // =========================================================================
 // Helpers
 // =========================================================================
@@ -64,18 +67,24 @@ async function fetchJson(url: string): Promise<{ status: number; body: any }> {
   }
 }
 
-async function fetchText(url: string): Promise<{ status: number; body: string }> {
+async function fetchText(
+  url: string,
+  withProxyToken = false,
+): Promise<{ status: number; body: string }> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 5000);
   try {
-    const resp = await fetch(url, { signal: controller.signal });
+    const resp = await fetch(url, {
+      signal: controller.signal,
+      headers: withProxyToken ? { [PROXY_TOKEN_HEADER]: PROXY_TOKEN } : undefined,
+    });
     return { status: resp.status, body: await resp.text() };
   } finally {
     clearTimeout(timeout);
   }
 }
 
-function upgradeStatus(port: number): Promise<number> {
+function upgradeStatus(port: number, withProxyToken = false): Promise<number> {
   return new Promise((resolve, reject) => {
     const socket = createConnection({ port, host: "127.0.0.1" });
     const timeout = setTimeout(() => {
@@ -91,7 +100,9 @@ function upgradeStatus(port: number): Promise<number> {
           "Connection: Upgrade\r\n" +
           "Upgrade: websocket\r\n" +
           "Sec-WebSocket-Version: 13\r\n" +
-          "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+          "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+          (withProxyToken ? `${PROXY_TOKEN_HEADER}: ${PROXY_TOKEN}\r\n` : "") +
+          "\r\n",
       );
     });
     socket.on("data", (chunk: Buffer) => {
@@ -136,7 +147,7 @@ test("replay server starts and serves /api/health", async () => {
       OPENROUTER_API_KEY: "",
       OPENROUTER_API_KEY_FILE: "",
       UNBROWSER_MCP_URL: "",
-      MARKET_PROXY_TOKEN: "",
+      MARKET_PROXY_TOKEN: "replay-test-token",
       ALLOWED_ORIGINS: "",
       MARKET_MODEL_PROVIDER: "",
       MARKET_MODEL_ID: "",
@@ -163,7 +174,7 @@ test("replay server starts and serves /api/health", async () => {
     assert.equal(ready.body.replay, true);
 
     // Index page
-    const index = await fetchText(`http://127.0.0.1:${port}/`);
+    const index = await fetchText(`http://127.0.0.1:${port}/`, true);
     assert.equal(index.status, 200);
     assert.ok(index.body.includes("replay test"));
   } finally {
@@ -196,7 +207,7 @@ test("replay server rejects /ws upgrade with 403", async () => {
         OPENROUTER_API_KEY: "",
         OPENROUTER_API_KEY_FILE: "",
         UNBROWSER_MCP_URL: "",
-        MARKET_PROXY_TOKEN: "",
+        MARKET_PROXY_TOKEN: "replay-test-token",
         ALLOWED_ORIGINS: "",
         MARKET_MODEL_PROVIDER: "",
         MARKET_MODEL_ID: "",
@@ -212,13 +223,13 @@ test("replay server rejects /ws upgrade with 403", async () => {
     await waitForServer(port, "127.0.0.1");
 
     // Normal HTTP requests to the route get the same deterministic refusal.
-    const wsResp = await fetchText(`http://127.0.0.1:${port}/ws`);
+    const wsResp = await fetchText(`http://127.0.0.1:${port}/ws`, true);
     assert.equal(wsResp.status, 403);
     assert.ok(wsResp.body.includes("WebSocket not available in replay mode"));
 
     // A real HTTP Upgrade bypasses Express routing; it must also be refused
     // and must never produce the successful WebSocket 101 response.
-    assert.equal(await upgradeStatus(port), 403);
+    assert.equal(await upgradeStatus(port, true), 403);
   } finally {
     child.kill("SIGTERM");
     rmSync(root, { recursive: true, force: true });
@@ -246,7 +257,7 @@ test("replay production fails if dist-web/index.html is missing", async () => {
         OPENROUTER_API_KEY: "",
         OPENROUTER_API_KEY_FILE: "",
         UNBROWSER_MCP_URL: "",
-        MARKET_PROXY_TOKEN: "",
+        MARKET_PROXY_TOKEN: "replay-test-token",
         ALLOWED_ORIGINS: "",
         MARKET_MODEL_PROVIDER: "",
         MARKET_MODEL_ID: "",
@@ -300,7 +311,7 @@ test("replay production fails if manifest mode mismatches", async () => {
         OPENROUTER_API_KEY: "",
         OPENROUTER_API_KEY_FILE: "",
         UNBROWSER_MCP_URL: "",
-        MARKET_PROXY_TOKEN: "",
+        MARKET_PROXY_TOKEN: "replay-test-token",
         ALLOWED_ORIGINS: "",
         MARKET_MODEL_PROVIDER: "",
         MARKET_MODEL_ID: "",
@@ -354,7 +365,7 @@ test("replay production fails if manifest meta tag is missing", async () => {
         OPENROUTER_API_KEY: "",
         OPENROUTER_API_KEY_FILE: "",
         UNBROWSER_MCP_URL: "",
-        MARKET_PROXY_TOKEN: "",
+        MARKET_PROXY_TOKEN: "replay-test-token",
         ALLOWED_ORIGINS: "",
         MARKET_MODEL_PROVIDER: "",
         MARKET_MODEL_ID: "",
@@ -408,7 +419,7 @@ test("replay production with matching manifest starts successfully without agent
         OPENROUTER_API_KEY: "",
         OPENROUTER_API_KEY_FILE: "",
         UNBROWSER_MCP_URL: "",
-        MARKET_PROXY_TOKEN: "",
+        MARKET_PROXY_TOKEN: "replay-test-token",
         ALLOWED_ORIGINS: "",
         MARKET_MODEL_PROVIDER: "",
         MARKET_MODEL_ID: "",
@@ -430,7 +441,7 @@ test("replay production with matching manifest starts successfully without agent
     assert.equal(ready.body.replay, true);
 
     // Verify static files are served
-    const index = await fetchText(`http://127.0.0.1:${port}/`);
+    const index = await fetchText(`http://127.0.0.1:${port}/`, true);
     assert.equal(index.status, 200);
     assert.ok(index.body.includes("replay prod test"));
   } finally {

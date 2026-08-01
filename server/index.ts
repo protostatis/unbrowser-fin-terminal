@@ -98,6 +98,13 @@ const app = express();
 app.get("/api/health", (_req, res) => res.json({ status: "ok", uptime: process.uptime() }));
 
 app.use((req, res, next) => {
+  // Container readiness probes originate inside the Compose network and do not
+  // carry Caddy's proxy token. Keep this narrow endpoint public so a healthy
+  // candidate is not rolled back before Caddy can serve it.
+  if (req.path === "/api/ready") {
+    next();
+    return;
+  }
   if (!matchesProxyToken(PROXY_TOKEN, singleHeader(req, PROXY_TOKEN_HEADER))) {
     res.status(403).type("text").send("Forbidden");
     return;
