@@ -147,12 +147,11 @@ terminal process remains the sole archive writer.
 
 ## Controls
 
-The browser keeps the terminal keyboard-first while adding a web-only
-interaction layer. Use **Web controls** to select the current event or ticker,
-change a split pane, start the explicit Open / Brief / Why action, and scroll a
-research canvas without relying on a keyboard. Its item list is a semantic
-mirror of the terminal state, so it remains reliable across responsive terminal
-layouts.
+The browser keeps the terminal keyboard-first while making visible terminal
+rows, panes, and chart selectors directly interactive. Tap the selected market
+quote to open its ticker, use a vertical touch drag to move a selection or
+scroll research content, and use the compact bottom-right control affordance
+for the optional semantic action panel.
 
 On touch or narrow screens, the web UI also adds a bottom command deck. It
 exposes previous/next view, selection movement, OPEN, BRIEF, WHY,

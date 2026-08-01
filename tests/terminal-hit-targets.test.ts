@@ -110,6 +110,40 @@ test("watch and movers rows select a new ticker, then open the selected one", ()
   );
 });
 
+test("the selected Market quote opens from its stable detail row", () => {
+  const market = {
+    mode: "market" as const,
+    screen: "MARKET",
+    available: ["SPY", "QQQ"],
+    selectedIndex: 0,
+    selected: "SPY",
+  };
+  assert.deepEqual(
+    terminalRowHitTarget(market, "> SPY SPDR S&P 500 ETF Trust +0.72%"),
+    {
+      action: {
+        action: "primary",
+        context: {
+          mode: "market",
+          screen: "MARKET",
+          selectedIndex: 0,
+          selected: "SPY",
+          pane: null,
+        },
+      },
+      label: "Open SPY",
+    },
+  );
+  assert.equal(
+    terminalRowHitTarget(
+      market,
+      "> SPY SPDR S&P 500 ETF Trust +0.72% │ ON THE MOVE",
+      { columns: 120, rowCount: 30, xFraction: 0.8 },
+    ),
+    undefined,
+  );
+});
+
 test("event and headline rows select without starting research", () => {
   const events = {
     mode: "market" as const,

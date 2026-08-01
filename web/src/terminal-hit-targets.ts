@@ -204,6 +204,20 @@ export function terminalRowHitTarget(
     }
   }
 
+  if (screen === "MARKET" && inListPane(screen, position)) {
+    const selected = normalized(state.selected ?? "");
+    const selectedQuoteRow = selected && (row === `> ${selected}` || row.startsWith(`> ${selected} `));
+    if (selectedQuoteRow) {
+      const context = terminalActionContext(state);
+      if (context) {
+        return {
+          action: { action: "primary", context },
+          label: `Open ${selected}`,
+        };
+      }
+    }
+  }
+
   const items = selectableItems(state);
   if (screen === "MOVERS" || screen === "WATCH") {
     if (!inListPane(screen, position)) return undefined;

@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  activeResearchStatus,
   horizontalSwipeInput,
   isValidSymbolInput,
   mobileActions,
   normalizeSymbolInput,
   symbolSearchInputs,
   TERMINAL_INPUTS,
+  verticalSwipeScroll,
 } from "../web/src/mobile-controls.js";
 
 test("mobile actions adapt to market, ticker, research, and cache states", () => {
@@ -76,4 +78,34 @@ test("only deliberate horizontal swipes change terminal screens", () => {
   assert.equal(horizontalSwipeInput(start, { x: 175, y: 104, at: 1200 }), null);
   assert.equal(horizontalSwipeInput(start, { x: 120, y: 190, at: 1200 }), null);
   assert.equal(horizontalSwipeInput(start, { x: 100, y: 100, at: 2100 }), null);
+});
+
+test("research status names the active source-search and evidence phases", () => {
+  assert.equal(
+    activeResearchStatus({
+      research: { active: true, symbol: "NVDA", phase: "running", activity: "seeding" },
+    }),
+    "RESEARCH NVDA · SEARCHING SOURCES",
+  );
+  assert.equal(
+    activeResearchStatus({
+      researchQueue: [{ symbol: "AAPL", phase: "running", activity: "extracting" }],
+    }),
+    "RESEARCH AAPL · EXTRACTING EVIDENCE",
+  );
+  assert.equal(activeResearchStatus({}), undefined);
+});
+
+test("vertical touch drags map to bounded terminal scroll actions", () => {
+  const start = { x: 200, y: 300, at: 1000 };
+  assert.deepEqual(
+    verticalSwipeScroll(start, { x: 205, y: 180, at: 1200 }),
+    { direction: "down", amount: 2 },
+  );
+  assert.deepEqual(
+    verticalSwipeScroll(start, { x: 195, y: 420, at: 1200 }),
+    { direction: "up", amount: 2 },
+  );
+  assert.equal(verticalSwipeScroll(start, { x: 280, y: 290, at: 1200 }), null);
+  assert.equal(verticalSwipeScroll(start, { x: 202, y: 260, at: 1200 }), null);
 });

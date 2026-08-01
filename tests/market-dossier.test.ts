@@ -111,6 +111,34 @@ test("browser dossier preserves a blocked extraction packet", () => {
   assert.equal(dossierPacketCount(dossier), 1);
 });
 
+test("research status renders a clear source-search phase", async () => {
+  const uiTest = registeredTools().get("market_ui_test");
+  assert.ok(uiTest, "market_ui_test should be registered");
+
+  await uiTest.execute("research-status-reset", { action: "reset" });
+  await uiTest.execute("research-status-open", {
+    action: "open_ticker",
+    symbol: "NVDA",
+    background: true,
+    width: 100,
+    height: 30,
+  });
+  await uiTest.execute("research-status-start", {
+    action: "press",
+    button: "button_j",
+    width: 100,
+    height: 30,
+  });
+  const researching = await uiTest.execute("research-status-advance", {
+    action: "advance_research",
+    width: 100,
+    height: 30,
+  });
+
+  assert.equal(researching.details.state?.research?.activity, "seeding");
+  assert.match(researching.details.screen.join("\n"), /SEARCHING SOURCES/);
+});
+
 test("dossier regression paths preserve blocks, citations, and source identity", async () => {
   const uiTest = registeredTools().get("market_ui_test");
   assert.ok(uiTest, "market_ui_test should be registered");

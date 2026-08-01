@@ -7,7 +7,7 @@ import {
   type Ref,
   type WheelEvent,
 } from "react";
-import { horizontalSwipeInput, type SwipePoint } from "./mobile-controls";
+import { horizontalSwipeInput, verticalSwipeScroll, type SwipePoint } from "./mobile-controls";
 import type { TerminalFrameState } from "./mobile-controls";
 import {
   canUsePointerScroll,
@@ -215,6 +215,8 @@ export const TerminalFrame = memo(function TerminalFrame({
     }, WHEEL_ACTION_INTERVAL_MS - elapsed);
   };
 
+  const touchScrollEnabled = canUsePointerScroll(state);
+
   return (
     <div
       ref={terminalRef}
@@ -222,6 +224,7 @@ export const TerminalFrame = memo(function TerminalFrame({
       role="application"
       aria-label="Market terminal. Keyboard commands active. Use Tab to change panes."
       tabIndex={0}
+      style={{ touchAction: touchScrollEnabled ? "none" : undefined }}
       onPointerDown={(event) => {
         event.currentTarget.focus({ preventScroll: true });
         if (event.pointerType !== "touch") return;
@@ -245,10 +248,24 @@ export const TerminalFrame = memo(function TerminalFrame({
           event.pointerType !== "touch" ||
           !event.isPrimary
         ) return;
-        const input = horizontalSwipeInput(start, pointerPoint(event));
+        const end = pointerPoint(event);
+        const input = horizontalSwipeInput(start, end);
         if (input) {
           suppressClickRef.current = true;
           onInput?.(input);
+          requestAnimationFrame(() => {
+            suppressClickRef.current = false;
+          });
+          return;
+        }
+        const scroll = verticalSwipeScroll(start, end);
+        if (scroll && touchScrollEnabled && onWebAction) {
+          suppressClickRef.current = true;
+          onWebAction({
+            action: "scroll",
+            ...scroll,
+            ...(state?.screen ? { screen: state.screen } : {}),
+          });
           requestAnimationFrame(() => {
             suppressClickRef.current = false;
           });

@@ -10,6 +10,7 @@ import { createRoot } from "react-dom/client";
 import { TerminalSocket } from "./socket";
 import { TerminalFrame } from "./TerminalFrame";
 import { MobileControls } from "./MobileControls";
+import { activeResearchStatus } from "./mobile-controls";
 import { EvidenceControl, EvidenceInspector } from "./EvidenceInspector";
 import {
   InteractionOverlay,
@@ -353,6 +354,7 @@ function App() {
   const hasFrame = rowsRef.current.length > 0;
   const wasReplaced = wasReplacedRef.current;
   const dossier = frameStateRef.current?.dossier;
+  const researchStatus = activeResearchStatus(frameStateRef.current);
 
   useEffect(() => {
     // A new frame can replace or clear the active canvas while the locker is
@@ -424,6 +426,12 @@ function App() {
               ? "Connecting…"
               : "Disconnected"}
         </span>
+
+        {researchStatus && (
+          <span className="status-research" role="status" aria-live="polite">
+            {researchStatus}
+          </span>
+        )}
 
         {dossier && (
           <EvidenceControl

@@ -4,6 +4,7 @@ import {
   normalizeUnbrowserMcpUrl,
   ResearchCandidateRegistry,
   UnbrowserMcpClient,
+  userFacingUnbrowserError,
 } from "../shared/unbrowser-mcp.js";
 
 function jsonResponse(value: unknown, init: ResponseInit = {}): Response {
@@ -53,6 +54,26 @@ test("MCP endpoint validation rejects credential-bearing and non-HTTP URLs", () 
   assert.equal(normalizeUnbrowserMcpUrl("http://unbrowser-mcp:8767/mcp"), "http://unbrowser-mcp:8767/mcp");
   assert.throws(() => normalizeUnbrowserMcpUrl("file:///tmp/unbrowser"), /HTTP or HTTPS/);
   assert.throws(() => normalizeUnbrowserMcpUrl("https://user:pass@example.com/mcp"), /must not contain credentials/);
+});
+
+test("MCP hides non-actionable upstream 400 and 500 details", async () => {
+  assert.equal(
+    userFacingUnbrowserError("unbrowser MCP returned HTTP 500: upstream trace details"),
+    "Source retrieval is temporarily unavailable. Try refreshing later.",
+  );
+  assert.equal(
+    userFacingUnbrowserError("unbrowser MCP returned HTTP 400: malformed upstream response"),
+    "Source retrieval is temporarily unavailable. Try refreshing later.",
+  );
+
+  const client = new UnbrowserMcpClient("http://unbrowser-mcp:8767/mcp", {
+    fetch: async () => new Response("upstream trace details", { status: 500 }),
+  });
+  await assert.rejects(
+    client.navigate("https://example.com/article"),
+    (error: unknown) => error instanceof Error
+      && error.message === "Source retrieval is temporarily unavailable. Try refreshing later.",
+  );
 });
 
 test("MCP extraction initializes a session, uses fixed tools, truncates output, and closes", async () => {

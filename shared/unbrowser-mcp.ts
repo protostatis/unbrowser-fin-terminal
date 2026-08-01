@@ -69,6 +69,25 @@ export function normalizeUnbrowserMcpUrl(raw: string): string {
   return parsed.href;
 }
 
+/** Keep transport details out of user-facing research status while retaining useful recovery guidance. */
+export function userFacingUnbrowserError(message: string): string {
+  const normalized = message.replace(/\s+/g, " ").trim();
+  const statusMatch = normalized.match(/\bHTTP\s+(\d{3})\b/i);
+  if (!statusMatch) return normalized;
+
+  switch (Number(statusMatch[1])) {
+    case 401:
+    case 403:
+      return "This source is not available to this research run.";
+    case 404:
+      return "This source is no longer available.";
+    case 429:
+      return "Source retrieval is busy. Try refreshing later.";
+    default:
+      return "Source retrieval is temporarily unavailable. Try refreshing later.";
+  }
+}
+
 function timeoutSignal(parent: AbortSignal | undefined, timeoutMs: number): {
   signal: AbortSignal;
   cleanup: () => void;
@@ -238,7 +257,7 @@ class McpSession {
       if (responseSession) this.sessionId = responseSession;
       const text = await readBoundedText(response, this.maxResponseBytes);
       if (!response.ok) {
-        throw new Error(`unbrowser MCP returned HTTP ${response.status}: ${text.slice(0, 300)}`);
+        throw new Error(userFacingUnbrowserError(`unbrowser MCP returned HTTP ${response.status}: ${text.slice(0, 300)}`));
       }
       const envelope = parseEnvelope(text, response.status);
       if (!envelope && !allowEmpty) throw new Error("unbrowser MCP returned an empty response");

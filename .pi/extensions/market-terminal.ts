@@ -11,6 +11,7 @@ import {
 	type GrantedResearchCandidate,
 	type UnbrowserExtraction,
 	type UnbrowserExtractionMode,
+	userFacingUnbrowserError,
 } from "../../shared/unbrowser-mcp.js";
 import { sanitizePublicUrl } from "../../shared/public-url.js";
 import {
@@ -2150,7 +2151,8 @@ function normalizeEvidencePacket(raw: unknown): EvidencePacket | undefined {
 	const extractedAt = typeof r.extractedAt === "number" && Number.isFinite(r.extractedAt) ? r.extractedAt : undefined;
 	const extractionMode = typeof r.extractionMode === "string" ? cleanText(r.extractionMode).slice(0, 40).trim() : "";
 	const truncated = typeof r.truncated === "boolean" ? r.truncated : false;
-	const failureNote = typeof r.failureNote === "string" ? cleanText(r.failureNote).replace(/\s+/g, " ").slice(0, 180).trim() : "";
+	const rawFailureNote = typeof r.failureNote === "string" ? cleanText(r.failureNote).replace(/\s+/g, " ").slice(0, 180).trim() : "";
+	const failureNote = rawFailureNote ? userFacingUnbrowserError(rawFailureNote) : "";
 	if (!sourceId || !retrievalStatus || extractedAt === undefined) return undefined;
 	// Failed extraction can have no safe final URL; retain the packet so the
 	// dossier accurately reports the blocker instead of looking source-free.
@@ -2212,7 +2214,7 @@ function mergeEvidencePackets(existing: EvidencePacket[] | undefined, incoming: 
 
 function normalizeEvidenceBlocker(raw: unknown): string | undefined {
 	if (typeof raw !== "string") return undefined;
-	const blocker = cleanText(raw).replace(/\s+/g, " ").slice(0, 180).trim();
+	const blocker = userFacingUnbrowserError(cleanText(raw).replace(/\s+/g, " ").slice(0, 180).trim());
 	return blocker || undefined;
 }
 
@@ -2538,7 +2540,8 @@ function createResearchJob(request: ResearchRequest): ResearchJob | undefined {
 function updateResearchJob(id: string, patch: Partial<Omit<ResearchJob, "id" | "startedAt">>): ResearchJob | undefined {
 	const previous = researchJobs.get(id);
 	if (!previous) return undefined;
-	const next: ResearchJob = { ...previous, ...patch, updatedAt: Date.now() };
+	const error = typeof patch.error === "string" ? userFacingUnbrowserError(patch.error) : patch.error;
+	const next: ResearchJob = { ...previous, ...patch, ...(error !== undefined ? { error } : {}), updatedAt: Date.now() };
 	researchJobs.set(id, next);
 	const latest = latestResearchBySymbol.get(next.symbol);
 	if (!latest || (researchJobs.get(latest)?.startedAt ?? 0) <= next.startedAt) latestResearchBySymbol.set(next.symbol, id);
@@ -2611,6 +2614,15 @@ function researchQueueLabel(): string {
 	return `${active.length} JOB${active.length === 1 ? "" : "S"} · ${running} RUNNING · ${queued} QUEUED`;
 }
 
+function researchActivityLabel(activity: ResearchActivity): string {
+	switch (activity) {
+		case "seeding": return "SEARCHING SOURCES";
+		case "fetching": return "FETCHING SOURCES";
+		case "extracting": return "EXTRACTING EVIDENCE";
+		case "synthesizing": return "BUILDING BRIEF";
+	}
+}
+
 function researchStatusLine(job: ResearchJob | undefined): string | undefined {
 	if (!job) return undefined;
 	const label = job.contextLabel || `${job.symbol} ${job.intent.toUpperCase()}`;
@@ -2625,7 +2637,7 @@ function researchStatusLine(job: ResearchJob | undefined): string | undefined {
 		}
 		if (job.phase === "dispatched") return `RESEARCH ${label}${scope} · STARTING · [C] CANCEL`;
 		const outcome = job.outcome === "partial" ? "PARTIAL · " : "";
-		return `RESEARCH ${label}${scope} · ${outcome}${job.activity.toUpperCase()}${blocks} · [C] CANCEL`;
+		return `RESEARCH ${label}${scope} · ${outcome}${researchActivityLabel(job.activity)}${blocks} · [C] CANCEL`;
 	}
 	if (job.outcome === "complete") {
 		const identityKey = canvasKey(job.symbol, job.chartScope, job.researchKey);
@@ -3848,7 +3860,7 @@ class MarketTerminal {
 			} : undefined,
 			researchQueue: [...new Map([...this.researchJobCache.values(), ...activeResearchJobs()].map((job) => [job.id, job])).values()]
 				.filter(researchSlotHeld)
-				.map((job) => ({ id: job.id, contextLabel: job.contextLabel, phase: job.phase })),
+				.map((job) => ({ id: job.id, contextLabel: job.contextLabel, symbol: job.symbol, phase: job.phase, outcome: job.outcome, activity: job.activity })),
 			dossier: displayCanvas ? {
 				title: displayCanvas.title,
 				intent: canvasIntent(displayCanvas) ?? researchIntentFromKey(this.researchKey) ?? "brief",
@@ -5055,7 +5067,7 @@ class MarketHub {
 				researchKey: researchJob.researchKey,
 				intent: researchJob.intent,
 			} : undefined,
-			researchQueue: this.knownResearchJobs().filter(researchSlotHeld).map((job) => ({ id: job.id, contextLabel: job.contextLabel, phase: job.phase })),
+			researchQueue: this.knownResearchJobs().filter(researchSlotHeld).map((job) => ({ id: job.id, contextLabel: job.contextLabel, symbol: job.symbol, phase: job.phase, outcome: job.outcome, activity: job.activity })),
 			dossier: displayCanvas ? {
 				title: displayCanvas.title,
 				intent: canvasIntent(displayCanvas) ?? "brief",

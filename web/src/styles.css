@@ -227,6 +227,18 @@ strong {
   white-space: nowrap;
 }
 
+.status-research {
+  min-width: 0;
+  overflow: hidden;
+  padding-left: 7px;
+  color: #d29922;
+  border-left: 1px solid #d2992266;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .status-dot {
   display: inline-block;
   width: 7px;
@@ -1468,9 +1480,11 @@ strong {
   appearance: none;
   display: flex;
   align-items: center;
-  gap: 4px;
   margin: 0 8px 8px auto;
-  padding: 4px 9px;
+  width: 28px;
+  height: 28px;
+  justify-content: center;
+  padding: 0;
   color: #8b949e;
   background: #0d1117ee;
   border: 1px solid #30363d;
@@ -1485,10 +1499,6 @@ strong {
   backdrop-filter: blur(6px);
 }
 
-.interaction-toggle-label {
-  color: #8b949e;
-}
-
 .interaction-toggle-chevron {
   color: #58a6ff;
   font-size: 9px;
@@ -1497,10 +1507,6 @@ strong {
 .interaction-toggle:hover {
   color: #c9d1d9;
   border-color: #1f6feb;
-}
-
-.interaction-toggle:hover .interaction-toggle-label {
-  color: #c9d1d9;
 }
 
 .interaction-toggle:focus-visible {
