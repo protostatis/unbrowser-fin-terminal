@@ -11,6 +11,40 @@ export const TERMINAL_INPUTS = {
 } as const;
 
 export type ChartScope = "day" | "week" | "month" | "year" | "max";
+export type ResearchActivity = "seeding" | "fetching" | "extracting" | "synthesizing";
+export type ResearchPhase = "queued" | "dispatched" | "running" | "cancelling" | "settled";
+
+export interface TerminalResearchState {
+  id?: string;
+  contextLabel?: string;
+  symbol?: string;
+  outcome?: "queued" | "running" | "partial" | "complete" | "failed" | "cancelled";
+  phase?: ResearchPhase;
+  activity?: ResearchActivity;
+  active?: boolean;
+  updatedAt?: number;
+  settledAt?: number;
+}
+
+export type ResearchStatusTone =
+  | "queued"
+  | "active"
+  | "synthesizing"
+  | "failed"
+  | "cancelling"
+  | "cancelled"
+  | "complete"
+  | "partial";
+
+export interface ResearchActivityStatus {
+  id?: string;
+  contextLabel?: string;
+  symbol?: string;
+  label: string;
+  text: string;
+  tone: ResearchStatusTone;
+  active: boolean;
+}
 
 /** Scroll window emitted by the canonical extension's story/briefing panes. */
 export interface TerminalScrollWindow {
@@ -28,7 +62,9 @@ export interface TerminalFrameState {
   searching?: boolean;
   searchQuery?: string;
   cacheDecision?: unknown;
-  research?: { active?: boolean };
+  research?: TerminalResearchState;
+  researchQueue?: TerminalResearchState[];
+  recentResearch?: TerminalResearchState[];
   /** Optional research dossier; absent on old server frames. */
   dossier?: TerminalDossier;
   demo?: boolean;
@@ -148,6 +184,72 @@ export function mobileActions(state?: TerminalFrameState): MobileAction[] {
   ];
 }
 
+function researchStatusFor(job: TerminalResearchState): ResearchActivityStatus {
+  const id = job.id;
+  const contextLabel = job.contextLabel?.trim() || undefined;
+  const symbol = job.symbol?.trim() || undefined;
+  const prefix = contextLabel ? `RESEARCH ${contextLabel}` : symbol ? `RESEARCH ${symbol}` : "RESEARCH";
+  const status = (
+    label: string,
+    tone: ResearchStatusTone,
+    active: boolean,
+  ): ResearchActivityStatus => ({
+    id,
+    contextLabel,
+    symbol,
+    label,
+    text: `${prefix} · ${label}`,
+    tone,
+    active,
+  });
+  const isActive = job.active ?? (job.phase !== "settled");
+
+  if (job.outcome === "failed") return status("RESEARCH FAILED", "failed", false);
+  if (job.phase === "cancelling") return status("CANCELLING", "cancelling", true);
+  if (job.outcome === "cancelled") return status("CANCELLED", "cancelled", false);
+  if (job.phase === "queued") return status("QUEUED", "queued", true);
+  if (job.phase === "dispatched") return status("STARTING", "active", true);
+  if (job.outcome === "complete") {
+    return isActive
+      ? status("FINALIZING BRIEF", "synthesizing", true)
+      : status("RESULTS READY", "complete", false);
+  }
+  if (job.phase === "settled" && job.outcome === "partial") {
+    return status("PARTIAL RESULTS", "partial", false);
+  }
+  switch (job.activity) {
+    case "seeding": return status("SEARCHING SOURCES", "active", true);
+    case "fetching": return status("FETCHING SOURCES", "active", true);
+    case "extracting": return status("EXTRACTING EVIDENCE", "active", true);
+    case "synthesizing": return status("BUILDING BRIEF", "synthesizing", true);
+    default: return status("SEARCHING", "active", isActive);
+  }
+}
+
+/** Return the clearest currently active research job. */
+export function researchActivityStatus(state?: TerminalFrameState): ResearchActivityStatus | undefined {
+  if (state?.research?.active) return researchStatusFor(state.research);
+  const queued = state?.researchQueue ?? [];
+  const active = queued.find((job) => job.phase === "running")
+    ?? queued.find((job) => job.phase === "dispatched")
+    ?? queued.find((job) => job.phase === "cancelling")
+    ?? queued.find((job) => job.phase === "queued");
+  if (active) return researchStatusFor(active);
+  return undefined;
+}
+
+/** Settled jobs are buffered by the app shell so concurrent outcomes are not lost. */
+export function recentResearchStatuses(state?: TerminalFrameState): ResearchActivityStatus[] {
+  return (state?.recentResearch ?? [])
+    .filter((job) => job.phase === "settled")
+    .map(researchStatusFor);
+}
+
+/** Text-only form retained for compact consumers and terminal-status tests. */
+export function activeResearchStatus(state?: TerminalFrameState): string | undefined {
+  return researchActivityStatus(state)?.text;
+}
+
 /** Keep mobile symbol entry aligned with the extension's accepted ticker form. */
 export function normalizeSymbolInput(value: string): string {
   return value.toUpperCase().replace(/[^A-Z0-9.^-]/g, "").slice(0, 11);
@@ -185,4 +287,19 @@ export function horizontalSwipeInput(
   if (Math.abs(dx) < 48 || Math.abs(dx) < Math.abs(dy) * 1.25) return null;
   // Finger left reveals the next screen; finger right returns to the previous.
   return dx < 0 ? TERMINAL_INPUTS.right : TERMINAL_INPUTS.left;
+}
+
+export function verticalSwipeScroll(
+  start: SwipePoint,
+  end: SwipePoint,
+): { direction: "up" | "down"; amount: number } | null {
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+  const elapsed = end.at - start.at;
+  if (elapsed < 0 || elapsed > 900) return null;
+  if (Math.abs(dy) < 48 || Math.abs(dy) < Math.abs(dx) * 1.25) return null;
+  return {
+    direction: dy < 0 ? "down" : "up",
+    amount: Math.min(8, Math.max(1, Math.floor(Math.abs(dy) / 48))),
+  };
 }

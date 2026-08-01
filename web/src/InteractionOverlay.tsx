@@ -92,11 +92,12 @@ export function InteractionOverlay({
         type="button"
         className="interaction-toggle"
         onClick={toggleOpen}
+        aria-label={open ? "Close market controls" : "Open market controls"}
         aria-expanded={open}
         aria-controls="interaction-panel"
         disabled={disabled}
+        title={open ? "Close market controls" : "Open market controls"}
       >
-        <span className="interaction-toggle-label">Web controls</span>
         <span aria-hidden="true" className="interaction-toggle-chevron">
           {open ? "▾" : "▸"}
         </span>

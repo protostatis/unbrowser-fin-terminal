@@ -4,6 +4,7 @@ import {
   normalizeUnbrowserMcpUrl,
   ResearchCandidateRegistry,
   UnbrowserMcpClient,
+  userFacingUnbrowserError,
 } from "../shared/unbrowser-mcp.js";
 
 function jsonResponse(value: unknown, init: ResponseInit = {}): Response {
@@ -53,6 +54,80 @@ test("MCP endpoint validation rejects credential-bearing and non-HTTP URLs", () 
   assert.equal(normalizeUnbrowserMcpUrl("http://unbrowser-mcp:8767/mcp"), "http://unbrowser-mcp:8767/mcp");
   assert.throws(() => normalizeUnbrowserMcpUrl("file:///tmp/unbrowser"), /HTTP or HTTPS/);
   assert.throws(() => normalizeUnbrowserMcpUrl("https://user:pass@example.com/mcp"), /must not contain credentials/);
+});
+
+test("MCP redacts transport and protocol failure details", async () => {
+  const unavailable = "Source retrieval is temporarily unavailable. Try refreshing later.";
+  assert.equal(
+    userFacingUnbrowserError("unbrowser MCP returned HTTP 500: upstream trace details"),
+    unavailable,
+  );
+  assert.equal(
+    userFacingUnbrowserError("unbrowser MCP returned HTTP 400: malformed upstream response"),
+    unavailable,
+  );
+  assert.equal(
+    userFacingUnbrowserError("unbrowser MCP returned HTTP 404: http://internal.example/trace"),
+    unavailable,
+  );
+  assert.equal(
+    userFacingUnbrowserError("unbrowser MCP error: private endpoint token=secret"),
+    unavailable,
+  );
+  assert.equal(
+    userFacingUnbrowserError("Source returned no extractable content"),
+    "Source returned no extractable content",
+  );
+
+  const client = new UnbrowserMcpClient("http://unbrowser-mcp:8767/mcp", {
+    fetch: async () => new Response("upstream trace details", { status: 500 }),
+  });
+  await assert.rejects(
+    client.navigate("https://example.com/article"),
+    (error: unknown) => error instanceof Error
+      && error.message === unavailable,
+  );
+
+  const rpcErrorClient = new UnbrowserMcpClient("http://unbrowser-mcp:8767/mcp", {
+    fetch: async () => jsonResponse({
+      jsonrpc: "2.0",
+      id: 1,
+      error: { message: "https://internal.example/mcp?token=secret" },
+    }),
+  });
+  await assert.rejects(
+    rpcErrorClient.navigate("https://example.com/article"),
+    (error: unknown) => error instanceof Error && error.message === unavailable,
+  );
+
+  const toolErrorResponses: Response[] = [
+    jsonResponse({
+      jsonrpc: "2.0",
+      id: 1,
+      result: { protocolVersion: "2025-03-26" },
+    }, { headers: { "mcp-session-id": "session-1" } }),
+    new Response(null, { status: 202 }),
+    jsonResponse({
+      jsonrpc: "2.0",
+      id: 2,
+      result: {
+        isError: true,
+        content: [{ type: "text", text: "internal trace at http://mcp.local/token=secret" }],
+      },
+    }),
+    new Response(null, { status: 200 }),
+  ];
+  const toolErrorClient = new UnbrowserMcpClient("http://unbrowser-mcp:8767/mcp", {
+    fetch: async () => {
+      const response = toolErrorResponses.shift();
+      if (!response) throw new Error("unexpected fetch");
+      return response;
+    },
+  });
+  await assert.rejects(
+    toolErrorClient.navigate("https://example.com/article"),
+    (error: unknown) => error instanceof Error && error.message === unavailable,
+  );
 });
 
 test("MCP extraction initializes a session, uses fixed tools, truncates output, and closes", async () => {

@@ -11,6 +11,7 @@ import {
 	type GrantedResearchCandidate,
 	type UnbrowserExtraction,
 	type UnbrowserExtractionMode,
+	userFacingUnbrowserError,
 } from "../../shared/unbrowser-mcp.js";
 import { sanitizePublicUrl } from "../../shared/public-url.js";
 import {
@@ -2150,7 +2151,8 @@ function normalizeEvidencePacket(raw: unknown): EvidencePacket | undefined {
 	const extractedAt = typeof r.extractedAt === "number" && Number.isFinite(r.extractedAt) ? r.extractedAt : undefined;
 	const extractionMode = typeof r.extractionMode === "string" ? cleanText(r.extractionMode).slice(0, 40).trim() : "";
 	const truncated = typeof r.truncated === "boolean" ? r.truncated : false;
-	const failureNote = typeof r.failureNote === "string" ? cleanText(r.failureNote).replace(/\s+/g, " ").slice(0, 180).trim() : "";
+	const rawFailureNote = typeof r.failureNote === "string" ? cleanText(r.failureNote).replace(/\s+/g, " ").slice(0, 180).trim() : "";
+	const failureNote = rawFailureNote ? userFacingUnbrowserError(rawFailureNote) : "";
 	if (!sourceId || !retrievalStatus || extractedAt === undefined) return undefined;
 	// Failed extraction can have no safe final URL; retain the packet so the
 	// dossier accurately reports the blocker instead of looking source-free.
@@ -2212,7 +2214,7 @@ function mergeEvidencePackets(existing: EvidencePacket[] | undefined, incoming: 
 
 function normalizeEvidenceBlocker(raw: unknown): string | undefined {
 	if (typeof raw !== "string") return undefined;
-	const blocker = cleanText(raw).replace(/\s+/g, " ").slice(0, 180).trim();
+	const blocker = userFacingUnbrowserError(cleanText(raw).replace(/\s+/g, " ").slice(0, 180).trim());
 	return blocker || undefined;
 }
 
@@ -2507,6 +2509,33 @@ function researchSlotHeld(job: ResearchJob | undefined): boolean {
 	return Boolean(job?.slotHeld && job.phase !== "settled" && job.settledAt === undefined);
 }
 
+const RECENT_SETTLED_RESEARCH_WINDOW_MS = 30_000;
+
+function latestSettledResearchJobs(limit = 6, now = Date.now()): ResearchJob[] {
+	return [...researchJobs.values()]
+		.filter((job) => job.phase === "settled" && job.settledAt !== undefined && now >= job.settledAt && now - job.settledAt <= RECENT_SETTLED_RESEARCH_WINDOW_MS)
+		.sort((a, b) => (b.settledAt ?? 0) - (a.settledAt ?? 0) || b.updatedAt - a.updatedAt)
+		.slice(0, limit);
+}
+
+function researchDebugState(job: ResearchJob) {
+	return {
+		id: job.id,
+		contextLabel: job.contextLabel,
+		symbol: job.symbol,
+		outcome: job.outcome,
+		phase: job.phase,
+		activity: job.activity,
+		active: researchSlotHeld(job),
+		publishedBlocks: job.publishedBlocks,
+		chartScope: job.chartScope,
+		researchKey: job.researchKey,
+		intent: job.intent,
+		updatedAt: job.updatedAt,
+		settledAt: job.settledAt,
+	};
+}
+
 function createResearchJob(request: ResearchRequest): ResearchJob | undefined {
 	if (activeResearchJobForIdentity(request)) return undefined;
 	const now = Date.now();
@@ -2611,6 +2640,15 @@ function researchQueueLabel(): string {
 	return `${active.length} JOB${active.length === 1 ? "" : "S"} · ${running} RUNNING · ${queued} QUEUED`;
 }
 
+function researchActivityLabel(activity: ResearchActivity): string {
+	switch (activity) {
+		case "seeding": return "SEARCHING SOURCES";
+		case "fetching": return "FETCHING SOURCES";
+		case "extracting": return "EXTRACTING EVIDENCE";
+		case "synthesizing": return "BUILDING BRIEF";
+	}
+}
+
 function researchStatusLine(job: ResearchJob | undefined): string | undefined {
 	if (!job) return undefined;
 	const label = job.contextLabel || `${job.symbol} ${job.intent.toUpperCase()}`;
@@ -2625,7 +2663,7 @@ function researchStatusLine(job: ResearchJob | undefined): string | undefined {
 		}
 		if (job.phase === "dispatched") return `RESEARCH ${label}${scope} · STARTING · [C] CANCEL`;
 		const outcome = job.outcome === "partial" ? "PARTIAL · " : "";
-		return `RESEARCH ${label}${scope} · ${outcome}${job.activity.toUpperCase()}${blocks} · [C] CANCEL`;
+		return `RESEARCH ${label}${scope} · ${outcome}${researchActivityLabel(job.activity)}${blocks} · [C] CANCEL`;
 	}
 	if (job.outcome === "complete") {
 		const identityKey = canvasKey(job.symbol, job.chartScope, job.researchKey);
@@ -3811,6 +3849,7 @@ class MarketTerminal {
 
 	debugState() {
 		const researchJob = this.currentResearchJob();
+		const recentResearch = latestSettledResearchJobs();
 		const displayCanvas = this.displayedCanvas();
 		const evidenceStatus = deriveEvidenceStatus(displayCanvas);
 		const dossierRead = canvasDossierRead(displayCanvas);
@@ -3834,21 +3873,11 @@ class MarketTerminal {
 				count: archivedResearchFor(this.symbol, this.chartScope, this.researchKey).length,
 				asOf: this.archivedCanvas?.updatedAt,
 			} : undefined,
-			research: researchJob ? {
-				id: researchJob.id,
-				symbol: researchJob.symbol,
-				outcome: researchJob.outcome,
-				phase: researchJob.phase,
-				activity: researchJob.activity,
-				active: researchSlotHeld(researchJob),
-				publishedBlocks: researchJob.publishedBlocks,
-				chartScope: researchJob.chartScope,
-				researchKey: researchJob.researchKey,
-				intent: researchJob.intent,
-			} : undefined,
+			research: researchJob ? researchDebugState(researchJob) : undefined,
+			recentResearch: recentResearch.map(researchDebugState),
 			researchQueue: [...new Map([...this.researchJobCache.values(), ...activeResearchJobs()].map((job) => [job.id, job])).values()]
 				.filter(researchSlotHeld)
-				.map((job) => ({ id: job.id, contextLabel: job.contextLabel, phase: job.phase })),
+				.map(researchDebugState),
 			dossier: displayCanvas ? {
 				title: displayCanvas.title,
 				intent: canvasIntent(displayCanvas) ?? researchIntentFromKey(this.researchKey) ?? "brief",
@@ -4998,6 +5027,7 @@ class MarketHub {
 	debugState() {
 		const entry = this.entries()[this.selected];
 		const researchJob = this.visibleResearchJob();
+		const recentResearch = latestSettledResearchJobs();
 		const displayCanvas = this.displayedMarketCanvas() ?? this.displayedEventCanvas();
 		const evidenceStatus = deriveEvidenceStatus(displayCanvas);
 		const dossierRead = canvasDossierRead(displayCanvas);
@@ -5043,19 +5073,9 @@ class MarketHub {
 				count: archivedResearchFor("MARKET", this.chartScope, canvasResearchKey(this.archivedMarketCanvas)).length,
 				asOf: this.archivedMarketCanvas?.updatedAt,
 			} : undefined,
-			research: researchJob ? {
-				id: researchJob.id,
-				symbol: researchJob.symbol,
-				outcome: researchJob.outcome,
-				phase: researchJob.phase,
-				activity: researchJob.activity,
-				active: researchSlotHeld(researchJob),
-				publishedBlocks: researchJob.publishedBlocks,
-				chartScope: researchJob.chartScope,
-				researchKey: researchJob.researchKey,
-				intent: researchJob.intent,
-			} : undefined,
-			researchQueue: this.knownResearchJobs().filter(researchSlotHeld).map((job) => ({ id: job.id, contextLabel: job.contextLabel, phase: job.phase })),
+			research: researchJob ? researchDebugState(researchJob) : undefined,
+			recentResearch: recentResearch.map(researchDebugState),
+			researchQueue: this.knownResearchJobs().filter(researchSlotHeld).map(researchDebugState),
 			dossier: displayCanvas ? {
 				title: displayCanvas.title,
 				intent: canvasIntent(displayCanvas) ?? "brief",
@@ -6880,7 +6900,7 @@ export default function (pi: ExtensionAPI) {
 			try {
 				extraction = await requireUnbrowserMcpClient().extract(safeUrl, mode, signal);
 			} catch (error) {
-				const failureNote = cleanText(error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 180).trim() || "Source extraction failed";
+				const failureNote = userFacingUnbrowserError(cleanText(error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 180).trim());
 				recordEvidencePacket(job, {
 					sourceId: candidate.sourceId,
 					sourceTitle: candidate.title,
@@ -7029,7 +7049,7 @@ export default function (pi: ExtensionAPI) {
 				const research = researchResult.status === "fulfilled" ? researchResult.value : undefined;
 				const failures: string[] = [];
 				if (quoteResult.status === "rejected") failures.push(`Quote: ${String(quoteResult.reason).slice(0, 200)}`);
-				if (researchResult.status === "rejected") failures.push(`Search: ${String(researchResult.reason).slice(0, 200)}`);
+				if (researchResult.status === "rejected") failures.push(`Search: ${userFacingUnbrowserError(String(researchResult.reason))}`);
 				const raw: DiscoveryCandidate[] = (research?.sources ?? []).map((s: { text: string; url: string }, i: number) => {
 					let source = "web";
 					try { source = new URL(s.url).hostname.replace(/^www\./, ""); } catch { /* keep web */ }
@@ -7039,7 +7059,7 @@ export default function (pi: ExtensionAPI) {
 				const challenge = research?.challenge
 					? `${research.challenge.provider}: ${research.challenge.reason}`
 					: researchResult.status === "rejected"
-						? `Source discovery unavailable: ${cleanText(String(researchResult.reason)).replace(/\s+/g, " ").slice(0, 180) || "request failed"}`
+						? userFacingUnbrowserError(String(researchResult.reason))
 						: undefined;
 				const query = research?.query || question || "latest news and catalysts";
 				const text = [

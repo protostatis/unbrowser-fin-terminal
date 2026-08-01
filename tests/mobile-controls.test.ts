@@ -1,12 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  activeResearchStatus,
   horizontalSwipeInput,
   isValidSymbolInput,
   mobileActions,
   normalizeSymbolInput,
+  recentResearchStatuses,
+  researchActivityStatus,
   symbolSearchInputs,
   TERMINAL_INPUTS,
+  verticalSwipeScroll,
 } from "../web/src/mobile-controls.js";
 
 test("mobile actions adapt to market, ticker, research, and cache states", () => {
@@ -76,4 +80,94 @@ test("only deliberate horizontal swipes change terminal screens", () => {
   assert.equal(horizontalSwipeInput(start, { x: 175, y: 104, at: 1200 }), null);
   assert.equal(horizontalSwipeInput(start, { x: 120, y: 190, at: 1200 }), null);
   assert.equal(horizontalSwipeInput(start, { x: 100, y: 100, at: 2100 }), null);
+});
+
+test("research status names the active source-search and evidence phases", () => {
+  assert.equal(
+    activeResearchStatus({
+      research: { active: true, symbol: "NVDA", phase: "running", activity: "seeding" },
+    }),
+    "RESEARCH NVDA · SEARCHING SOURCES",
+  );
+  assert.equal(
+    activeResearchStatus({
+      researchQueue: [{ symbol: "AAPL", phase: "running", activity: "extracting" }],
+    }),
+    "RESEARCH AAPL · EXTRACTING EVIDENCE",
+  );
+  assert.equal(
+    activeResearchStatus({
+      researchQueue: [{ symbol: "MSFT", phase: "cancelling", outcome: "cancelled" }],
+    }),
+    "RESEARCH MSFT · CANCELLING",
+  );
+  assert.equal(
+    activeResearchStatus({
+      researchQueue: [
+        { symbol: "MSFT", phase: "cancelling", outcome: "cancelled" },
+        { symbol: "AAPL", phase: "running", activity: "extracting" },
+      ],
+    }),
+    "RESEARCH AAPL · EXTRACTING EVIDENCE",
+  );
+  assert.equal(activeResearchStatus({}), undefined);
+});
+
+test("research activity status exposes a visible active phase and buffers settled outcomes", () => {
+  assert.deepEqual(
+    researchActivityStatus({
+      research: { id: "job-active", active: true, symbol: "NVDA", phase: "running", activity: "extracting" },
+    }),
+    {
+      id: "job-active",
+      contextLabel: undefined,
+      symbol: "NVDA",
+      label: "EXTRACTING EVIDENCE",
+      text: "RESEARCH NVDA · EXTRACTING EVIDENCE",
+      tone: "active",
+      active: true,
+    },
+  );
+  assert.deepEqual(
+    recentResearchStatuses({
+      recentResearch: [
+        { id: "job-complete", contextLabel: "REUTERS HEADLINE", symbol: "MARKET", phase: "settled", outcome: "complete" },
+        { id: "job-failed", contextLabel: "AAPL BRIEF", symbol: "AAPL", phase: "settled", outcome: "failed" },
+      ],
+    }),
+    [
+      {
+        id: "job-complete",
+        contextLabel: "REUTERS HEADLINE",
+        symbol: "MARKET",
+        label: "RESULTS READY",
+        text: "RESEARCH REUTERS HEADLINE · RESULTS READY",
+        tone: "complete",
+        active: false,
+      },
+      {
+        id: "job-failed",
+        contextLabel: "AAPL BRIEF",
+        symbol: "AAPL",
+        label: "RESEARCH FAILED",
+        text: "RESEARCH AAPL BRIEF · RESEARCH FAILED",
+        tone: "failed",
+        active: false,
+      },
+    ],
+  );
+});
+
+test("vertical touch drags map to bounded terminal scroll actions", () => {
+  const start = { x: 200, y: 300, at: 1000 };
+  assert.deepEqual(
+    verticalSwipeScroll(start, { x: 205, y: 180, at: 1200 }),
+    { direction: "down", amount: 2 },
+  );
+  assert.deepEqual(
+    verticalSwipeScroll(start, { x: 195, y: 420, at: 1200 }),
+    { direction: "up", amount: 2 },
+  );
+  assert.equal(verticalSwipeScroll(start, { x: 280, y: 290, at: 1200 }), null);
+  assert.equal(verticalSwipeScroll(start, { x: 202, y: 260, at: 1200 }), null);
 });

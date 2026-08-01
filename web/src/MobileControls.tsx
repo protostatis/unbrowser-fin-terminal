@@ -6,11 +6,13 @@ import {
   symbolSearchInputs,
   TERMINAL_INPUTS,
   type MobileAction,
+  type ResearchActivityStatus,
   type TerminalFrameState,
 } from "./mobile-controls";
 
 interface MobileControlsProps {
   state?: TerminalFrameState;
+  researchStatus?: ResearchActivityStatus;
   disabled: boolean;
   onInput: (data: string) => void;
   onReturnToTerminal?(): void;
@@ -30,6 +32,7 @@ function primaryActionLabel(state?: TerminalFrameState): "Open" | "Brief" {
 
 export function MobileControls({
   state,
+  researchStatus,
   disabled,
   onInput,
   onReturnToTerminal,
@@ -42,6 +45,7 @@ export function MobileControls({
   const cacheLocked = Boolean(state?.cacheDecision);
   const actions = mobileActions(state);
   const primaryLabel = primaryActionLabel(state);
+  const researchSubject = researchStatus?.contextLabel ?? researchStatus?.symbol;
 
   const closeSearch = () => {
     setSearchOpen(false);
@@ -114,7 +118,23 @@ export function MobileControls({
         <div className="mobile-console-head">
           <span className="mobile-console-brand">TOUCH // COMMAND DECK</span>
           <span className="mobile-console-context">{contextLabel(state)}</span>
-          <span className="mobile-swipe-hint">SWIPE TO CHANGE VIEW</span>
+          {researchStatus ? (
+            <span
+              className={`mobile-research-status mobile-research-${researchStatus.tone}`}
+              role={researchStatus.tone === "failed" ? "alert" : "status"}
+              aria-live={researchStatus.tone === "failed" ? "assertive" : "polite"}
+              title={researchStatus.text}
+            >
+              <span className="mobile-research-lamp" aria-hidden="true" />
+              <span className="mobile-research-label">
+                {researchSubject
+                  ? `${researchSubject} · ${researchStatus.label}`
+                  : researchStatus.label}
+              </span>
+            </span>
+          ) : (
+            <span className="mobile-swipe-hint">SWIPE TO CHANGE VIEW</span>
+          )}
         </div>
 
         <div className="mobile-nav" aria-label="Navigate terminal">
