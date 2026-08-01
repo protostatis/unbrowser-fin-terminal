@@ -40,6 +40,7 @@ import {
   singleHeader,
 } from "./proxy-auth.js";
 import { createDemoRateLimiter, type DemoRateLimiter } from "./demo-guards.js";
+import { resolveWebAction } from "./web-actions.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -404,6 +405,34 @@ wss.on("connection", (ws: WebSocket, request: IncomingMessage) => {
           pendingSelects.delete(id);
           pending.resolve(msg.cancelled ? undefined : msg.value);
         }
+        handled = true;
+        break;
+      }
+      case "web_action": {
+        if (PUBLIC_DEMO) {
+          if (!demoLimiter!.allowInput(clientIp)) {
+            console.log("[demo] input rate limit hit:", clientIp);
+            ws.close(DEMO_BUSY_CLOSE_CODE, "Too many demo inputs");
+            return;
+          }
+        }
+        // Resolve against the live panel state. Invalid or unrecognized
+        // actions are a silent no-op (we never throw across the WebSocket).
+        try {
+          const rawState =
+            typeof activePanel?.debugState === "function"
+              ? activePanel.debugState()
+              : undefined;
+          const result = resolveWebAction(msg.data, rawState);
+          if (Array.isArray(result)) {
+            for (const input of result) web.sendInput(input);
+          }
+        } catch {
+          // Defensive: any unexpected exception is swallowed.
+        }
+        // Push a frame regardless so the browser sees the result of any
+        // internal inputs we emitted.
+        pushFrame();
         handled = true;
         break;
       }
