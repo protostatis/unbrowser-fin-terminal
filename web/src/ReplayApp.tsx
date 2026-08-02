@@ -14,14 +14,14 @@ type Dialog = "pilot" | "source" | null;
  *
  * Renders the pre-built fixture in the same terminal/status/modal visual
  * language as the live build and makes no WebSocket, fetch, auth, identity,
- * persistence, redirect, model, or third-party-source request. The pilot
- * button is informational only — no activation, account, workspace, save, or
- * follow is created — and the source locker opens only an explanatory dialog.
+ * persistence, redirect, model, or source request. The capture button explains
+ * the frozen public artifact, and the source locker replays its evidence.
  * Escape closes every dialog; no other key handling exists here.
  */
 export function ReplayApp() {
   const [dialog, setDialog] = useState<Dialog>(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
+  const triggerRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
@@ -36,23 +36,34 @@ export function ReplayApp() {
     if (dialog) closeButtonRef.current?.focus();
   }, [dialog]);
 
-  const close = () => setDialog(null);
+  const open = (nextDialog: Exclude<Dialog, null>, trigger: HTMLElement) => {
+    triggerRef.current = trigger;
+    setDialog(nextDialog);
+  };
+  const close = () => {
+    setDialog(null);
+    requestAnimationFrame(() => triggerRef.current?.focus());
+  };
 
   return (
     <div className="terminal replay-terminal">
       <div
         className="terminal-frame replay-frame"
-        role="application"
-        aria-label="Static market terminal demo. Frozen sample screen with no live connection and no input."
+        role="region"
+        aria-label="Captured market-terminal replay. Frozen, read-only sample with no live connection or input."
       >
         {REPLAY_SCREEN.rows.map((html, index) => (
           <div
             key={index}
             className="term-row"
-            dangerouslySetInnerHTML={{ __html: html || "&nbsp;" }}
+            dangerouslySetInnerHTML={{ __html: sanitizeReplayHtml(html || "&nbsp;") }}
           />
         ))}
       </div>
+
+      <p className="replay-disclosure">
+        {REPLAY_DISCLAIMERS.nonFinancial} {REPLAY_DISCLAIMERS.noLive} Captured {REPLAY_SCREEN.capturedAt} {REPLAY_SCREEN.captureTimezone}.
+      </p>
 
       <div className="status-line replay-status">
         <span className="status-conn" aria-live="polite">
@@ -63,22 +74,22 @@ export function ReplayApp() {
         <button
           type="button"
           className="evidence-chip replay-chip-pilot"
-          onClick={() => setDialog("pilot")}
+          onClick={(event) => open("pilot", event.currentTarget)}
           aria-haspopup="dialog"
           aria-expanded={dialog === "pilot"}
-          aria-label={`Static pilot. ${REPLAY_DISCLAIMERS.noActivation} ${REPLAY_DISCLAIMERS.noAccount}`}
+          aria-label={`Captured product replay. ${REPLAY_DISCLAIMERS.noLive}`}
         >
           <span className="evidence-lamp" aria-hidden="true" />
-          <span className="evidence-chip-text">PILOT // NO ACTIVATION</span>
+          <span className="evidence-chip-text">CAPTURED REPLAY</span>
         </button>
 
         <button
           type="button"
           className="evidence-chip evidence-chip-none"
-          onClick={() => setDialog("source")}
+          onClick={(event) => open("source", event.currentTarget)}
           aria-haspopup="dialog"
           aria-expanded={dialog === "source"}
-          aria-label={`Source locker. ${REPLAY_DISCLAIMERS.noThirdParty}`}
+          aria-label={`Source locker. ${REPLAY_DISCLAIMERS.captured}`}
         >
           <span className="evidence-lamp" aria-hidden="true" />
           <span className="evidence-chip-text">SOURCE LOCKER</span>
@@ -106,11 +117,11 @@ export function ReplayApp() {
           <div className="evidence-cartridge-meta">
             <span>INTENT: {REPLAY_SCREEN.dossier.intent.toUpperCase()}</span>
             <span>STAGE: {REPLAY_SCREEN.dossier.stage.toUpperCase()}</span>
-            <span className="evidence-status evidence-status-none">
+            <span className={`evidence-status evidence-status-${REPLAY_SCREEN.dossier.evidenceStatus}`}>
               STATUS:{" "}
               {REPLAY_EVIDENCE_STATUS_LABEL[REPLAY_SCREEN.dossier.evidenceStatus]}
             </span>
-            <span>PACKETS: {REPLAY_SCREEN.dossier.packets.length}</span>
+            <span>PACKETS: {REPLAY_SCREEN.dossier.packets.length} / {REPLAY_SCREEN.dossier.sourceCount} SOURCES</span>
           </div>
           <div className="replay-dialog-rule" aria-hidden="true" />
           {REPLAY_SCREEN.dossier.packets.length === 0 ? (
@@ -133,9 +144,16 @@ export function ReplayApp() {
                       {REPLAY_RETRIEVAL_STATUS_LABEL[packet.retrieval]}
                     </span>
                     <span className="evidence-packet-source">{packet.domain}</span>
+                    {packet.capturedAt && (
+                      <span className="evidence-packet-time">{packet.capturedAt}</span>
+                    )}
                   </div>
                   <h3 className="evidence-packet-title">{packet.title}</h3>
                   <p className="evidence-packet-excerpt">{packet.excerpt}</p>
+                  <div className="evidence-packet-foot">
+                    {packet.mode && <span className="evidence-mode">MODE:{packet.mode}</span>}
+                    {packet.note && <span className="evidence-note">{packet.note}</span>}
+                  </div>
                 </article>
               ))}
             </div>
@@ -144,6 +162,41 @@ export function ReplayApp() {
       )}
     </div>
   );
+}
+
+/**
+ * Captures are stored as terminal-generated HTML. Only text and spans with the
+ * three palette properties emitted by the renderer may reach the DOM; all
+ * other markup and styles are converted to plain text.
+ */
+function sanitizeReplayHtml(html: string): string {
+  const template = document.createElement("template");
+  template.innerHTML = html;
+  const output = document.createElement("span");
+  const palette = new Set(["color", "background-color", "font-weight"]);
+  const safeRgb = (value: string) => /^rgb\((?:[0-9]{1,3},){2}[0-9]{1,3}\)$/.test(value);
+
+  for (const node of Array.from(template.content.childNodes)) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      output.append(node.textContent ?? "");
+      continue;
+    }
+    if (!(node instanceof HTMLSpanElement)) {
+      output.append(node.textContent ?? "");
+      continue;
+    }
+    const span = document.createElement("span");
+    span.textContent = node.textContent ?? "";
+    for (const declaration of node.style) {
+      const value = node.style.getPropertyValue(declaration).trim();
+      if (!palette.has(declaration)) continue;
+      if ((declaration === "color" || declaration === "background-color") && !safeRgb(value)) continue;
+      if (declaration === "font-weight" && value !== "700") continue;
+      span.style.setProperty(declaration, value);
+    }
+    output.append(span);
+  }
+  return output.innerHTML;
 }
 
 /* ── Explanatory dialog (same modal language as the evidence locker) ─────── */
