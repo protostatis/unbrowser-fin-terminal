@@ -30,9 +30,8 @@ deployment fallback for a normal terminal release.
    ```
 
 3. In `unchained-infra`, create a release branch from current `main`. Replace
-   both the `fin-terminal.build.context` and
-   `fin-terminal-demo.build.context` Git refs in `docker-compose.yml` with that
-   exact 40-character SHA. Never use a mutable branch ref such as
+   the authenticated terminal and public-terminal image refs with that exact
+   40-character SHA. Never use a mutable branch ref such as
    `#feature/signal-dossier`.
 
 4. Update both matching SHA assertions in `unchained/test_fin_terminal.py`,
@@ -56,20 +55,30 @@ deployment fallback for a normal terminal release.
 ## Deployment Contract
 
 - Build the authenticated live service with
-  `PUBLIC_BASE_PATH=/unbrowser/fin-terminal/` and the demo service with
-  `PUBLIC_BASE_PATH=/unbrowser/fin-terminal-demo/`.
-- `PUBLIC_DEMO` is explicit and must be set in production: `PUBLIC_DEMO=0` for
-  the live terminal and `PUBLIC_DEMO=1` for the replay demo. It is never
-  derived from the build path alone.
-- The client build and server mode must pair. A client built for
-  `/unbrowser/fin-terminal-demo/` must be served by a replay-mode server; a
-  client built for `/unbrowser/fin-terminal/` must be served by a live-mode
-  server. A mismatched pair is unsafe and must fail closed.
-- The public demo is a static replay site, not a live kiosk. It serves
-  checked-in, immutable replay artifacts and an informational pilot
-  placeholder. It starts no AgentSession, performs no WebSocket/model/source
-  work, and creates no auth, entitlement, workspace, or source-check state.
-  There is no singleton seat, waiting room, or idle watchdog.
+  `PUBLIC_BASE_PATH=/unbrowser/fin-terminal/`. Build the public gateway client
+  at `/unbrowser/fin-terminal-demo/` with
+  `VITE_TERMINAL_BUILD_MODE=public-live`.
+- `PUBLIC_DEMO=0` is explicit for authenticated live and `PUBLIC_DEMO=1` is
+  explicit for replay. Public admission instead uses
+  `TERMINAL_RUNTIME_MODE=public-gateway` and must not set `PUBLIC_DEMO`.
+- The client build and server mode must pair. `public-gateway` requires a
+  `public-live` client; replay requires replay; authenticated live requires
+  live. The stable demo URL alone no longer determines whether the deployment
+  is replay or public-live. A mismatched pair is unsafe and must fail closed.
+- The public-live gateway verifies Turnstile, serializes FIFO admission through
+  a Redis lease, reserves conservative per-session research budget, and proxies
+  each signed opaque ticket to one isolated worker. The browser never reaches a
+  worker directly.
+- Production requires an exact allowed origin, Redis, session-signing key,
+  worker proxy token, Turnstile keys, and a worker endpoint list exactly matching
+  the configured seat count. Turnstile bypass and memory persistence are
+  development-only and fail closed in production.
+- Disposable workers use `PUBLIC_SESSION_WORKER=1`, one research worker,
+  explicit model configuration, matching timeout/run limits, isolated source
+  extraction, and no public ingress. A worker reached by a visitor is not
+  reusable until a replacement generation passes readiness.
+- Replay remains available as a separate static fallback. It starts no
+  AgentSession, WebSocket, model, or source request.
 - The container listens on port `8787`; `/api/ready` is the readiness check.
 - Caddy owns route authorization and injects the terminal proxy token. Do not
   expose port `8787` directly or bypass Caddy.
@@ -90,10 +99,18 @@ deployment fallback for a normal terminal release.
 - Confirm a direct container-network request without the injected proxy token
   returns HTTP 403.
 - Confirm the demo service reports `GET /api/ready` HTTP 200.
-- Confirm `/unbrowser/fin-terminal-demo/` serves the checked-in static replay
-  artifacts and pilot placeholder with no authenticated user session created.
-- Confirm `/unbrowser/fin-terminal-demo/ws` is rejected without an HTTP 101
-  WebSocket upgrade.
+- Confirm `/unbrowser/fin-terminal-demo/api/public/config` returns a signed
+  opaque visitor token and only public limits/site-key metadata.
+- Confirm invalid origin and Turnstile admission attempts fail closed.
+- Confirm FIFO assignment, queue/ticket expiry, reconnect grace, idle timeout,
+  absolute timeout, and per-session research launch limits.
+- Confirm the browser WebSocket reaches only the gateway, an assigned worker is
+  replaced after session end, and a stale worker generation cannot re-enter the
+  ready pool.
+- Confirm the daily reservation ceiling rejects new seats before configured
+  spend can be exceeded.
+- If replay fallback is deployed separately, confirm it serves immutable replay
+  artifacts and rejects WebSocket upgrades.
 
 The authoritative infrastructure details, including production secrets and
 host safety controls, live in

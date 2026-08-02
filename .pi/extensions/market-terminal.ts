@@ -419,6 +419,16 @@ function terminalRows(tui: Tui): number {
 }
 
 const MAX_CANVAS_CHARS = 12_000;
+const publicSessionResearchLimit = (() => {
+	const raw = process.env.PUBLIC_MAX_RESEARCH_RUNS?.trim();
+	if (!raw) return undefined;
+	const value = Number(raw);
+	if (!Number.isInteger(value) || value < 1 || value > 10) {
+		throw new Error("PUBLIC_MAX_RESEARCH_RUNS must be an integer from 1 to 10");
+	}
+	return value;
+})();
+let publicSessionResearchRuns = 0;
 const canvases = new Map<string, Canvas>();
 const researchArchive = new Map<string, ArchivedResearch[]>();
 const researchJobs = new Map<string, ResearchJob>();
@@ -2631,6 +2641,7 @@ function resetResearchJobs(): void {
 	toolResearchJobs.clear();
 	runningResearchId = undefined;
 	workerBridge = undefined;
+	publicSessionResearchRuns = 0;
 }
 
 function researchQueueLabel(): string {
@@ -6146,13 +6157,13 @@ export default function (pi: ExtensionAPI) {
 		switch (event.type) {
 			case "started": {
 				removeQueuedResearch(job.id);
-				updateResearchJob(job.id, { phase: "running", outcome: "running", activity: "seeding", error: undefined });
+				updateResearchJob(job.id, { phase: "dispatched", outcome: "queued", activity: "seeding", error: undefined });
 				return;
 			}
 			case "job": {
 				const phase = event.outcome === "cancelled"
 					? "cancelling"
-					: job.phase === "queued" ? "dispatched" : "running";
+					: event.outcome === "queued" ? "dispatched" : "running";
 				updateResearchJob(job.id, {
 					phase,
 					outcome: event.outcome,
@@ -6217,9 +6228,9 @@ export default function (pi: ExtensionAPI) {
 		return researchWorkerCoordinator;
 	};
 
-	const pumpResearchQueue = (ctx: ExtensionContext): void => {
+	const pumpResearchQueue = (ctx: ExtensionContext, workerBootstrap = false): void => {
 		if (isResearchWorkerProcess) {
-			if (runningResearchId || !ctx.isIdle() || ctx.hasPendingMessages()) return;
+			if (runningResearchId || (!workerBootstrap && (!ctx.isIdle() || ctx.hasPendingMessages()))) return;
 			while (researchQueue.length > 0) {
 				const id = researchQueue.shift()!;
 				const queued = researchJobs.get(id);
@@ -6280,9 +6291,16 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 			if (activeResearchJobs().length >= 24) return { accepted: false, status: "RESEARCH QUEUE FULL · CANCEL OR WAIT FOR A JOB" };
+			if (publicSessionResearchLimit !== undefined && publicSessionResearchRuns >= publicSessionResearchLimit) {
+				return {
+					accepted: false,
+					status: `PUBLIC SESSION RESEARCH LIMIT REACHED (${publicSessionResearchLimit})`,
+				};
+			}
 			const job = createResearchJob(request);
 			if (!job) return { accepted: false, status: "THIS RESEARCH JOB IS ALREADY ACTIVE", job: activeResearchJobForIdentity(request) };
-			pumpResearchQueue(ctx);
+			if (publicSessionResearchLimit !== undefined) publicSessionResearchRuns += 1;
+			if (!isResearchWorkerProcess) pumpResearchQueue(ctx);
 			const current = researchJobs.get(job.id) ?? job;
 			return { accepted: true, status: `${researchStatusLine(current)} · ${researchQueueLabel()}`, job: current };
 		},
@@ -6410,6 +6428,22 @@ export default function (pi: ExtensionAPI) {
 		const job = runningResearchJob();
 		if (job?.phase === "dispatched" && job.outcome !== "cancelled") updateResearchJob(job.id, { phase: "running", outcome: "running", activity: "seeding" });
 	});
+	pi.on("agent_end", (event) => {
+		const job = runningResearchJob();
+		if (!job || job.phase !== "running" || !researchSlotHeld(job) || job.outcome === "cancelled" || job.outcome === "complete") return;
+		const assistant = [...event.messages].reverse().find((message) => message.role === "assistant");
+		if (!assistant || assistant.role !== "assistant") return;
+		const safeError = assistant.stopReason === "error"
+			? "Research model request failed before a complete canvas was published"
+			: assistant.stopReason === "aborted"
+				? "Research model turn was aborted before completion"
+				: assistant.stopReason === "length"
+					? "Research model reached its output limit before publishing a complete canvas"
+					: assistant.stopReason === "stop"
+						? "Research model stopped without publishing the required complete canvas"
+						: undefined;
+		if (safeError && !job.error) updateResearchJob(job.id, { error: safeError });
+	});
 	pi.on("tool_execution_start", (event) => {
 		const job = runningResearchJob();
 		if (!job || job.outcome === "cancelled") return;
@@ -6433,7 +6467,7 @@ export default function (pi: ExtensionAPI) {
 	});
 	pi.on("agent_settled", (_event, ctx) => {
 		const job = runningResearchJob();
-		if (job) {
+		if (job?.phase === "running" || job?.phase === "cancelling") {
 			let patch: Partial<ResearchJob> = {};
 			if (job.outcome === "queued" || job.outcome === "running") {
 				patch = { outcome: "failed", error: job.error || "No research canvas was published" };
@@ -7217,12 +7251,10 @@ export default function (pi: ExtensionAPI) {
 
 			workerBridge.workerJobId = response.job.id;
 			emitWorkerEvent("started");
-			updateResearchJob(response.job.id, {
-				phase: "running",
-				outcome: "running",
-				activity: "seeding",
-				error: undefined,
-			});
+			// Do not mark the model turn running during command bootstrap. Dispatch
+			// only after IPC correlation is installed; agent_start owns the
+			// dispatched -> running transition.
+			pumpResearchQueue(ctx, true);
 		},
 	});
 

@@ -11,7 +11,8 @@ COPY web ./web
 COPY .pi/extensions ./.pi/extensions
 
 ARG PUBLIC_BASE_PATH=/
-RUN PUBLIC_BASE_PATH="$PUBLIC_BASE_PATH" npm run build
+ARG VITE_TERMINAL_BUILD_MODE=
+RUN PUBLIC_BASE_PATH="$PUBLIC_BASE_PATH" VITE_TERMINAL_BUILD_MODE="$VITE_TERMINAL_BUILD_MODE" npm run build
 
 
 FROM node:22.23.2-bookworm-slim@sha256:f32b81066cde10a75dbac96646099533316d94bac4150c55da1636e1f0ffdc46 AS production-dependencies

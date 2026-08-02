@@ -8,6 +8,7 @@
  */
 
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -139,9 +140,20 @@ async function createWorkerSession(): Promise<AgentSession> {
   return created.session;
 }
 
-async function waitForSettlement(activeSession: AgentSession): Promise<void> {
+export interface ResearchSettlementOptions {
+  runTimeoutMs?: number;
+  dispatchTimeoutMs?: number;
+}
+
+export async function waitForSettlement(
+  activeSession: AgentSession,
+  options: ResearchSettlementOptions = {},
+): Promise<void> {
+  const runTimeoutMs = options.runTimeoutMs ?? RUN_TIMEOUT_MS;
+  const dispatchTimeoutMs = options.dispatchTimeoutMs ?? DISPATCH_TIMEOUT_MS;
   await new Promise<void>((resolve, reject) => {
     let completed = false;
+    let researchTurnStarted = false;
     let unsubscribe = () => {};
     let unsubscribeError = () => {};
     const finish = (callback: () => void) => {
@@ -155,18 +167,17 @@ async function waitForSettlement(activeSession: AgentSession): Promise<void> {
     };
     const timeout = setTimeout(() => {
       finish(() => reject(new Error("Research worker exceeded its 10-minute runtime limit")));
-    }, RUN_TIMEOUT_MS);
-    timeout.unref();
+    }, runTimeoutMs);
     const dispatchTimeout = setTimeout(() => {
       finish(() => reject(new Error("Research worker did not start an agent turn within 60 seconds")));
-    }, DISPATCH_TIMEOUT_MS);
-    dispatchTimeout.unref();
+    }, dispatchTimeoutMs);
     unsubscribe = activeSession.subscribe((event) => {
       if (event.type === "agent_start") {
+        researchTurnStarted = true;
         clearTimeout(dispatchTimeout);
         return;
       }
-      if (event.type !== "agent_settled") return;
+      if (event.type !== "agent_settled" || !researchTurnStarted) return;
       // Pi runs extension event handlers before subscriber callbacks; yield one
       // turn so the last IPC canvas/settled event is flushed before disposal.
       finish(() => setTimeout(resolve, 0));
@@ -176,6 +187,20 @@ async function waitForSettlement(activeSession: AgentSession): Promise<void> {
       finish(() => reject(new Error(error.error)));
     });
   });
+}
+
+export async function dispatchAndWaitForSettlement(
+  activeSession: AgentSession,
+  command: string,
+  options: ResearchSettlementOptions = {},
+  onCommandAccepted: () => void = () => {},
+): Promise<void> {
+  const settlement = waitForSettlement(activeSession, options);
+  // Subscribe before dispatch: a queued follow-up may start and settle before
+  // the command prompt's promise continuation runs.
+  await activeSession.prompt(command);
+  onCommandAccepted();
+  await settlement;
 }
 
 async function shutdown(): Promise<void> {
@@ -212,22 +237,28 @@ async function main(): Promise<void> {
     return;
   }
 
-  await session.prompt(`/market-worker-run ${encodedRunMessage(run)}`);
-  runDispatched = true;
-  await waitForSettlement(session);
+  await dispatchAndWaitForSettlement(
+    session,
+    `/market-worker-run ${encodedRunMessage(run)}`,
+    {},
+    () => { runDispatched = true; },
+  );
 }
 
-main()
-  .catch(async (error) => {
-    process.exitCode = 1;
-    if (activeRun && !runDispatched) {
-      sendBootstrapEvent(activeRun, "fatal", {
-        error: error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500),
-      });
-    } else {
-      await abortDispatchedFailure();
-    }
-  })
-  .finally(() => {
-    void shutdown();
-  });
+const isMainModule = Boolean(process.argv[1]) && import.meta.url === pathToFileURL(process.argv[1]!).href;
+if (isMainModule) {
+  main()
+    .catch(async (error) => {
+      process.exitCode = 1;
+      if (activeRun && !runDispatched) {
+        sendBootstrapEvent(activeRun, "fatal", {
+          error: error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500),
+        });
+      } else {
+        await abortDispatchedFailure();
+      }
+    })
+    .finally(() => {
+      void shutdown();
+    });
+}

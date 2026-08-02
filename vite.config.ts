@@ -10,12 +10,37 @@ if (!/^\/(?:[A-Za-z0-9._~-]+\/)*$/.test(publicBasePath)) {
   throw new Error("PUBLIC_BASE_PATH must start and end with / and contain URL-safe path segments");
 }
 
-// Determine build mode from PUBLIC_BASE_PATH: if the path contains the
-// "fin-terminal-demo" segment the build is for replay-only kiosk mode;
-// otherwise it is a live agent build.
-const buildMode: "replay" | "live" = publicBasePath.split("/").filter(Boolean).includes("fin-terminal-demo")
-  ? "replay"
-  : "live";
+// Legacy builds infer replay mode from the public-demo path. A public live
+// gateway keeps that stable URL but explicitly builds the real client with
+// VITE_TERMINAL_BUILD_MODE=public-live.
+const requestedBuildMode = process.env.VITE_TERMINAL_BUILD_MODE?.trim();
+if (requestedBuildMode && !["replay", "live", "public-live"].includes(requestedBuildMode)) {
+  throw new Error("VITE_TERMINAL_BUILD_MODE must be replay, live, or public-live");
+}
+const buildMode: "replay" | "live" | "public-live" = requestedBuildMode as
+  | "replay"
+  | "live"
+  | "public-live"
+  | undefined
+  ?? (publicBasePath.split("/").filter(Boolean).includes("fin-terminal-demo") ? "replay" : "live");
+const baseProxyPath = publicBasePath === "/" ? "" : publicBasePath.replace(/\/$/, "");
+const proxy = {
+  "/api": { target: backendHttp, changeOrigin: true },
+  "/ws": { target: backendWs, ws: true, changeOrigin: true },
+  ...(baseProxyPath ? {
+    [`${baseProxyPath}/api`]: {
+      target: backendHttp,
+      changeOrigin: true,
+      rewrite: (requestPath: string) => requestPath.slice(baseProxyPath.length),
+    },
+    [`${baseProxyPath}/ws`]: {
+      target: backendWs,
+      ws: true,
+      changeOrigin: true,
+      rewrite: (requestPath: string) => requestPath.slice(baseProxyPath.length),
+    },
+  } : {}),
+};
 
 export default defineConfig({
   root: "web",
@@ -34,10 +59,7 @@ export default defineConfig({
   ],
   server: {
     port: 5173,
-    proxy: {
-      "/api": { target: backendHttp, changeOrigin: true },
-      "/ws": { target: backendWs, ws: true, changeOrigin: true },
-    },
+    proxy,
   },
   build: { outDir: "../dist-web", emptyOutDir: true },
 });

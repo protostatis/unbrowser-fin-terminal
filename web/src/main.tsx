@@ -21,10 +21,15 @@ import {
   type TerminalWebAction,
 } from "./InteractionOverlay";
 import { keyToData } from "./keyboard";
-import { PUBLIC_DEMO, REPLAY_DEMO } from "./demo-mode";
-import { DEMO_BUSY_CLOSE_CODE } from "./socket";
+import { PUBLIC_DEMO, PUBLIC_LIVE_DEMO, REPLAY_DEMO } from "./demo-mode";
+import {
+  DEMO_BUSY_CLOSE_CODE,
+  PUBLIC_SESSION_ENDED_CLOSE_CODE,
+  PUBLIC_WORKER_UNAVAILABLE_CLOSE_CODE,
+} from "./socket";
 import type { FrameMessage, SelectRequestMessage } from "./socket";
 import { ReplayApp } from "./ReplayApp";
+import { PublicLiveApp } from "./PublicLiveApp";
 import "./styles.css";
 
 const RESEARCH_OUTCOME_DISPLAY_MS = 8_000;
@@ -81,9 +86,15 @@ function useResearchStatus(state: FrameMessage["state"]) {
  * keyboard input to forward to the extension.
  */
 
-function App() {
-  const socketRef = useRef(new TerminalSocket());
-  const socket = socketRef.current;
+export function App({
+  onPublicSessionEnd,
+  publicSessionProtocol,
+}: {
+  onPublicSessionEnd?: () => void;
+  publicSessionProtocol?: string;
+} = {}) {
+  const socketRef = useRef<TerminalSocket>();
+  const socket = socketRef.current ?? (socketRef.current = new TerminalSocket(publicSessionProtocol));
 
   /* ── Re-render trigger (avoids stale-closure issues with refs) ─────── */
   const [, forceUpdate] = useReducer((x: number) => x + 1, 0);
@@ -161,7 +172,7 @@ function App() {
   /* ── WebSocket lifecycle ──────────────────────────────────────────────── */
 
   useEffect(() => {
-    const s = socketRef.current;
+    const s = socket;
 
     const unsubFrame = s.on("frame", (msg: FrameMessage) => {
       rowsRef.current = msg.rows;
@@ -224,6 +235,12 @@ function App() {
           demoRetryTimerRef.current = setTimeout(tryDemoSeat, delay);
         }
       }
+      if (
+        event.code === PUBLIC_SESSION_ENDED_CLOSE_CODE
+        || event.code === PUBLIC_WORKER_UNAVAILABLE_CLOSE_CODE
+      ) {
+        onPublicSessionEnd?.();
+      }
       forceUpdate();
     });
 
@@ -259,7 +276,7 @@ function App() {
    */
 
   useEffect(() => {
-    const s = socketRef.current;
+    const s = socket;
     const container = containerRef.current;
     const ruler = rulerRef.current;
     if (!container || !ruler) return;
@@ -317,7 +334,7 @@ function App() {
    */
 
   useEffect(() => {
-    const s = socketRef.current;
+    const s = socket;
 
     const handler = (e: KeyboardEvent) => {
       // When a select modal is shown, only Escape is handled (to cancel).
@@ -618,11 +635,15 @@ function App() {
 const rootEl = document.getElementById("root");
 if (!rootEl) throw new Error("#root element not found");
 
-// Replay-only demo builds (base path /unbrowser/fin-terminal-demo/) render the
-// static ReplayApp instead of the live terminal, so no TerminalSocket is ever
-// constructed in that deployment. The live terminal is unchanged everywhere
-// else.
-const RootApp = REPLAY_DEMO ? ReplayApp : App;
+// Replay-only builds never construct a socket. Public-live builds defer the
+// real client until Turnstile admission assigns an isolated worker seat.
+function PublicLiveRoot() {
+  return <PublicLiveApp renderTerminal={(onSessionEnd, publicSessionProtocol) => (
+    <App onPublicSessionEnd={onSessionEnd} publicSessionProtocol={publicSessionProtocol} />
+  )} />;
+}
+
+const RootApp = REPLAY_DEMO ? ReplayApp : PUBLIC_LIVE_DEMO ? PublicLiveRoot : App;
 
 createRoot(rootEl).render(
   <StrictMode>

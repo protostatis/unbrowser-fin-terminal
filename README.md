@@ -17,6 +17,7 @@ A keyboard-first market terminal for the [Pi coding agent](https://github.com/ea
 - Project-local research history with explicit `AS OF` timestamps
 - Full-height layouts for narrow and wide terminals
 - Responsive mobile command deck with touch navigation, scope controls, symbol entry, and horizontal view swipes
+- Turnstile-gated public live sessions with FIFO admission, bounded disposable workers, fixed leases, and conservative research-budget reservations
 
 ## Requirements
 
@@ -103,11 +104,12 @@ must also provide an authenticated, opaque `X-Fin-Terminal-User` value. The
 first WebSocket principal owns the singleton terminal session until the process
 restarts, preventing state transfer between users.
 
-Live production must set `PUBLIC_DEMO=0` explicitly; the replay demo sets
-`PUBLIC_DEMO=1` (see "Public demo deployment"). The client build and server
-mode must match — a client built for `/unbrowser/fin-terminal-demo/` pairs
-with a replay server, and one built for `/unbrowser/fin-terminal/` pairs with
-a live server.
+Authenticated live production sets `PUBLIC_DEMO=0`; replay sets
+`PUBLIC_DEMO=1`; the anonymous public gateway instead sets
+`TERMINAL_RUNTIME_MODE=public-gateway` and must not set `PUBLIC_DEMO`. The
+client build and server mode must match: public-gateway pairs with an explicit
+`public-live` client build, replay pairs with replay, and authenticated live
+pairs with live.
 
 Set `MARKET_ROOT=/app`, `MARKET_DATA_DIR=/data`, and mount `/data` as the only
 persistent volume. `/api/health` is liveness-only; use `/api/ready` for the
@@ -131,9 +133,44 @@ For the production release workflow, including the immutable source-SHA handoff
 to `unchained-infra` and GitHub Actions production approval, see
 [`docs/deployment.md`](docs/deployment.md).
 
-### Public demo deployment
+### Public live-session pilot
 
-The public demo is a static replay site, not a live kiosk. It serves
+The public-live build preserves the stable demo URL while replacing the replay
+with bounded real sessions. The browser reaches only an admission gateway; each
+admitted ticket is proxied to one isolated disposable terminal worker.
+
+Build the client explicitly as public-live:
+
+```bash
+docker build \
+  --build-arg PUBLIC_BASE_PATH=/unbrowser/fin-terminal-demo/ \
+  --build-arg VITE_TERMINAL_BUILD_MODE=public-live \
+  -t unbrowser-fin-terminal-public .
+```
+
+The gateway requires `TERMINAL_RUNTIME_MODE=public-gateway`, an exact
+`PUBLIC_ALLOWED_ORIGIN`, Redis, a 32+ character session-signing key, an internal
+worker proxy token, Turnstile keys, and an explicit `PUBLIC_WORKER_ENDPOINTS`
+list matching `PUBLIC_MAX_SESSIONS`. Production forbids
+`PUBLIC_TURNSTILE_BYPASS=1` and `memory://` persistence.
+
+Every worker sets `PUBLIC_SESSION_WORKER=1`,
+`MARKET_RESEARCH_CONCURRENCY=1`, an explicit model policy, the same session
+timeouts/run limit as the gateway, and the internal worker proxy token. Workers
+must be reachable only from the gateway network and replaced after any visitor
+reaches them. The gateway reserves the full configured per-session research
+budget before assigning a seat, so admission fails closed at the daily cap.
+
+The defaults bound a visitor to a 10-minute queue ticket, 5-minute idle lease,
+15-minute absolute lease, 30-second reconnect grace, and five research launches.
+See [`docs/deployment.md`](docs/deployment.md) for the release and verification
+contract. Account signup, persistent workspaces, claims, and billing shown in
+the conversion preview are design handoff only and are not wired into this
+public gateway.
+
+### Static replay deployment
+
+Replay mode remains available as a static fallback. It serves
 checked-in, immutable replay artifacts of the terminal and an informational
 pilot placeholder. It starts no AgentSession, performs no WebSocket, model, or
 source work, and creates no auth, entitlement, workspace, or source-check
@@ -147,12 +184,10 @@ docker build \
   -t unbrowser-fin-terminal-demo .
 ```
 
-`PUBLIC_DEMO` must be set explicitly in production: `PUBLIC_DEMO=0` for the
-live terminal and `PUBLIC_DEMO=1` for the replay demo. The client build must
-match the server mode. A client built with `/unbrowser/fin-terminal-demo/`
-must pair with a replay server, and a client built with
-`/unbrowser/fin-terminal/` must pair with a live server. A mismatched pair is
-unsafe and fails closed.
+`PUBLIC_DEMO=1` must be explicit for replay. Because the stable demo path can
+also host public-live, deployment must set `VITE_TERMINAL_BUILD_MODE=public-live`
+for the gateway build; omitting that override at the demo path intentionally
+produces replay. Any build/runtime mismatch fails closed.
 
 Replay-mode verification:
 
