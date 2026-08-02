@@ -14,9 +14,8 @@ type Dialog = "pilot" | "source" | null;
  *
  * Renders the pre-built fixture in the same terminal/status/modal visual
  * language as the live build and makes no WebSocket, fetch, auth, identity,
- * persistence, redirect, model, or third-party-source request. The pilot
- * button is informational only — no activation, account, workspace, save, or
- * follow is created — and the source locker opens only an explanatory dialog.
+ * persistence, redirect, model, or source request. The capture button explains
+ * the frozen public artifact, and the source locker replays its evidence.
  * Escape closes every dialog; no other key handling exists here.
  */
 export function ReplayApp() {
@@ -66,10 +65,10 @@ export function ReplayApp() {
           onClick={() => setDialog("pilot")}
           aria-haspopup="dialog"
           aria-expanded={dialog === "pilot"}
-          aria-label={`Static pilot. ${REPLAY_DISCLAIMERS.noActivation} ${REPLAY_DISCLAIMERS.noAccount}`}
+          aria-label={`Captured product replay. ${REPLAY_DISCLAIMERS.noLive}`}
         >
           <span className="evidence-lamp" aria-hidden="true" />
-          <span className="evidence-chip-text">PILOT // NO ACTIVATION</span>
+          <span className="evidence-chip-text">CAPTURED REPLAY</span>
         </button>
 
         <button
@@ -78,7 +77,7 @@ export function ReplayApp() {
           onClick={() => setDialog("source")}
           aria-haspopup="dialog"
           aria-expanded={dialog === "source"}
-          aria-label={`Source locker. ${REPLAY_DISCLAIMERS.noThirdParty}`}
+          aria-label={`Source locker. ${REPLAY_DISCLAIMERS.captured}`}
         >
           <span className="evidence-lamp" aria-hidden="true" />
           <span className="evidence-chip-text">SOURCE LOCKER</span>
@@ -106,7 +105,7 @@ export function ReplayApp() {
           <div className="evidence-cartridge-meta">
             <span>INTENT: {REPLAY_SCREEN.dossier.intent.toUpperCase()}</span>
             <span>STAGE: {REPLAY_SCREEN.dossier.stage.toUpperCase()}</span>
-            <span className="evidence-status evidence-status-none">
+            <span className={`evidence-status evidence-status-${REPLAY_SCREEN.dossier.evidenceStatus}`}>
               STATUS:{" "}
               {REPLAY_EVIDENCE_STATUS_LABEL[REPLAY_SCREEN.dossier.evidenceStatus]}
             </span>
@@ -133,9 +132,16 @@ export function ReplayApp() {
                       {REPLAY_RETRIEVAL_STATUS_LABEL[packet.retrieval]}
                     </span>
                     <span className="evidence-packet-source">{packet.domain}</span>
+                    {packet.capturedAt && (
+                      <span className="evidence-packet-time">{packet.capturedAt}</span>
+                    )}
                   </div>
                   <h3 className="evidence-packet-title">{packet.title}</h3>
                   <p className="evidence-packet-excerpt">{packet.excerpt}</p>
+                  <div className="evidence-packet-foot">
+                    {packet.mode && <span className="evidence-mode">MODE:{packet.mode}</span>}
+                    {packet.note && <span className="evidence-note">{packet.note}</span>}
+                  </div>
                 </article>
               ))}
             </div>
