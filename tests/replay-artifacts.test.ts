@@ -21,6 +21,7 @@ function baseScreen(overrides: Partial<ReplayScreen> = {}): ReplayScreen {
       intent: "preview",
       stage: "sample",
       evidenceStatus: "unavailable",
+      sourceCount: 10,
       packets: [],
     },
     pilot: {
@@ -47,6 +48,7 @@ test("the shipped fixture passes module-load validation", () => {
   assert.equal(REPLAY_SCREEN.rows.length > 0, true);
   assert.equal(REPLAY_SCREEN.dossier.evidenceStatus, "partial");
   assert.equal(REPLAY_SCREEN.dossier.packets.length, 4);
+  assert.equal(REPLAY_SCREEN.dossier.sourceCount, 6);
 });
 
 test("unavailable evidence must have exactly zero packets", () => {

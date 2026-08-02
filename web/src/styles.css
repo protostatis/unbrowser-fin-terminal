@@ -2144,8 +2144,8 @@ strong {
  *
  * The public demo build is a static replay: the terminal frame is pre-rendered
  * fixture HTML and the chrome chips open explanatory dialogs only. It shares
- * the exact terminal/status/modal language of the live build — no dashboard,
- * rail, or canvas — and performs no network, model, or source request.
+ * the exact terminal/status/modal language of the live build and performs no
+ * network, model, or source request.
  */
 
 /* The replay build has no connection lifecycle, so the chips sit in normal
@@ -2159,6 +2159,35 @@ strong {
 /* Push the chip group to the right edge of the status line. */
 .replay-status .evidence-chip:first-of-type {
   margin-left: auto;
+}
+
+/* A production capture can be much wider/taller than the viewer. Preserve it
+ * rather than clipping the right-hand analysis or lower terminal rows. */
+.replay-frame {
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.replay-frame .term-row {
+  width: max-content;
+  min-width: 100%;
+  overflow: visible;
+}
+
+.replay-disclosure {
+  margin: 0;
+  padding: 4px 12px;
+  color: #8b949e;
+  border-top: 1px solid #21262d;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+@media (max-width: 720px) {
+  .replay-frame {
+    padding: 8px;
+    font-size: 12px;
+  }
 }
 
 /* Static (blue) status dot — connected/green implies a live session that

@@ -21,6 +21,7 @@ type Dialog = "pilot" | "source" | null;
 export function ReplayApp() {
   const [dialog, setDialog] = useState<Dialog>(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
+  const triggerRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
@@ -35,23 +36,34 @@ export function ReplayApp() {
     if (dialog) closeButtonRef.current?.focus();
   }, [dialog]);
 
-  const close = () => setDialog(null);
+  const open = (nextDialog: Exclude<Dialog, null>, trigger: HTMLElement) => {
+    triggerRef.current = trigger;
+    setDialog(nextDialog);
+  };
+  const close = () => {
+    setDialog(null);
+    requestAnimationFrame(() => triggerRef.current?.focus());
+  };
 
   return (
     <div className="terminal replay-terminal">
       <div
         className="terminal-frame replay-frame"
-        role="application"
-        aria-label="Static market terminal demo. Frozen sample screen with no live connection and no input."
+        role="region"
+        aria-label="Captured market-terminal replay. Frozen, read-only sample with no live connection or input."
       >
         {REPLAY_SCREEN.rows.map((html, index) => (
           <div
             key={index}
             className="term-row"
-            dangerouslySetInnerHTML={{ __html: html || "&nbsp;" }}
+            dangerouslySetInnerHTML={{ __html: sanitizeReplayHtml(html || "&nbsp;") }}
           />
         ))}
       </div>
+
+      <p className="replay-disclosure">
+        {REPLAY_DISCLAIMERS.nonFinancial} {REPLAY_DISCLAIMERS.noLive} Captured {REPLAY_SCREEN.capturedAt} {REPLAY_SCREEN.captureTimezone}.
+      </p>
 
       <div className="status-line replay-status">
         <span className="status-conn" aria-live="polite">
@@ -62,7 +74,7 @@ export function ReplayApp() {
         <button
           type="button"
           className="evidence-chip replay-chip-pilot"
-          onClick={() => setDialog("pilot")}
+          onClick={(event) => open("pilot", event.currentTarget)}
           aria-haspopup="dialog"
           aria-expanded={dialog === "pilot"}
           aria-label={`Captured product replay. ${REPLAY_DISCLAIMERS.noLive}`}
@@ -74,7 +86,7 @@ export function ReplayApp() {
         <button
           type="button"
           className="evidence-chip evidence-chip-none"
-          onClick={() => setDialog("source")}
+          onClick={(event) => open("source", event.currentTarget)}
           aria-haspopup="dialog"
           aria-expanded={dialog === "source"}
           aria-label={`Source locker. ${REPLAY_DISCLAIMERS.captured}`}
@@ -109,7 +121,7 @@ export function ReplayApp() {
               STATUS:{" "}
               {REPLAY_EVIDENCE_STATUS_LABEL[REPLAY_SCREEN.dossier.evidenceStatus]}
             </span>
-            <span>PACKETS: {REPLAY_SCREEN.dossier.packets.length}</span>
+            <span>PACKETS: {REPLAY_SCREEN.dossier.packets.length} / {REPLAY_SCREEN.dossier.sourceCount} SOURCES</span>
           </div>
           <div className="replay-dialog-rule" aria-hidden="true" />
           {REPLAY_SCREEN.dossier.packets.length === 0 ? (
@@ -150,6 +162,41 @@ export function ReplayApp() {
       )}
     </div>
   );
+}
+
+/**
+ * Captures are stored as terminal-generated HTML. Only text and spans with the
+ * three palette properties emitted by the renderer may reach the DOM; all
+ * other markup and styles are converted to plain text.
+ */
+function sanitizeReplayHtml(html: string): string {
+  const template = document.createElement("template");
+  template.innerHTML = html;
+  const output = document.createElement("span");
+  const palette = new Set(["color", "background-color", "font-weight"]);
+  const safeRgb = (value: string) => /^rgb\((?:[0-9]{1,3},){2}[0-9]{1,3}\)$/.test(value);
+
+  for (const node of Array.from(template.content.childNodes)) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      output.append(node.textContent ?? "");
+      continue;
+    }
+    if (!(node instanceof HTMLSpanElement)) {
+      output.append(node.textContent ?? "");
+      continue;
+    }
+    const span = document.createElement("span");
+    span.textContent = node.textContent ?? "";
+    for (const declaration of node.style) {
+      const value = node.style.getPropertyValue(declaration).trim();
+      if (!palette.has(declaration)) continue;
+      if ((declaration === "color" || declaration === "background-color") && !safeRgb(value)) continue;
+      if (declaration === "font-weight" && value !== "700") continue;
+      span.style.setProperty(declaration, value);
+    }
+    output.append(span);
+  }
+  return output.innerHTML;
 }
 
 /* ── Explanatory dialog (same modal language as the evidence locker) ─────── */

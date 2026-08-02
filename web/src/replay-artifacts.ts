@@ -33,6 +33,8 @@ export interface ReplayDossier {
   intent: string;
   stage: string;
   evidenceStatus: ReplayEvidenceStatus;
+  /** Terminal summary count; may exceed the public packet subset. */
+  sourceCount: number;
   packets: ReplayPacket[];
 }
 
@@ -46,6 +48,9 @@ export interface ReplayScreen {
   rows: string[];
   /** Status-line label shown in the replay chrome. */
   statusLabel: string;
+  /** Capture provenance shown in the public replay disclosure. */
+  capturedAt: string;
+  captureTimezone: string;
   dossier: ReplayDossier;
   pilot: ReplayDialogCopy;
   sourceLocker: ReplayDialogCopy;
@@ -157,11 +162,12 @@ const dossier: ReplayDossier = {
   intent: "brief",
   stage: "complete",
   evidenceStatus: "partial",
+  sourceCount: 6,
   packets: [
     { id: "S-e655bc91f423", retrieval: "challenged", domain: "investors.com", capturedAt: "06:05 PM", title: "AT&T Rises On Q4 Earnings Beat, Guidance Through 2028", excerpt: "", note: "Source presented an access challenge", mode: "text_main" },
-    { id: "S-30d980f137ae", retrieval: "fetched", domain: "stockanalysis.com", capturedAt: "06:05 PM", title: "AT&T earnings and estimates", excerpt: "Captured terminal excerpt: AT&T (T) closing price $23.27 on 07/31/2026; extended trading data was displayed in the original packet.", mode: "text_main" },
-    { id: "S-d9f5bae8a8f5", retrieval: "fetched", domain: "about.att.com", capturedAt: "06:05 PM", title: "AT&T Reports Strong First-Quarter 2026 Financial Results", excerpt: "Captured terminal packet; the original session identified this candidate as non-distinct from the MarketBeat packet.", mode: "text_main" },
-    { id: "S-b84bf7ed92af", retrieval: "fetched", domain: "marketbeat.com", capturedAt: "06:05 PM", title: "AT&T (T) Earnings Date and Reports 2026", excerpt: "Captured terminal packet with an extraction-card response. The replay preserves the packet’s presence and retrieval mode without re-fetching it.", mode: "extract_cards" },
+    { id: "S-30d980f137ae", retrieval: "fetched", domain: "stockanalysis.com", capturedAt: "06:05 PM", title: "AT&T earnings and estimates", excerpt: "Replay summary: the captured terminal packet showed AT&T closing at $23.27 on 07/31/2026 and displayed extended-trading information.", note: "Public replay summary; no source is re-fetched", mode: "replay_summary" },
+    { id: "S-d9f5bae8a8f5", retrieval: "fetched", domain: "about.att.com", capturedAt: "06:05 PM", title: "AT&T Reports Strong First-Quarter 2026 Financial Results", excerpt: "Replay summary: the captured terminal identified this candidate as non-distinct from the MarketBeat packet.", note: "Public replay summary; no source is re-fetched", mode: "replay_summary" },
+    { id: "S-b84bf7ed92af", retrieval: "fetched", domain: "marketbeat.com", capturedAt: "06:05 PM", title: "AT&T (T) Earnings Date and Reports 2026", excerpt: "Replay summary: the original terminal recorded an extraction-card response for this packet.", note: "Public replay summary; no source is re-fetched", mode: "replay_summary" },
   ],
 };
 
@@ -177,9 +183,9 @@ const pilot: ReplayDialogCopy = {
 const sourceLocker: ReplayDialogCopy = {
   title: "SOURCE LOCKER · CAPTURED BRIEF",
   lines: [
-    "These packets were captured with the terminal brief and are replayed as approved artifacts.",
+    "Four approved packets from the terminal’s six-source summary are published in this replay.",
     REPLAY_DISCLAIMERS.captured,
-    "Retrieval gaps and partial evidence are preserved instead of being hidden.",
+    "TA1 marks the captured Yahoo market snapshot; it is separate from the source packets. Retrieval gaps and partial evidence are preserved instead of hidden.",
   ],
 };
 
@@ -279,6 +285,12 @@ export function validateReplayArtifact(screen: ReplayScreen): ReplayScreen {
     fail("dossier stage is required");
   }
   if (!Array.isArray(dossier.packets)) fail("dossier packets must be an array");
+  if (
+    !Number.isInteger(dossier.sourceCount) ||
+    dossier.sourceCount < dossier.packets.length
+  ) {
+    fail("dossier sourceCount must be an integer at least as large as packet count");
+  }
 
   if (dossier.evidenceStatus === "unavailable") {
     if (dossier.packets.length !== 0) {
@@ -352,6 +364,8 @@ export function validateReplayArtifact(screen: ReplayScreen): ReplayScreen {
 export const REPLAY_SCREEN: ReplayScreen = {
   rows,
   statusLabel: "CAPTURED REPLAY · AUG 02 2026 · NO NETWORK",
+  capturedAt: "2026-08-02 01:28",
+  captureTimezone: "UTC",
   dossier,
   pilot,
   sourceLocker,
