@@ -1,5 +1,7 @@
 import { createClient, type RedisClientType } from "redis";
 import type { PublicSessionCoordinatorState } from "./public-session-coordinator.js";
+import type { WarmPoolState } from "./capacity-warm-pool.js";
+import type { ResearchPermitState } from "./research-permit-coordinator.js";
 
 const LOCK_TTL_MS = 15_000;
 const RENEW_LOCK_SCRIPT = `
@@ -14,7 +16,13 @@ const RELEASE_LOCK_SCRIPT = `
   end
   return 0
 `;
-type MemoryState = { state?: string; owner?: string; leaseExpiresAt?: number };
+type MemoryState = {
+  state?: string;
+  owner?: string;
+  leaseExpiresAt?: number;
+  capacity?: string;
+  researchPermits?: string;
+};
 const memoryStores = new Map<string, MemoryState>();
 
 /**
@@ -41,7 +49,12 @@ export class PublicSessionPersistence {
     }
     this.stateKey = `${namespace}:state`;
     this.lockKey = `${namespace}:gateway-lock`;
+    this.capacityKey = `${namespace}:capacity`;
+    this.researchPermitKey = `${namespace}:research-permits`;
   }
+
+  private readonly capacityKey: string;
+  private readonly researchPermitKey: string;
 
   async connect(): Promise<void> {
     if (this.memoryKey) {
@@ -89,6 +102,58 @@ export class PublicSessionPersistence {
       store.state = JSON.stringify(state);
     } else {
       await this.client!.set(this.stateKey, JSON.stringify(state));
+    }
+  }
+
+  async loadCapacityState(): Promise<WarmPoolState | undefined> {
+    this.assertConnected();
+    const raw = this.memoryKey
+      ? memoryStores.get(this.memoryKey)?.capacity
+      : await this.client!.get(this.capacityKey);
+    if (!raw) return undefined;
+    try {
+      return JSON.parse(raw) as WarmPoolState;
+    } catch {
+      throw new Error("stored warm-pool state is invalid JSON");
+    }
+  }
+
+  async saveCapacityState(state: WarmPoolState): Promise<void> {
+    this.assertConnected();
+    if (!(await this.renewLease())) {
+      throw new Error("public session gateway lost its Redis admission lease");
+    }
+    if (this.memoryKey) {
+      const store = memoryStores.get(this.memoryKey)!;
+      store.capacity = JSON.stringify(state);
+    } else {
+      await this.client!.set(this.capacityKey, JSON.stringify(state));
+    }
+  }
+
+  async loadResearchPermitState(): Promise<ResearchPermitState | undefined> {
+    this.assertConnected();
+    const raw = this.memoryKey
+      ? memoryStores.get(this.memoryKey)?.researchPermits
+      : await this.client!.get(this.researchPermitKey);
+    if (!raw) return undefined;
+    try {
+      return JSON.parse(raw) as ResearchPermitState;
+    } catch {
+      throw new Error("stored research-permit state is invalid JSON");
+    }
+  }
+
+  async saveResearchPermitState(state: ResearchPermitState): Promise<void> {
+    this.assertConnected();
+    if (!(await this.renewLease())) {
+      throw new Error("public session gateway lost its Redis admission lease");
+    }
+    if (this.memoryKey) {
+      const store = memoryStores.get(this.memoryKey)!;
+      store.researchPermits = JSON.stringify(state);
+    } else {
+      await this.client!.set(this.researchPermitKey, JSON.stringify(state));
     }
   }
 

@@ -573,6 +573,67 @@ export class PublicSessionCoordinator {
     };
   }
 
+  /**
+   * Export per-seat status for the warm-pool capacity planner. This is a pure
+   * read: no mutations, no access to secrets or Docker.
+   */
+  getSeatStatuses(): Array<{
+    workerId: string;
+    phase: "absent" | "starting" | "ready-idle" | "assigned" | "admitted" | "active" | "disconnected" | "recycling";
+    generation?: string;
+    sessionId?: string;
+    idleSinceMs?: number;
+  }> {
+    const now = this.now();
+    return [...this.workers.values()].map((worker) => {
+      let phase: ReturnType<typeof this.getSeatStatuses>[0]["phase"] = "absent";
+      let sessionId: string | undefined;
+      let idleSinceMs: number | undefined;
+
+      if (worker.sessionId) {
+        const session = this.sessions.get(worker.sessionId);
+        sessionId = session?.id;
+        if (session) {
+          switch (session.state) {
+            case "admitted":
+              phase = session.startedAt === undefined ? "admitted" : "starting";
+              break;
+            case "active":
+              if (session.disconnectedAt !== undefined) {
+                phase = "disconnected";
+              } else {
+                phase = "active";
+                if (session.lastActivityAt !== undefined) {
+                  idleSinceMs = Math.max(0, now - session.lastActivityAt);
+                }
+              }
+              break;
+            case "ended":
+              phase = "recycling";
+              break;
+            default:
+              phase = "assigned";
+              break;
+          }
+        }
+      } else if (worker.ready && worker.generation) {
+        phase = "ready-idle";
+      } else if (worker.replacementOfGeneration) {
+        phase = "recycling";
+      } else if (worker.requiresUnavailable) {
+        phase = "recycling";
+      }
+
+      return {
+        workerId: worker.id,
+        phase,
+        ...(worker.generation ? { generation: worker.generation } : {}),
+        ...(sessionId ? { sessionId } : {}),
+        ...(idleSinceMs !== undefined ? { idleSinceMs } : {}),
+      };
+    });
+  }
+
   /** Persist only opaque ticket state; worker health is always re-probed after restart. */
   exportState(): PublicSessionCoordinatorState {
     return {

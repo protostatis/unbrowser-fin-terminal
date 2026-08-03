@@ -30,6 +30,13 @@ import {
   isWorkspaceCheckpointEnabled,
   workspaceServiceUrl,
 } from "../shared/financial-workspace-checkpoint.js";
+import { CapacityWarmPool } from "./capacity-warm-pool.js";
+import {
+  ResearchPermitCoordinator,
+  type ResearchPermit,
+  type ResearchPermitState,
+} from "./research-permit-coordinator.js";
+import { startManagementApi } from "./private-management-api.js";
 
 const VISITOR_TOKEN_HEADER = "x-public-visitor-token";
 const TICKET_TOKEN_HEADER = "x-public-ticket-token";
@@ -50,6 +57,13 @@ const SESSION_ENDED_CLOSE_CODE = 4408;
 const WORKER_UNAVAILABLE_CLOSE_CODE = 4410;
 const WORKER_HEALTH_INTERVAL_MS = 2_000;
 const WORKER_HEALTH_TIMEOUT_MS = 1_500;
+const WARM_POOL_SCALE_DOWN_MS = 5 * 60_000; // 5 minutes idle before scale-down
+const WARM_POOL_WARM_SPARES = 1; // keep one ready-idle spare
+const RESEARCH_PERMIT_MAX_CONCURRENT = 2;
+const RESEARCH_PERMIT_MAX_QUEUE = 24;
+const RESEARCH_PERMIT_QUEUE_TTL_MS = 30 * 60_000; // 30 minutes in queue
+const RESEARCH_PERMIT_ACQUIRE_TTL_MS = 12 * 60_000; // 12 minutes max hold
+const RESEARCH_PERMIT_HEARTBEAT_MS = 30_000; // 30 seconds
 
 type TurnstileVerification = { success?: unknown; hostname?: unknown; action?: unknown };
 
@@ -414,12 +428,34 @@ export async function startPublicLiveGateway(): Promise<PublicLiveGateway> {
     const restored = await persistence.load();
     if (restored) coordinator.restore(restored);
 
+    // ── Warm-pool capacity planner ──────────────────────────────────────
+    const warmPool = new CapacityWarmPool({
+      totalSeats: config.workerEndpoints.length,
+      idleScaleDownMs: WARM_POOL_SCALE_DOWN_MS,
+      warmSpares: WARM_POOL_WARM_SPARES,
+    });
+    const capacityRestored = await persistence.loadCapacityState();
+    if (capacityRestored) warmPool.restore(capacityRestored);
+
+    // ── Research permit coordinator ─────────────────────────────────────
+    const researchPermits = new ResearchPermitCoordinator({
+      maxConcurrent: RESEARCH_PERMIT_MAX_CONCURRENT,
+      maxQueue: RESEARCH_PERMIT_MAX_QUEUE,
+      defaultQueueTtlMs: RESEARCH_PERMIT_QUEUE_TTL_MS,
+      heartbeatIntervalMs: RESEARCH_PERMIT_HEARTBEAT_MS,
+      acquireTtlMs: RESEARCH_PERMIT_ACQUIRE_TTL_MS,
+    });
+    const permitRestored = await persistence.loadResearchPermitState();
+    if (permitRestored) researchPermits.restore(permitRestored);
+
     let mutations = Promise.resolve();
     let fatal: ((error: unknown) => void) | undefined;
     const mutate = <T>(operation: () => T | Promise<T>): Promise<T> => {
       const result = mutations.then(async () => {
         const value = await operation();
         await persistence.save(coordinator.exportState());
+        await persistence.saveCapacityState(warmPool.exportState());
+        await persistence.saveResearchPermitState(researchPermits.exportState());
         return value;
       });
       mutations = result.then(() => undefined, (error) => {
@@ -484,7 +520,28 @@ export async function startPublicLiveGateway(): Promise<PublicLiveGateway> {
     });
     app.get("/api/ready", async (_request, response) => {
       try {
-        const metrics = await inspect(() => coordinator.metrics());
+        const metrics = await inspect(() => {
+          const coordinatorMetrics = coordinator.metrics();
+          const seatStatuses = coordinator.getSeatStatuses();
+          const drainMap = new Map<string, boolean>();
+          for (const seat of seatStatuses) {
+            drainMap.set(seat.workerId, warmPool.isDraining(seat.workerId));
+          }
+          const seatsWithDrain = seatStatuses.map((s) => ({
+            ...s,
+            drainRequested: drainMap.get(s.workerId) ?? false,
+          }));
+          const plan = warmPool.plan(seatsWithDrain);
+          const permitMetrics = researchPermits.metrics();
+          return {
+            ...coordinatorMetrics,
+            desiredRunning: plan.desiredRunning,
+            totalSeats: config.workerEndpoints.length,
+            scaleDownCandidates: plan.scaleDownCandidates,
+            researchPermitsAquired: permitMetrics.acquired,
+            researchPermitsQueued: permitMetrics.queued,
+          };
+        });
         response.json({ status: "ready", publicLive: true, ...metrics });
       } catch {
         response.status(503).json({ status: "unavailable" });
@@ -965,6 +1022,34 @@ export async function startPublicLiveGateway(): Promise<PublicLiveGateway> {
           for (const { id, generation, probeEpoch } of results) {
             coordinator.setWorkerReady(id, Boolean(generation), generation, probeEpoch);
           }
+          // Run warm-pool planning: compute desired state and log scale-down/activate.
+          researchPermits.sweep();
+          const seatStatuses = coordinator.getSeatStatuses();
+          const drainMap = new Map<string, boolean>();
+          for (const seat of seatStatuses) {
+            drainMap.set(seat.workerId, warmPool.isDraining(seat.workerId));
+          }
+          const seatsWithDrain = seatStatuses.map((s) => ({
+            ...s,
+            drainRequested: drainMap.get(s.workerId) ?? false,
+            drainId: warmPool.getDrain(s.workerId)?.drainId,
+            drainGeneration: warmPool.getDrain(s.workerId)?.generation,
+            drainSinceMs: warmPool.getDrain(s.workerId)
+              ? Date.now() - (warmPool.getDrain(s.workerId)?.requestedAt ?? Date.now())
+              : undefined,
+          }));
+          const plan = warmPool.plan(seatsWithDrain);
+          if (plan.scaleDownCandidates.length > 0) {
+            console.log("[warm-pool] scale-down candidates:", plan.scaleDownCandidates.join(", "));
+          }
+          if (plan.activateCandidates.length > 0) {
+            console.log("[warm-pool] activate candidates:", plan.activateCandidates.join(", "));
+          }
+          console.log(
+            `[warm-pool] desired running=${plan.desiredRunning}, ` +
+            `current=${seatsWithDrain.filter((s) =>
+              s.phase !== "absent" && !s.drainRequested).length}`,
+          );
         });
       } finally {
         maintenanceRunning = false;
@@ -973,6 +1058,7 @@ export async function startPublicLiveGateway(): Promise<PublicLiveGateway> {
     let timer: ReturnType<typeof setInterval> | undefined;
     let closing = false;
     let signalHandler: (() => void) | undefined;
+    let managementApi: ReturnType<typeof startManagementApi> | undefined;
     const close = async () => {
       if (closing) return;
       closing = true;
@@ -983,6 +1069,7 @@ export async function startPublicLiveGateway(): Promise<PublicLiveGateway> {
       if (timer) clearInterval(timer);
       for (const bridge of bridges.values()) closeBridge(bridge, 1012, "Public gateway shutting down");
       browserWss.close();
+      if (managementApi) await managementApi.close();
       if (server.listening) {
         await new Promise<void>((resolve) => server.close(() => resolve()));
       }
@@ -1008,6 +1095,45 @@ export async function startPublicLiveGateway(): Promise<PublicLiveGateway> {
     server.on("error", fatal);
     timer = setInterval(() => void maintenance().catch((error) => fatal?.(error)), WORKER_HEALTH_INTERVAL_MS);
     timer.unref();
+
+    // ── Private management API ───────────────────────────────────────────
+    const managementToken = process.env.MANAGEMENT_API_TOKEN?.trim();
+    const managementPort = Number(process.env.MANAGEMENT_API_PORT?.trim() ?? 8789);
+    const managementEnabled = Boolean(
+      managementToken && managementToken.length >= 32,
+    );
+    if (managementEnabled) {
+      managementApi = startManagementApi(
+        {
+          host: config.host,
+          port: managementPort,
+          token: managementToken!,
+          enabled: managementEnabled,
+        },
+        {
+          getSeatStatuses: () => {
+            const seatStatuses = coordinator.getSeatStatuses();
+            const drainMap = new Map<string, boolean>();
+            for (const seat of seatStatuses) {
+              drainMap.set(seat.workerId, warmPool.isDraining(seat.workerId));
+            }
+            return seatStatuses.map((s) => ({
+              ...s,
+              drainRequested: drainMap.get(s.workerId) ?? false,
+              drainId: warmPool.getDrain(s.workerId)?.drainId,
+              drainGeneration: warmPool.getDrain(s.workerId)?.generation,
+              drainSinceMs: warmPool.getDrain(s.workerId)
+                ? Date.now() - (warmPool.getDrain(s.workerId)?.requestedAt ?? Date.now())
+                : undefined,
+            }));
+          },
+          getWarmPool: () => warmPool,
+          getResearchCoordinator: () => researchPermits,
+          mutate,
+          inspect,
+        },
+      );
+    }
     signalHandler = () => void close();
     process.once("SIGINT", signalHandler);
     process.once("SIGTERM", signalHandler);
