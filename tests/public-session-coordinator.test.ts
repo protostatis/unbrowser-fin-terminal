@@ -1,12 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  PUBLIC_ENDED_SESSION_RETENTION_MS,
   PublicSessionCoordinator,
   type PublicSessionEndReason,
 } from "../server/public-session-coordinator.js";
 
-function createCoordinator(overrides: Partial<ConstructorParameters<typeof PublicSessionCoordinator>[0]> = {}) {
-  let now = 1_700_000_000_000;
+function createCoordinator(
+  overrides: Partial<ConstructorParameters<typeof PublicSessionCoordinator>[0]> = {},
+  initialNow = 1_700_000_000_000,
+) {
+  let now = initialNow;
   const ended: Array<{ id: string; reason: PublicSessionEndReason }> = [];
   const coordinator = new PublicSessionCoordinator({
     workerIds: ["seat-01", "seat-02"],
@@ -140,19 +144,127 @@ test("research reservations make the daily public budget a hard conservative cap
   });
 });
 
-test("UTC day rollover resets only the conservative daily reservation counter", () => {
+test("UTC day rollover carries active reservations into the new daily ceiling", () => {
   const { coordinator, advance } = createCoordinator({
-    workerIds: ["seat-01"],
+    workerIds: ["seat-01", "seat-02"],
     dailyBudgetMicroUsd: 1_000_000,
     researchRunReservationMicroUsd: 200_000,
-  });
+  }, Date.parse("2026-08-02T23:59:50.000Z"));
   coordinator.setWorkerReady("seat-01", true, "instance-a");
+  coordinator.setWorkerReady("seat-02", true, "instance-b");
   const first = coordinator.admit("visitor-a");
   assert.equal(first.accepted, true);
+  if (!first.accepted) return;
+  assert.ok(coordinator.attach(first.session.id));
   assert.equal(coordinator.metrics().dailyReservedMicroUsd, 1_000_000);
-  advance(24 * 60 * 60_000);
+  advance(20_000);
   coordinator.sweep();
-  assert.equal(coordinator.metrics().dailyReservedMicroUsd, 0);
+  assert.equal(coordinator.metrics().dailyReservedMicroUsd, 1_000_000);
+
+  const second = coordinator.admit("visitor-b");
+  assert.equal(second.accepted, true);
+  if (second.accepted) {
+    assert.equal(coordinator.status(second.session.id)?.endReason, "daily-budget-exhausted");
+  }
+});
+
+test("a stale socket detach cannot disconnect its newer replacement", () => {
+  const { coordinator, advance } = createCoordinator({ workerIds: ["seat-01"] });
+  coordinator.setWorkerReady("seat-01", true, "instance-a");
+  const admitted = coordinator.admit("visitor-a");
+  assert.equal(admitted.accepted, true);
+  if (!admitted.accepted) return;
+
+  const first = coordinator.attach(admitted.session.id);
+  const replacement = coordinator.attach(admitted.session.id);
+  assert.ok(first && replacement);
+  if (!first || !replacement) return;
+  assert.ok(replacement.connectionVersion > first.connectionVersion);
+
+  coordinator.detach(admitted.session.id, first.connectionVersion);
+  advance(30_000);
+  coordinator.sweep();
+  assert.equal(coordinator.status(admitted.session.id)?.state, "active");
+
+  coordinator.detach(admitted.session.id, replacement.connectionVersion);
+  advance(30_000);
+  coordinator.sweep();
+  assert.equal(coordinator.status(admitted.session.id)?.endReason, "disconnect-timeout");
+});
+
+test("a worker generation reached after assignment is fenced until replacement", () => {
+  const { coordinator } = createCoordinator({ workerIds: ["seat-01"] });
+  coordinator.setWorkerReady("seat-01", true, "instance-a");
+  const admitted = coordinator.admit("visitor-a");
+  assert.equal(admitted.accepted, true);
+  if (!admitted.accepted) return;
+  const assignment = coordinator.attach(admitted.session.id);
+  assert.ok(assignment);
+  if (!assignment) return;
+  assert.equal(assignment.workerGeneration, "instance-a");
+
+  assert.equal(coordinator.confirmWorkerGeneration(
+    assignment.id,
+    assignment.connectionVersion,
+    "instance-b",
+  ), false);
+  assert.equal(coordinator.status(assignment.id)?.endReason, "worker-unavailable");
+  coordinator.setWorkerReady("seat-01", true, "instance-b");
+  assert.equal(coordinator.metrics().readyWorkers, 0);
+  coordinator.setWorkerReady("seat-01", true, "instance-c");
+  assert.equal(coordinator.metrics().readyWorkers, 1);
+});
+
+test("a missing worker generation header requires an unavailable transition", () => {
+  const { coordinator } = createCoordinator({ workerIds: ["seat-01"] });
+  coordinator.setWorkerReady("seat-01", true, "instance-a");
+  const admitted = coordinator.admit("visitor-a");
+  assert.equal(admitted.accepted, true);
+  if (!admitted.accepted) return;
+  const assignment = coordinator.attach(admitted.session.id);
+  assert.ok(assignment);
+  if (!assignment) return;
+
+  assert.equal(coordinator.confirmWorkerGeneration(
+    assignment.id,
+    assignment.connectionVersion,
+    undefined,
+  ), false);
+  coordinator.setWorkerReady("seat-01", true, "instance-b");
+  assert.equal(coordinator.metrics().readyWorkers, 0);
+  coordinator.setWorkerReady("seat-01", false);
+  coordinator.setWorkerReady("seat-01", true, "instance-b");
+  assert.equal(coordinator.metrics().readyWorkers, 1);
+});
+
+test("an unvisited assignment safely follows a newly probed worker generation", () => {
+  const { coordinator } = createCoordinator({ workerIds: ["seat-01"] });
+  coordinator.setWorkerReady("seat-01", true, "instance-a");
+  const admitted = coordinator.admit("visitor-a");
+  assert.equal(admitted.accepted, true);
+  if (!admitted.accepted) return;
+
+  coordinator.setWorkerReady("seat-01", true, "instance-b");
+  const assignment = coordinator.attach(admitted.session.id);
+  assert.equal(assignment?.workerGeneration, "instance-b");
+});
+
+test("ended ticket tombstones expire from persisted admission state", () => {
+  const { coordinator, advance } = createCoordinator({ workerIds: ["seat-01"] });
+  coordinator.setWorkerReady("seat-01", true, "instance-a");
+  const admitted = coordinator.admit("visitor-a");
+  assert.equal(admitted.accepted, true);
+  if (!admitted.accepted) return;
+  const assignment = coordinator.attach(admitted.session.id);
+  assert.ok(assignment);
+  if (!assignment) return;
+  coordinator.terminate(admitted.session.id, "protocol-violation");
+  assert.equal(coordinator.status(admitted.session.id)?.state, "ended");
+
+  advance(PUBLIC_ENDED_SESSION_RETENTION_MS);
+  coordinator.sweep();
+  assert.equal(coordinator.status(admitted.session.id), undefined);
+  assert.equal(coordinator.exportState().sessions.length, 0);
 });
 
 test("persisted admission state restores opaque tickets but re-probes worker health", () => {

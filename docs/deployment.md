@@ -68,20 +68,33 @@ deployment fallback for a normal terminal release.
 - The public-live gateway verifies Turnstile, serializes FIFO admission through
   a Redis lease, reserves conservative per-session research budget, and proxies
   each signed opaque ticket to one isolated worker. The browser never reaches a
-  worker directly.
+  worker directly. Active reservations carry across UTC rollover so work that
+  starts after midnight cannot consume the next calendar day's budget twice.
 - Production requires an exact allowed origin, Redis, session-signing key,
-  worker proxy token, Turnstile keys, and a worker endpoint list exactly matching
-  the configured seat count. Turnstile bypass and memory persistence are
-  development-only and fail closed in production.
+  separate edge-proxy and worker-proxy tokens, Turnstile keys, and a worker
+  endpoint list exactly matching the configured seat count. Turnstile bypass
+  and memory persistence are development-only and fail closed in production.
 - Disposable workers use `PUBLIC_SESSION_WORKER=1`, one research worker,
   explicit model configuration, matching timeout/run limits, isolated source
   extraction, and no public ingress. A worker reached by a visitor is not
-  reusable until a replacement generation passes readiness.
+  reusable until a replacement generation passes readiness. The gateway must
+  confirm the authenticated worker WebSocket generation header before relaying
+  queued browser input or worker output.
+- Public browser messages are semantically allowlisted, rate-limited, and
+  backpressure-bounded. Worker frames are text-only, schema-checked, and bounded
+  before crossing the public boundary. Public token/status responses are marked
+  `no-store`.
 - Replay remains available as a separate static fallback. It starts no
   AgentSession, WebSocket, model, or source request.
-- The container listens on port `8787`; `/api/ready` is the readiness check.
-- Caddy owns route authorization and injects the terminal proxy token. Do not
-  expose port `8787` directly or bypass Caddy.
+- Authenticated/worker containers listen on `8787`; the public gateway uses its
+  separately configured port (the pilot overlay uses `8788`). `/api/ready` is
+  the readiness check for each mode.
+- Caddy owns authenticated-terminal route authorization and injects its terminal
+  proxy token. For public live, Caddy must strip and overwrite `X-Real-IP`; the
+  gateway trusts that value only when Caddy also strips and overwrites
+  `X-Fin-Terminal-Edge-Token` with `PUBLIC_EDGE_PROXY_TOKEN`, and enforces both
+  visitor-IP and proxy-peer admission limits. Do not expose either terminal
+  container port directly or bypass Caddy.
 - Production research uses the Docker-internal `unbrowser-mcp` endpoint. Do
   not substitute the shared public development endpoint.
 - The terminal remains a singleton per process. Approved operators share the
@@ -102,13 +115,21 @@ deployment fallback for a normal terminal release.
 - Confirm `/unbrowser/fin-terminal-demo/api/public/config` returns a signed
   opaque visitor token and only public limits/site-key metadata.
 - Confirm invalid origin and Turnstile admission attempts fail closed.
+- Confirm Turnstile verification is bound to the production hostname and the
+  `public_terminal_admission` widget action.
 - Confirm FIFO assignment, queue/ticket expiry, reconnect grace, idle timeout,
   absolute timeout, and per-session research launch limits.
 - Confirm the browser WebSocket reaches only the gateway, an assigned worker is
   replaced after session end, and a stale worker generation cannot re-enter the
   ready pool.
+- Confirm an overlapping browser reconnect does not let the stale socket close
+  expire its replacement, and a generation change between health probe and
+  worker WebSocket attachment ends and fences the ticket.
+- Confirm oversized, binary, malformed, and sustained-rate browser/worker
+  traffic is rejected without unbounded gateway or Redis work.
 - Confirm the daily reservation ceiling rejects new seats before configured
-  spend can be exceeded.
+  spend can be exceeded, including while an active reservation crosses UTC
+  midnight.
 - If replay fallback is deployed separately, confirm it serves immutable replay
   artifacts and rejects WebSocket upgrades.
 

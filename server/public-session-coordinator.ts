@@ -16,6 +16,8 @@ export type PublicSessionEndReason =
   | "absolute-timeout"
   | "disconnect-timeout"
   | "worker-unavailable"
+  | "rate-limited"
+  | "protocol-violation"
   | "daily-budget-exhausted";
 
 export interface PublicSessionSnapshot {
@@ -35,6 +37,8 @@ export interface PublicWorkerAssignment {
   id: string;
   visitorId: string;
   workerId: string;
+  workerGeneration: string;
+  connectionVersion: number;
   sessionExpiresAt: number;
   idleExpiresAt: number;
   researchRunsRemaining: number;
@@ -73,8 +77,10 @@ export interface PublicSessionCoordinatorState {
     startedAt?: number;
     lastActivityAt?: number;
     disconnectedAt?: number;
+    connectionVersion: number;
     researchRuns: number;
     researchReservedMicroUsd: number;
+    endedAt?: number;
     endReason?: PublicSessionEndReason;
   }>;
   workers: Array<{
@@ -82,6 +88,7 @@ export interface PublicSessionCoordinatorState {
     sessionId?: string;
     generation?: string;
     replacementOfGeneration?: string;
+    requiresUnavailable?: boolean;
   }>;
 }
 
@@ -105,8 +112,10 @@ type Session = {
   startedAt?: number;
   lastActivityAt?: number;
   disconnectedAt?: number;
+  connectionVersion: number;
   researchRuns: number;
   researchReservedMicroUsd: number;
+  endedAt?: number;
   endReason?: PublicSessionEndReason;
 };
 
@@ -116,9 +125,12 @@ type WorkerSlot = {
   sessionId?: string;
   generation?: string;
   replacementOfGeneration?: string;
+  requiresUnavailable: boolean;
 };
 
 const NOOP = () => {};
+export const PUBLIC_ENDED_SESSION_RETENTION_MS = 2 * 60_000;
+const MAX_ENDED_SESSION_TOMBSTONES = 1_000;
 
 function assertPositiveInteger(name: string, value: number): void {
   if (!Number.isInteger(value) || value <= 0) {
@@ -159,7 +171,9 @@ export class PublicSessionCoordinator {
     assertPositiveInteger("dailyBudgetMicroUsd", options.dailyBudgetMicroUsd);
     assertPositiveInteger("researchRunReservationMicroUsd", options.researchRunReservationMicroUsd);
 
-    for (const id of options.workerIds) this.workers.set(id, { id, ready: false });
+    for (const id of options.workerIds) {
+      this.workers.set(id, { id, ready: false, requiresUnavailable: false });
+    }
     this.now = options.now ?? Date.now;
     let sequence = 0;
     this.createId = options.createId ?? (() => `public-${this.now().toString(36)}-${(++sequence).toString(36)}`);
@@ -188,6 +202,7 @@ export class PublicSessionCoordinator {
       state: "queued",
       createdAt: now,
       ticketExpiresAt: now + this.options.ticketTtlMs,
+      connectionVersion: 0,
       researchRuns: 0,
       researchReservedMicroUsd: 0,
     };
@@ -202,24 +217,92 @@ export class PublicSessionCoordinator {
   setWorkerReady(workerId: string, ready: boolean, generation?: string): void {
     const worker = this.workers.get(workerId);
     if (!worker) throw new Error(`unknown public worker "${workerId}"`);
-    if (!ready) {
+    if (!ready || !generation) {
       worker.ready = false;
-    } else if (!worker.sessionId) {
-      if (worker.replacementOfGeneration && generation === worker.replacementOfGeneration) {
-        // A stale health response from the terminated tenant process must never
-        // return its slot to the queue before Compose has replaced it.
-        worker.ready = false;
-      } else {
-        worker.ready = true;
-        if (generation) worker.generation = generation;
-        worker.replacementOfGeneration = undefined;
+      worker.requiresUnavailable = false;
+      if (worker.sessionId) {
+        const session = this.sessions.get(worker.sessionId);
+        if (session && session.state !== "ended") this.end(session, "worker-unavailable");
       }
-    }
-    if (!ready && worker.sessionId) {
+    } else if (worker.sessionId) {
       const session = this.sessions.get(worker.sessionId);
-      if (session && session.state !== "ended") this.end(session, "worker-unavailable");
+      if (!session || session.state === "ended") {
+        worker.sessionId = undefined;
+        this.markIdleWorkerReady(worker, generation);
+      } else if (generation === session.workerGeneration) {
+        worker.generation = generation;
+      } else if (session.startedAt === undefined) {
+        // No browser has reached this seat, so rebinding an admitted ticket to
+        // the newly observed pristine generation is safe.
+        worker.generation = generation;
+        session.workerGeneration = generation;
+      } else if (session.disconnectedAt !== undefined) {
+        // The old tenant connection is gone and no replacement attach is in
+        // flight. End its ticket before making the pristine generation ready.
+        this.end(session, "worker-unavailable");
+        this.markIdleWorkerReady(worker, generation);
+      } else {
+        // An attachment is connected or in flight. Its authenticated upgrade
+        // header decides whether this generation has received tenant state.
+        worker.ready = false;
+      }
+    } else {
+      this.markIdleWorkerReady(worker, generation);
     }
     this.pump();
+  }
+
+  /** Confirm that the assigned internal WebSocket reached the probed process. */
+  confirmWorkerGeneration(
+    sessionId: string,
+    connectionVersion: number,
+    observedGeneration: string | undefined,
+  ): boolean {
+    const session = this.sessions.get(sessionId);
+    if (
+      !session
+      || session.state !== "active"
+      || session.connectionVersion !== connectionVersion
+      || !session.workerId
+    ) {
+      return false;
+    }
+    const worker = this.workers.get(session.workerId);
+    if (!worker || worker.sessionId !== session.id) return false;
+    if (observedGeneration && observedGeneration === session.workerGeneration) {
+      worker.generation = observedGeneration;
+      return true;
+    }
+
+    // A successful WebSocket handshake already initializes tenant state in
+    // the worker. Fence the generation actually reached so it cannot be handed
+    // to another visitor before that process is replaced.
+    if (observedGeneration) {
+      session.workerGeneration = observedGeneration;
+      worker.generation = observedGeneration;
+    } else {
+      // Without an authenticated generation header, a preceding health probe
+      // cannot identify the process that accepted the connection. Require an
+      // observed unavailable transition before any process can re-enter.
+      worker.requiresUnavailable = true;
+    }
+    this.end(session, "worker-unavailable");
+    return false;
+  }
+
+  private markIdleWorkerReady(worker: WorkerSlot, generation: string): void {
+    if (
+      worker.requiresUnavailable
+      || (worker.replacementOfGeneration && generation === worker.replacementOfGeneration)
+    ) {
+      // A stale health response from the terminated tenant process must never
+      // return its slot to the queue before Compose has replaced it.
+      worker.ready = false;
+    } else {
+      worker.ready = true;
+      worker.generation = generation;
+      worker.replacementOfGeneration = undefined;
+    }
   }
 
   /** Attach a browser WebSocket to an admitted session. */
@@ -234,6 +317,7 @@ export class PublicSessionCoordinator {
     }
     session.lastActivityAt = now;
     session.disconnectedAt = undefined;
+    session.connectionVersion += 1;
     return this.assignment(session);
   }
 
@@ -259,14 +343,21 @@ export class PublicSessionCoordinator {
   }
 
   /** Start disconnect grace instead of immediately reassigning an active seat. */
-  detach(sessionId: string): void {
+  detach(sessionId: string, connectionVersion: number): void {
     const session = this.sessions.get(sessionId);
-    if (session?.state === "active") session.disconnectedAt = this.now();
+    if (session?.state === "active" && session.connectionVersion === connectionVersion) {
+      session.disconnectedAt = this.now();
+    }
+  }
+
+  /** End a browser capability after a public-boundary policy violation. */
+  terminate(sessionId: string, reason: "rate-limited" | "protocol-violation"): void {
+    const session = this.sessions.get(sessionId);
+    if (session && session.state !== "ended") this.end(session, reason);
   }
 
   /** Get a pollable status snapshot without exposing internal credentials. */
   status(sessionId: string): PublicSessionSnapshot | undefined {
-    this.sweep();
     const session = this.sessions.get(sessionId);
     return session ? this.snapshot(session) : undefined;
   }
@@ -274,7 +365,6 @@ export class PublicSessionCoordinator {
   /** Run expiry checks and assign newly healthy seats to queued visitors. */
   sweep(): void {
     const now = this.now();
-    this.resetDailyBudgetIfNeeded(now);
     for (const session of this.sessions.values()) {
       if (session.state === "queued" && now >= session.ticketExpiresAt) {
         this.end(session, "ticket-expired");
@@ -295,6 +385,8 @@ export class PublicSessionCoordinator {
         this.end(session, "idle-timeout");
       }
     }
+    this.resetDailyBudgetIfNeeded(now);
+    this.pruneEndedSessions(now);
     this.pump();
   }
 
@@ -306,7 +398,6 @@ export class PublicSessionCoordinator {
     dailyReservedMicroUsd: number;
     dailyBudgetMicroUsd: number;
   } {
-    this.sweep();
     let readyWorkers = 0;
     let assignedWorkers = 0;
     for (const worker of this.workers.values()) {
@@ -335,11 +426,13 @@ export class PublicSessionCoordinator {
         sessionId,
         generation,
         replacementOfGeneration,
+        requiresUnavailable,
       }) => ({
         id,
         ...(sessionId ? { sessionId } : {}),
         ...(generation ? { generation } : {}),
         ...(replacementOfGeneration ? { replacementOfGeneration } : {}),
+        ...(requiresUnavailable ? { requiresUnavailable: true } : {}),
       })),
     };
   }
@@ -369,7 +462,13 @@ export class PublicSessionCoordinator {
       if (!["queued", "admitted", "active", "ended"].includes(raw.state)) {
         throw new Error("invalid persisted public session state");
       }
-      const session: Session = { ...raw };
+      const session: Session = {
+        ...raw,
+        connectionVersion: Number.isInteger(raw.connectionVersion) && raw.connectionVersion >= 0
+          ? raw.connectionVersion
+          : 0,
+        ...(raw.state === "ended" && !Number.isFinite(raw.endedAt) ? { endedAt: now } : {}),
+      };
       // A gateway restart severs browser proxy connections. Keep the original
       // absolute limit but make reconnect grace explicit until the browser
       // attaches through the replacement gateway.
@@ -385,6 +484,7 @@ export class PublicSessionCoordinator {
       worker.sessionId = persisted?.sessionId;
       worker.generation = persisted?.generation;
       worker.replacementOfGeneration = persisted?.replacementOfGeneration;
+      worker.requiresUnavailable = persisted?.requiresUnavailable === true;
       worker.ready = false;
     }
     this.dailyBudgetDay = state.dailyBudgetDay;
@@ -422,6 +522,7 @@ export class PublicSessionCoordinator {
     const hadConnectedBrowser = session.startedAt !== undefined;
     session.state = "ended";
     session.endReason = reason;
+    session.endedAt = this.now();
     this.visitorSessions.delete(session.visitorId);
     if (session.workerId) {
       const worker = this.workers.get(session.workerId);
@@ -432,10 +533,15 @@ export class PublicSessionCoordinator {
           // replacement must pass a health check before this slot becomes ready.
           worker.ready = false;
           worker.replacementOfGeneration = session.workerGeneration ?? worker.generation;
-        } else {
+        } else if (reason !== "worker-unavailable") {
           // An admitted visitor never opened a browser socket, so the worker
           // has no tenant panel or agent state to discard.
           worker.ready = true;
+          worker.replacementOfGeneration = undefined;
+        } else {
+          // A failed health probe cannot return an unvisited seat to service.
+          // Any later healthy generation may re-enter through setWorkerReady.
+          worker.ready = false;
           worker.replacementOfGeneration = undefined;
         }
       }
@@ -468,13 +574,20 @@ export class PublicSessionCoordinator {
   }
 
   private assignment(session: Session): PublicWorkerAssignment {
-    if (!session.workerId || session.startedAt === undefined || session.lastActivityAt === undefined) {
+    if (
+      !session.workerId
+      || !session.workerGeneration
+      || session.startedAt === undefined
+      || session.lastActivityAt === undefined
+    ) {
       throw new Error("cannot assign a session without a worker and active lease");
     }
     return {
       id: session.id,
       visitorId: session.visitorId,
       workerId: session.workerId,
+      workerGeneration: session.workerGeneration,
+      connectionVersion: session.connectionVersion,
       sessionExpiresAt: session.startedAt + this.options.absoluteTimeoutMs,
       idleExpiresAt: session.lastActivityAt + this.options.idleTimeoutMs,
       researchRunsRemaining: this.options.maxResearchRuns - session.researchRuns,
@@ -491,6 +604,29 @@ export class PublicSessionCoordinator {
     const day = utcDay(now);
     if (day === this.dailyBudgetDay) return;
     this.dailyBudgetDay = day;
-    this.dailyReservedMicroUsd = 0;
+    // An active session can launch its already-reserved research after UTC
+    // midnight. Carry the full reservation forward so the new calendar day
+    // cannot allocate the same budget a second time.
+    this.dailyReservedMicroUsd = [...this.sessions.values()]
+      .filter((session) => session.state === "admitted" || session.state === "active")
+      .reduce((total, session) => total + session.researchReservedMicroUsd, 0);
+  }
+
+  private pruneEndedSessions(now: number): void {
+    const retained: Session[] = [];
+    for (const session of this.sessions.values()) {
+      if (session.state !== "ended") continue;
+      const endedAt = session.endedAt ?? now;
+      if (now - endedAt >= PUBLIC_ENDED_SESSION_RETENTION_MS) {
+        this.sessions.delete(session.id);
+      } else {
+        retained.push(session);
+      }
+    }
+    if (retained.length <= MAX_ENDED_SESSION_TOMBSTONES) return;
+    retained.sort((left, right) => (left.endedAt ?? 0) - (right.endedAt ?? 0));
+    for (const session of retained.slice(0, retained.length - MAX_ENDED_SESSION_TOMBSTONES)) {
+      this.sessions.delete(session.id);
+    }
   }
 }

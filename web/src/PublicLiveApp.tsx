@@ -27,6 +27,7 @@ type TurnstileApi = {
     callback: (token: string) => void;
     "error-callback": () => void;
     "expired-callback": () => void;
+    action: "public_terminal_admission";
     theme: "dark";
   }): string;
   remove(widgetId: string): void;
@@ -109,6 +110,10 @@ function endMessage(reason?: string): string {
       return "Your fifteen-minute public terminal session has ended.";
     case "worker-unavailable":
       return "The assigned terminal worker restarted. You can request a fresh session.";
+    case "rate-limited":
+      return "This session exceeded the public terminal activity limit. You can request a fresh session.";
+    case "protocol-violation":
+      return "This session sent an unsupported terminal message and was closed for safety.";
     default:
       return "This public terminal session is no longer available. Request a new seat to continue.";
   }
@@ -174,6 +179,7 @@ export function PublicLiveApp({
       if (!active || !captchaRef.current) return;
       widgetIdRef.current = turnstile.render(captchaRef.current, {
         sitekey: config.turnstileSiteKey,
+        action: "public_terminal_admission",
         theme: "dark",
         callback: (token) => {
           setChallengeToken(token);

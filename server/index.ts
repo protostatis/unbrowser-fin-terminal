@@ -193,6 +193,7 @@ else {
 
   // ── Live-only constants ─────────────────────────────────────────────────
   const PRINCIPAL_HEADER = "x-fin-terminal-user";
+  const PUBLIC_WORKER_GENERATION_HEADER = "X-Fin-Terminal-Worker-Generation";
   const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
   const CLIENT_REPLACED_CLOSE_CODE = 4001;
   const publicSessionWorker = readPublicSessionWorkerConfig();
@@ -429,6 +430,14 @@ else {
       done(true);
     },
   });
+  if (publicWorkerInstanceId) {
+    wss.on("headers", (headers) => {
+      // The gateway compares this authenticated internal handshake with the
+      // generation it probed before assigning the seat. Browser-controlled
+      // traffic never reaches this worker listener directly.
+      headers.push(`${PUBLIC_WORKER_GENERATION_HEADER}: ${publicWorkerInstanceId}`);
+    });
+  }
 
   const publicWorkerLifecycle = publicSessionWorker.enabled
     ? new PublicSessionWorkerLifecycle({

@@ -12,6 +12,7 @@ export interface PublicLiveGatewayConfig {
   publicOrigin: string;
   redisUrl: string;
   signingKey: string;
+  edgeProxyToken: string;
   workerProxyToken: string;
   turnstileSiteKey: string;
   turnstileSecret: string;
@@ -189,6 +190,11 @@ export function readPublicLiveGatewayConfig(
   const maxSessions = integer(env, "PUBLIC_MAX_SESSIONS", 10, 1, 10);
   const signingKey = required(env, "PUBLIC_SESSION_SIGNING_KEY");
   if (signingKey.length < 32) throw new Error("PUBLIC_SESSION_SIGNING_KEY must be at least 32 characters");
+  const edgeProxyToken = optional(env.PUBLIC_EDGE_PROXY_TOKEN) ?? "";
+  if (isProduction && !edgeProxyToken) throw new Error("PUBLIC_EDGE_PROXY_TOKEN is required in production");
+  if (edgeProxyToken && edgeProxyToken.length < 32) {
+    throw new Error("PUBLIC_EDGE_PROXY_TOKEN must be at least 32 characters");
+  }
 
   return {
     host: optional(env.HOST) ?? "127.0.0.1",
@@ -197,6 +203,7 @@ export function readPublicLiveGatewayConfig(
     publicOrigin: canonicalOrigin(required(env, "PUBLIC_ALLOWED_ORIGIN"), "PUBLIC_ALLOWED_ORIGIN"),
     redisUrl: redisUrl(required(env, "PUBLIC_REDIS_URL"), isProduction),
     signingKey,
+    edgeProxyToken,
     workerProxyToken: required(env, "PUBLIC_WORKER_PROXY_TOKEN"),
     turnstileSiteKey: turnstileRequired ? required(env, "PUBLIC_TURNSTILE_SITE_KEY") : "",
     turnstileSecret: turnstileRequired ? required(env, "PUBLIC_TURNSTILE_SECRET") : "",

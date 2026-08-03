@@ -12,6 +12,7 @@ function configEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
     PUBLIC_ALLOWED_ORIGIN: "https://unbrowser.unchainedsky.com",
     PUBLIC_REDIS_URL: "redis://redis:6379/0",
     PUBLIC_SESSION_SIGNING_KEY: "01234567890123456789012345678901",
+    PUBLIC_EDGE_PROXY_TOKEN: "edge-proxy-token-0123456789012345",
     PUBLIC_WORKER_PROXY_TOKEN: "worker-proxy-token",
     PUBLIC_TURNSTILE_SITE_KEY: "turnstile-site-key",
     PUBLIC_TURNSTILE_SECRET: "turnstile-secret",
@@ -30,6 +31,7 @@ test("public live gateway requires an explicit, bounded isolated-worker contract
   assert.equal(config.absoluteTimeoutMs, 900_000);
   assert.equal(config.maxResearchRuns, 5);
   assert.equal(config.dailyBudgetMicroUsd, 10_000_000);
+  assert.equal(config.edgeProxyToken, "edge-proxy-token-0123456789012345");
 });
 
 test("public gateway rejects unsafe origins, worker endpoints, and impossible budget reservations", () => {
@@ -44,6 +46,10 @@ test("public gateway rejects unsafe origins, worker endpoints, and impossible bu
   assert.throws(
     () => readPublicLiveGatewayConfig(configEnv({ PUBLIC_WORKER_ENDPOINTS: "seat-01=http://worker-01:8787" })),
     /exactly PUBLIC_MAX_SESSIONS workers/,
+  );
+  assert.throws(
+    () => readPublicLiveGatewayConfig(configEnv({ PUBLIC_EDGE_PROXY_TOKEN: "" })),
+    /PUBLIC_EDGE_PROXY_TOKEN is required in production/,
   );
   assert.throws(
     () => readPublicLiveGatewayConfig(configEnv({

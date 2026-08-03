@@ -150,8 +150,9 @@ docker build \
 
 The gateway requires `TERMINAL_RUNTIME_MODE=public-gateway`, an exact
 `PUBLIC_ALLOWED_ORIGIN`, Redis, a 32+ character session-signing key, an internal
-worker proxy token, Turnstile keys, and an explicit `PUBLIC_WORKER_ENDPOINTS`
-list matching `PUBLIC_MAX_SESSIONS`. Production forbids
+worker proxy token, a separate 32+ character `PUBLIC_EDGE_PROXY_TOKEN`,
+Turnstile keys, and an explicit `PUBLIC_WORKER_ENDPOINTS` list matching
+`PUBLIC_MAX_SESSIONS`. Production forbids
 `PUBLIC_TURNSTILE_BYPASS=1` and `memory://` persistence.
 
 Every worker sets `PUBLIC_SESSION_WORKER=1`,
@@ -159,10 +160,23 @@ Every worker sets `PUBLIC_SESSION_WORKER=1`,
 timeouts/run limit as the gateway, and the internal worker proxy token. Workers
 must be reachable only from the gateway network and replaced after any visitor
 reaches them. The gateway reserves the full configured per-session research
-budget before assigning a seat, so admission fails closed at the daily cap.
+budget before assigning a seat, carries active reservations across UTC rollover,
+and therefore fails closed at the daily cap.
+
+Before any worker content or queued browser input is relayed, the gateway
+compares the worker WebSocket generation header with the generation probed for
+that seat. A changed or missing generation ends the ticket and fences the
+reached process until replacement. Both WebSocket directions have payload and
+backpressure ceilings; browser messages also pass semantic validation and a
+per-connection token bucket. Ended ticket tombstones are short-lived and
+bounded rather than accumulated in Redis indefinitely.
 
 The defaults bound a visitor to a 10-minute queue ticket, 5-minute idle lease,
 15-minute absolute lease, 30-second reconnect grace, and five research launches.
+The public edge must strip and overwrite `X-Real-IP`; the gateway applies both
+visitor-IP and coarser proxy-peer admission limits. It trusts the forwarded
+address only when Caddy also overwrites `X-Fin-Terminal-Edge-Token` with the
+configured edge token. Never publish the gateway container port directly.
 See [`docs/deployment.md`](docs/deployment.md) for the release and verification
 contract. Account signup, persistent workspaces, claims, and billing shown in
 the conversion preview are design handoff only and are not wired into this
