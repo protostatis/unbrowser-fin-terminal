@@ -12,8 +12,10 @@ if (!/^\/(?:[A-Za-z0-9._~-]+\/)*$/.test(publicBasePath)) {
 
 // Legacy builds infer replay mode from the public-demo path. A public live
 // gateway keeps that stable URL but explicitly builds the real client with
-// VITE_TERMINAL_BUILD_MODE=public-live.
-const requestedBuildMode = process.env.VITE_TERMINAL_BUILD_MODE?.trim();
+// VITE_TERMINAL_BUILD_MODE=public-live. Normalize empty/whitespace to
+// undefined so the path-based default applies (the Dockerfile passes an empty
+// VITE_TERMINAL_BUILD_MODE, which ?? alone would treat as a valid value).
+const requestedBuildMode = process.env.VITE_TERMINAL_BUILD_MODE?.trim() || undefined;
 if (requestedBuildMode && !["replay", "live", "public-live"].includes(requestedBuildMode)) {
   throw new Error("VITE_TERMINAL_BUILD_MODE must be replay, live, or public-live");
 }
