@@ -4,10 +4,8 @@ import {
 } from "./WorkspaceCheckpointBanner";
 import {
   createSessionAccumulator,
-  recordEvent,
-  updateFrameState,
-  buildCheckpoint,
-  submitCheckpoint,
+  updateFrameActivity,
+  requestWorkspaceHandoff,
   type SessionAccumulator,
 } from "./workspace-checkpoint";
 import type { TerminalFrameState } from "./mobile-controls";
@@ -160,9 +158,10 @@ export function PublicLiveApp({
   const [hasMeaningfulActivity, setHasMeaningfulActivity] = useState(false);
 
   const handleFrameUpdate = useCallback(
-    (state: TerminalFrameState | undefined, dossier?: TerminalDossier) => {
+    (state: TerminalFrameState | undefined, _dossier?: TerminalDossier) => {
       const acc = accumulatorRef.current;
-      updateFrameState(acc, state, dossier);
+      // Local display gating only — checkpoint content is never built here.
+      updateFrameActivity(acc, state);
       if (acc.hasMeaningfulActivity) setHasMeaningfulActivity(true);
     },
     [],
@@ -300,34 +299,20 @@ export function PublicLiveApp({
   };
 
   // ── Checkpoint conversion handler ──────────────────────────────────────
-  const handleConvertToWorkspace = useCallback(async () => {
-    const acc = accumulatorRef.current;
-    const ticketToken = admission?.ticketToken ?? storedToken(TICKET_STORAGE_KEY);
-    if (!ticketToken) return;
-
-    const checkpoint = buildCheckpoint(
-      acc,
-      ticketToken,
-      0, // generation is internal, use 0 for now
-      undefined,
-    );
-
-    const result = await submitCheckpoint(
-      ticketToken,
-      ticketToken, // workerId not available to browser, use sessionId as fallback
-      0,
-      undefined,
-      checkpoint,
-    );
-
+  // The browser only initiates the opt-in; the gateway exports the
+  // authoritative checkpoint from the assigned worker and sets the HttpOnly
+  // handoff cookie. Returns true only after the handoff was durably created.
+  const handleConvertToWorkspace = useCallback(async (): Promise<boolean> => {
+    const result = await requestWorkspaceHandoff(publicHeaders(true));
     if (result.success) {
       // The handoff secret is delivered via HttpOnly cookie server-side.
       // Redirect to the auth URL for workspace handoff.
       window.location.href = result.result.authUrl;
-    } else {
-      console.error("[checkpoint] submission failed:", result.error);
+      return true;
     }
-  }, [admission?.ticketToken]);
+    console.error("[checkpoint] handoff failed:", result.error);
+    return false;
+  }, []);
 
   const ticketToken = admission?.ticketToken ?? storedToken(TICKET_STORAGE_KEY);
   if ((admission?.status === "admitted" || admission?.status === "active") && ticketToken) {

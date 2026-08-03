@@ -513,6 +513,19 @@ export class PublicSessionCoordinator {
     return session ? this.snapshot(session) : undefined;
   }
 
+  /**
+   * Private read: the worker identity behind an active session. Never part of
+   * the public snapshot — used only by the workspace-handoff controller to
+   * authorize a checkpoint export against the exact assigned worker/generation.
+   */
+  getAssignedWorker(sessionId: string): { workerId: string; workerGeneration: string } | undefined {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.state !== "active" || !session.workerId || !session.workerGeneration) {
+      return undefined;
+    }
+    return { workerId: session.workerId, workerGeneration: session.workerGeneration };
+  }
+
   /** Run expiry checks and assign newly healthy seats to queued visitors. */
   sweep(): void {
     const now = this.now();

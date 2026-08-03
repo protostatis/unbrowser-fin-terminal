@@ -22,6 +22,7 @@ import {
 	readResearchWorkerConcurrency,
 	ResearchWorkerCoordinator,
 } from "../../server/research-worker-coordinator.js";
+import { createResearchPermitGateFromEnv } from "../../server/research-permit-client.js";
 import {
 	isParentMessage,
 	WORKER_PROTOCOL_VERSION,
@@ -5840,6 +5841,131 @@ function restoreSessionCanvases(ctx: ExtensionContext): boolean {
 	return archiveChanged;
 }
 
+// ── Private-workspace checkpoint import ──────────────────────────────────────
+
+/** Custom-entry type carrying a validated workspace checkpoint. */
+const WORKSPACE_CHECKPOINT_CUSTOM_TYPE = "financial-workspace-checkpoint";
+
+/**
+ * Reconstruct a stored Canvas from a validated checkpoint canvas. The
+ * checkpoint intentionally carries no raw process state; source domains are
+ * rebuilt into safe source URLs for the sources block.
+ */
+function checkpointCanvasToStored(
+	raw: unknown,
+	fallbackSymbol: string | undefined,
+	fallbackScope: ChartScope | undefined,
+	createdAt: number,
+): Canvas | undefined {
+	if (!raw || typeof raw !== "object") return undefined;
+	const canvasRaw = raw as Record<string, unknown>;
+	const symbol = typeof canvasRaw.symbol === "string"
+		? normalizeSymbol(canvasRaw.symbol)
+		: fallbackSymbol;
+	if (!symbol) return undefined;
+	const scope = normalizeChartScope(canvasRaw.chartScope ?? fallbackScope);
+	const title = typeof canvasRaw.title === "string"
+		? cleanText(canvasRaw.title).slice(0, 160) || `${symbol} research`
+		: `${symbol} research`;
+	const summary = typeof canvasRaw.summary === "string" ? cleanText(canvasRaw.summary) : "";
+	const packetsRaw = Array.isArray(canvasRaw.packets) ? canvasRaw.packets : [];
+	const evidencePackets: EvidencePacket[] = [];
+	const sourceItems: CanvasSourceItem[] = [];
+	let updatedAt = typeof canvasRaw.createdAt === "number" ? canvasRaw.createdAt : createdAt;
+	for (const packetRaw of packetsRaw.slice(0, 200)) {
+		if (!packetRaw || typeof packetRaw !== "object") continue;
+		const packet = packetRaw as Record<string, unknown>;
+		const sourceId = typeof packet.sourceId === "string" ? cleanText(packet.sourceId).slice(0, 160).trim() : "";
+		const sourceTitle = typeof packet.sourceTitle === "string" ? cleanText(packet.sourceTitle).slice(0, 160).trim() : "";
+		const sourceDomain = typeof packet.sourceDomain === "string" ? cleanText(packet.sourceDomain).slice(0, 160).trim() : "";
+		if (!sourceId || !sourceTitle || !sourceDomain) continue;
+		const extractedAt = typeof packet.extractedAt === "number" && Number.isFinite(packet.extractedAt) ? packet.extractedAt : updatedAt;
+		if (extractedAt > updatedAt) updatedAt = extractedAt;
+		const retrievalStatus = typeof packet.retrievalStatus === "string" && ["fetched", "challenged", "limited", "failed"].includes(packet.retrievalStatus)
+			? (packet.retrievalStatus as EvidencePacket["retrievalStatus"]) : "fetched";
+		const excerpt = typeof packet.excerpt === "string" ? cleanText(packet.excerpt).slice(0, 500).trim() : "";
+		const safeUrl = `https://${sourceDomain}`;
+		evidencePackets.push({
+			sourceId,
+			sourceTitle,
+			sourceDomain,
+			sourceUrl: safeUrl,
+			excerpt,
+			retrievalStatus,
+			extractedAt,
+			extractionMode: "checkpoint",
+			truncated: Boolean(packet.truncated),
+		});
+		if (sourceItems.length < 12) {
+			sourceItems.push({ id: sourceId, label: sourceTitle, url: safeUrl, status: retrievalStatus === "fetched" ? "fetched" : retrievalStatus });
+		}
+	}
+	const intent = canvasRaw.intent === "why" || canvasRaw.intent === "brief" ? (canvasRaw.intent as ResearchIntent) : researchIntentFromKey("brief");
+	const stage = canvasRaw.stage === "complete" ? "complete" : "partial";
+	const blocks: CanvasBlock[] = [];
+	if (summary) blocks.push({ id: "summary", kind: "text", title: "Summary", text: summary });
+	if (sourceItems.length > 0) blocks.push({ id: "sources", kind: "sources", title: "Sources", items: sourceItems });
+	return {
+		symbol,
+		title,
+		content: summary,
+		...(blocks.length > 0 ? { blocks } : {}),
+		updatedAt,
+		...(typeof canvasRaw.researchId === "string" ? { researchId: cleanText(canvasRaw.researchId).slice(0, 160).trim() } : {}),
+		...(stage ? { stage } : {}),
+		chartScope: scope,
+		researchKey: LEGACY_RESEARCH_KEY,
+		...(intent ? { intent } : {}),
+		...(evidencePackets.length > 0 ? { evidencePackets } : {}),
+	};
+}
+
+/**
+ * Restore canonical checkpoint state (canvases, watchlist, context) from the
+ * fresh session's custom entry. Never restores raw transcript or process
+ * state — only the validated, bounded checkpoint payload.
+ */
+function restoreCheckpointCanvases(ctx: ExtensionContext): boolean {
+	let restored = false;
+	for (const entry of ctx.sessionManager.getBranch()) {
+		if (entry.type !== "custom" || entry.customType !== WORKSPACE_CHECKPOINT_CUSTOM_TYPE) continue;
+		const checkpoint = entry.data && typeof entry.data === "object" && !Array.isArray(entry.data)
+			? entry.data as Record<string, unknown>
+			: undefined;
+		if (!checkpoint) continue;
+		const context = checkpoint.context && typeof checkpoint.context === "object"
+			? checkpoint.context as Record<string, unknown>
+			: undefined;
+		const symbol = typeof context?.symbol === "string" ? normalizeSymbol(context.symbol) : undefined;
+		const scope = normalizeChartScope(context?.chartScope);
+		const createdAt = typeof checkpoint.createdAt === "number" ? checkpoint.createdAt : Date.now();
+
+		const watchlistRaw = Array.isArray(context?.watchlist) ? context.watchlist : [];
+		if (watchlistRaw.length > 0) {
+			const symbols = watchlistRaw
+				.filter((s): s is string => typeof s === "string")
+				.map((s) => normalizeSymbol(s))
+				.filter((s): s is string => Boolean(s))
+				.slice(0, 500);
+			if (symbols.length > 0) {
+				watchlist = symbols;
+				restored = true;
+			}
+		}
+
+		const canvasesRaw = Array.isArray(checkpoint.canvases) ? checkpoint.canvases : [];
+		for (const canvasRaw of canvasesRaw.slice(0, 50)) {
+			const canvas = checkpointCanvasToStored(canvasRaw, symbol, scope, createdAt);
+			if (!canvas) continue;
+			const key = canvasKey(canvas.symbol, canvasScope(canvas), canvasResearchKey(canvas));
+			const current = canvases.get(key);
+			if (!current || current.updatedAt <= canvas.updatedAt) canvases.set(key, canvas);
+			restored = true;
+		}
+	}
+	return restored;
+}
+
 async function rebuildCanvasState(ctx: ExtensionContext): Promise<void> {
 	await archiveWriteQueue.catch(() => {});
 	researchArchive.clear();
@@ -5852,7 +5978,8 @@ async function rebuildCanvasState(ctx: ExtensionContext): Promise<void> {
 		if (ctx.mode === "tui") ctx.ui.notify(`Research archive unavailable: ${error instanceof Error ? error.message : String(error)}`, "warning");
 	}
 	const archiveChanged = restoreSessionCanvases(ctx);
-	if (archiveChanged && archivePath) {
+	const checkpointRestored = restoreCheckpointCanvases(ctx);
+	if ((archiveChanged || checkpointRestored) && archivePath) {
 		try {
 			await persistResearchArchive();
 		} catch (error) {
@@ -6291,11 +6418,17 @@ export default function (pi: ExtensionAPI) {
 	const getResearchWorkerCoordinator = (): ResearchWorkerCoordinator => {
 		if (isResearchWorkerProcess) throw new Error("A research worker cannot coordinate child workers");
 		if (!researchWorkerCoordinator) {
+			// The gateway-owned global research permit gate. When the feature is
+			// enabled this coordinator acquires a permit from the private gateway
+			// management API immediately before every fork and releases it only
+			// after the child exits. When disabled, behavior is unchanged.
+			const permitGate = createResearchPermitGateFromEnv();
 			researchWorkerCoordinator = new ResearchWorkerCoordinator({
 				concurrency: readResearchWorkerConcurrency(),
 				workerFactory: createDefaultWorkerFactory(),
 				onEvent: applyWorkerEvent,
 				onError: settleWorkerFailure,
+				...(permitGate ? { ...permitGate } : {}),
 			});
 		}
 		return researchWorkerCoordinator;

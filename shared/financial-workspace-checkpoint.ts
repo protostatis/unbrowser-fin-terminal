@@ -16,6 +16,18 @@
 /** Maximum serialized checkpoint size (bytes). Reject larger payloads. */
 export const CHECKPOINT_MAX_BYTES = 512 * 1024; // 512 KB
 
+/**
+ * Worker-side private checkpoint-export path. The gateway calls this on the
+ * assigned worker only for an active session/generation; it is never mounted
+ * on a public listener and never reachable from the browser.
+ */
+export const CHECKPOINT_EXPORT_PATH = "/internal/financial-workspace/checkpoint-export";
+
+/**
+ * Workspace-service checkpoint-create path (gateway → workspace control).
+ */
+export const CHECKPOINT_CREATE_PATH = "/internal/financial-workspace/checkpoints";
+
 /** Maximum event log entries retained in a checkpoint. */
 export const CHECKPOINT_MAX_EVENTS = 1_000;
 
@@ -170,6 +182,14 @@ const UNSAFE_URL_PATTERN =
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Portable UTF-8 byte-length (no Node `Buffer` dependency so this module can
+ * be imported from both the server and the browser bundle).
+ */
+function utf8ByteLength(value: string): number {
+  return new TextEncoder().encode(value).length;
 }
 
 function isBoundedString(
@@ -438,7 +458,7 @@ export function validateCheckpoint(value: unknown):
 
   // Size gate
   const serialized = JSON.stringify(value);
-  if (Buffer.byteLength(serialized, "utf8") > CHECKPOINT_MAX_BYTES) {
+  if (utf8ByteLength(serialized) > CHECKPOINT_MAX_BYTES) {
     return { valid: false, reason: `checkpoint exceeds ${CHECKPOINT_MAX_BYTES} bytes` };
   }
 
@@ -569,18 +589,21 @@ export function buildContinuationSummary(checkpoint: FinancialTerminalCheckpoint
 
 // ──── Feature Flag ──────────────────────────────────────────────────────────
 
+/** Portable process-env shaped object (avoids a Node-only dependency). */
+export type WorkspaceEnv = { [key: string]: string | undefined };
+
 /**
  * Check if financial workspace checkpoints are enabled in this deployment.
  * Feature-gated: requires explicit opt-in via env var.
  */
-export function isWorkspaceCheckpointEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+export function isWorkspaceCheckpointEnabled(env: WorkspaceEnv = {}): boolean {
   return env.FINANCIAL_WORKSPACE_CHECKPOINTS === "1";
 }
 
 /**
  * Resolve the internal workspace service URL from env (or undefined if disabled).
  */
-export function workspaceServiceUrl(env: NodeJS.ProcessEnv = process.env): string | undefined {
+export function workspaceServiceUrl(env: WorkspaceEnv = {}): string | undefined {
   const url = env.FINANCIAL_WORKSPACE_SERVICE_URL?.trim();
   if (!url) return undefined;
   try {
@@ -595,7 +618,7 @@ export function workspaceServiceUrl(env: NodeJS.ProcessEnv = process.env): strin
  * Resolve the bearer control token for server-to-server communication.
  * This token NEVER reaches the browser.
  */
-export function workspaceControlToken(env: NodeJS.ProcessEnv = process.env): string | undefined {
+export function workspaceControlToken(env: WorkspaceEnv = {}): string | undefined {
   const token = env.FINANCIAL_WORKSPACE_CONTROL_TOKEN?.trim();
   if (!token || token.length < 32) return undefined;
   return token;

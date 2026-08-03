@@ -35,8 +35,8 @@ export interface WorkspaceCheckpointBannerProps {
   workspaceHandoffAvailable: boolean;
   /** Session end reason (shown when ended). */
   endReason?: string;
-  /** Callback when user opts in to workspace conversion. */
-  onConvertToWorkspace: () => void;
+  /** Callback when user opts in to workspace conversion. Resolves true only after the handoff was durably created. */
+  onConvertToWorkspace: () => Promise<boolean>;
   /** Callback when user wants to start a new public session. */
   onNewSession: () => void;
   /** Current render timestamp for animation. */
@@ -69,6 +69,14 @@ function endReasonMessage(reason?: string): string {
   }
 }
 
+/** Honest message when the session ended without a saved workspace snapshot. */
+function noSnapshotMessage(reason?: string): string {
+  if (reason === "absolute-timeout" || reason === "idle-timeout") {
+    return "No workspace snapshot was saved before this session ended.";
+  }
+  return "The session ended before a workspace snapshot could be created.";
+}
+
 /** Human-readable time remaining. */
 function formatTime(ms: number): string {
   if (ms <= 0) return "0:00";
@@ -94,7 +102,11 @@ export function WorkspaceCheckpointBanner({
   const [now, setNow] = useState(() => nowFn());
   const [converting, setConverting] = useState(false);
   const [acknowledgedBeforeNavigate, setAcknowledgedBeforeNavigate] = useState(false);
+  const [handoffCreated, setHandoffCreated] = useState(false);
   const [showConversionConfirm, setShowConversionConfirm] = useState(false);
+  // Synchronous guard so a navigation that happens before React re-renders
+  // still respects the durable acknowledgement.
+  const acknowledgedRef = useRef(false);
   const timerRef = useRef<ReturnType<typeof setInterval>>();
 
   // ── Timer tick ─────────────────────────────────────────────────────────
@@ -121,9 +133,10 @@ export function WorkspaceCheckpointBanner({
   // ── BeforeUnload guard for durable ack ─────────────────────────────────
   useEffect(() => {
     if (!hasMeaningfulActivity || !workspaceHandoffAvailable) return;
-    if (acknowledgedBeforeNavigate) return;
+    if (acknowledgedRef.current) return;
 
     const handler = (event: BeforeUnloadEvent) => {
+      if (acknowledgedRef.current) return;
       // Standard beforeunload prevention
       event.preventDefault();
       // For older browsers
@@ -137,16 +150,22 @@ export function WorkspaceCheckpointBanner({
   // ── Handlers ───────────────────────────────────────────────────────────
   const handleConvert = useCallback(async () => {
     setConverting(true);
-    setAcknowledgedBeforeNavigate(true);
     try {
-      onConvertToWorkspace();
+      const success = await onConvertToWorkspace();
+      if (success) {
+        acknowledgedRef.current = true;
+        setAcknowledgedBeforeNavigate(true);
+        setHandoffCreated(true);
+      } else {
+        setConverting(false);
+      }
     } catch {
       setConverting(false);
-      setAcknowledgedBeforeNavigate(false);
     }
   }, [onConvertToWorkspace]);
 
   const handleNewSession = useCallback(() => {
+    acknowledgedRef.current = true;
     setAcknowledgedBeforeNavigate(true);
     onNewSession();
   }, [onNewSession]);
@@ -195,7 +214,7 @@ export function WorkspaceCheckpointBanner({
           </>
         ) : (
           <span className="workspace-checkpoint-ended">
-            {endReasonMessage(endReason)}
+            {handoffCreated ? endReasonMessage(endReason) : noSnapshotMessage(endReason)}
           </span>
         )}
       </div>

@@ -25,7 +25,7 @@ import { PublicSessionPersistence } from "./public-session-persistence.js";
 import { createOpaqueId, signOpaqueId, verifyOpaqueId } from "./public-session-tokens.js";
 import { matchesProxyToken } from "./proxy-auth.js";
 import { isActiveResearchFramePayload } from "./research-activity.js";
-import { createWorkspaceCheckpointHandler } from "./workspace-checkpoint-handler.js";
+import { createWorkspaceHandoffController } from "./workspace-checkpoint-control.js";
 import {
   isWorkspaceCheckpointEnabled,
   workspaceServiceUrl,
@@ -618,9 +618,30 @@ export async function startPublicLiveGateway(): Promise<PublicLiveGateway> {
       }
     });
 
-    // ── Workspace checkpoint handler (feature-flagged) ───────────────────
-    const workspaceCheckpointHandler = createWorkspaceCheckpointHandler();
-    app.post("/internal/financial-workspace/checkpoints", workspaceCheckpointHandler);
+    // ── Workspace handoff (browser opt-in → worker export → control) ─────
+    // The browser only initiates opt-in; checkpoint content is always built
+    // from the assigned worker's authoritative state, never from the browser.
+    const workspaceHandoff = createWorkspaceHandoffController({
+      ticketFromRequest: (request) => {
+        const visitorId = verifyOpaqueId(singleHeader(request as IncomingMessage, VISITOR_TOKEN_HEADER), config.signingKey);
+        const ticketId = verifyOpaqueId(singleHeader(request as IncomingMessage, TICKET_TOKEN_HEADER), config.signingKey);
+        return visitorId && ticketId ? { visitorId, ticketId } : undefined;
+      },
+      activeAssignmentFor: (ticketId, visitorId) => {
+        const session = coordinator.status(ticketId);
+        if (!session || session.visitorId !== visitorId || session.state !== "active") return undefined;
+        const assigned = coordinator.getAssignedWorker(ticketId);
+        if (!assigned) return undefined;
+        const endpoint = workerById.get(assigned.workerId);
+        if (!endpoint) return undefined;
+        return {
+          workerId: assigned.workerId,
+          workerUrl: endpoint.url,
+          workerGeneration: assigned.workerGeneration,
+        };
+      },
+    });
+    app.post("/api/public/workspace-handoff", workspaceHandoff);
 
     const __filename = fileURLToPath(import.meta.url);
     const cwd = path.resolve(process.env.MARKET_ROOT?.trim() || path.resolve(path.dirname(__filename), ".."));
@@ -1097,10 +1118,18 @@ export async function startPublicLiveGateway(): Promise<PublicLiveGateway> {
     timer.unref();
 
     // ── Private management API ───────────────────────────────────────────
-    const managementToken = process.env.MANAGEMENT_API_TOKEN?.trim();
-    const managementPort = Number(process.env.MANAGEMENT_API_PORT?.trim() ?? 8789);
+    // Feature-gated via TERMINAL_RUNTIME_FEATURE_ENABLED; the token must be
+    // explicit and strong. This listener is private-only (separate port).
+    const runtimeFeatureEnabled = process.env.TERMINAL_RUNTIME_FEATURE_ENABLED?.trim() === "1";
+    const managementToken = process.env.TERMINAL_RUNTIME_MANAGEMENT_TOKEN?.trim();
+    const managementPort = Number(process.env.TERMINAL_RUNTIME_MANAGEMENT_PORT?.trim() ?? 8789);
     const managementEnabled = Boolean(
-      managementToken && managementToken.length >= 32,
+      runtimeFeatureEnabled
+      && managementToken
+      && managementToken.length >= 32
+      && Number.isInteger(managementPort)
+      && managementPort > 0
+      && managementPort <= 65_535,
     );
     if (managementEnabled) {
       managementApi = startManagementApi(
@@ -1129,6 +1158,7 @@ export async function startPublicLiveGateway(): Promise<PublicLiveGateway> {
           },
           getWarmPool: () => warmPool,
           getResearchCoordinator: () => researchPermits,
+          touchSession: (sessionId) => coordinator.touch(sessionId),
           mutate,
           inspect,
         },

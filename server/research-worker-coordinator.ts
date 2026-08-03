@@ -48,6 +48,36 @@ export interface WorkerHandle {
 /** Creates a `WorkerHandle` from the supplied env map. */
 export type WorkerFactory = (env: Record<string, string>) => WorkerHandle;
 
+// ── Research-permit gate (worker→gateway global concurrency) ───────────────
+
+/** Identity under which a fork acquires a global research permit. */
+export interface ResearchPermitIdentity {
+  /** Public session that owns this research job (opaque, bounded). */
+  sessionId: string;
+  /** Worker process generation used for stale-permit reclamation. */
+  workerGeneration: string;
+}
+
+export interface ResearchPermitAcquireOutcome {
+  accepted: boolean;
+  status: "acquired" | "queued" | "rejected";
+  requestId?: string;
+  reason?: string;
+  queuePosition?: number;
+}
+
+/**
+ * Private gateway permit surface used by the coordinator. When configured,
+ * every fork is gated on `acquire` (called immediately before the worker
+ * factory forks) and the permit is released only after the child exits.
+ */
+export interface ResearchPermitGate {
+  acquire(identity: ResearchPermitIdentity): Promise<ResearchPermitAcquireOutcome>;
+  status(requestId: string): Promise<{ requestId: string; status: string }>;
+  heartbeat(requestId: string): Promise<void>;
+  release(requestId: string): Promise<void>;
+}
+
 // ── Options ───────────────────────────────────────────────────────────────
 
 export interface ResearchWorkerCoordinatorOptions {
@@ -78,6 +108,26 @@ export interface ResearchWorkerCoordinatorOptions {
    * workers continue to consume a concurrency slot until their exit event.
    */
   terminalGraceMs?: number;
+  /**
+   * Global research-permit gate. When present (and `permitIdentity` is also
+   * present), every fork is gated on the gateway permit immediately before
+   * `workerFactory` runs, and the permit is released only after child exit.
+   * When absent the coordinator keeps its previous ungated behavior.
+   */
+  permitGate?: ResearchPermitGate;
+  /** Supplies the session/generation identity used for permit acquisition. */
+  permitIdentity?: () => ResearchPermitIdentity;
+  /**
+   * How long a job may wait for a queued global permit before it settles as
+   * failed (ms, default 10 minutes). Bounds permit waits under the public
+   * session's absolute limit.
+   */
+  permitWaitTimeoutMs?: number;
+  /**
+   * Poll/heartbeat interval while a permit is queued (ms, default 30 s).
+   * The heartbeat keeps the owning public session from idle-expiring.
+   */
+  permitPollIntervalMs?: number;
   /** Called with every validated, in-scope worker event. */
   onEvent?: (event: WorkerEvent) => void;
   /** Called when the coordinator observes a non-recoverable worker fault. */
@@ -112,6 +162,8 @@ interface ActiveAttempt {
   lastSequence: number;
   /** True when cancellation has been requested for this attempt. */
   cancelled: boolean;
+  /** Global research permit held for the lifetime of this child (released on exit). */
+  permitRequestId?: string;
   /** Handle returned by `setTimeout` for the force-kill. */
   cancelTimer: ReturnType<typeof globalThis.setTimeout> | null;
   /** Parent-enforced deadline that covers worker boot, model work, and IPC. */
@@ -123,6 +175,17 @@ interface ActiveAttempt {
 interface QueuedJob {
   jobId: string;
   request: ResearchRequestContext;
+}
+
+/** A job waiting for a global research permit before it may fork. */
+interface PermitPendingJob {
+  jobId: string;
+  request: ResearchRequestContext;
+  requestId?: string;
+  /** Bound on the total wait for a queued permit. */
+  waitTimer: ReturnType<typeof globalThis.setTimeout> | null;
+  /** Heartbeat/poll interval while the permit is queued. */
+  pollTimer: ReturnType<typeof globalThis.setTimeout> | null;
 }
 
 // ── Result shapes ─────────────────────────────────────────────────────────
@@ -148,6 +211,10 @@ export class ResearchWorkerCoordinator {
   private readonly graceMs: number;
   private readonly deadlineMs: number;
   private readonly terminalGraceMs: number;
+  private readonly permitGate?: ResearchPermitGate;
+  private readonly permitIdentity?: () => ResearchPermitIdentity;
+  private readonly permitWaitTimeoutMs: number;
+  private readonly permitPollIntervalMs: number;
   private readonly onEvent?: (event: WorkerEvent) => void;
   private readonly onError?: (jobId: string, error: Error) => void;
   private readonly _setTimeout: typeof globalThis.setTimeout;
@@ -157,6 +224,8 @@ export class ResearchWorkerCoordinator {
   private readonly active = new Map<string, ActiveAttempt>();
   /** FIFO waitlist. */
   private readonly queue: QueuedJob[] = [];
+  /** Jobs waiting for a global research permit before they can fork. */
+  private readonly permitPending = new Map<string, PermitPendingJob>();
   /** Set of jobIds currently active (for fast dedup). */
   private readonly activeJobIds = new Set<string>();
   /** Set of jobIds that have already settled (for `cancel()` idempotency). */
@@ -174,6 +243,10 @@ export class ResearchWorkerCoordinator {
     this.graceMs = Math.max(0, options.graceMs ?? 5_000);
     this.deadlineMs = positiveTimeout(options.deadlineMs, 12 * 60_000);
     this.terminalGraceMs = positiveTimeout(options.terminalGraceMs, 5_000);
+    this.permitGate = options.permitGate;
+    this.permitIdentity = options.permitIdentity;
+    this.permitWaitTimeoutMs = positiveTimeout(options.permitWaitTimeoutMs, 10 * 60_000);
+    this.permitPollIntervalMs = positiveTimeout(options.permitPollIntervalMs, 30_000);
     this.onEvent = options.onEvent;
     this.onError = options.onError;
     this._setTimeout = options.setTimeout ?? globalThis.setTimeout;
@@ -185,8 +258,12 @@ export class ResearchWorkerCoordinator {
   /**
    * Enqueue a research job.
    *
-   * If a free slot exists the job is dispatched immediately. Otherwise it
-   * waits in a FIFO queue until a worker slot opens.
+   * If a free slot exists (and no global permit gate is configured) the job is
+   * dispatched immediately. Otherwise it waits in a FIFO queue until a worker
+   * slot opens. With a permit gate configured, the job additionally waits for a
+   * global research permit before the fork; it stays visibly queued, is
+   * heartbeated to keep the owning session alive, and is bounded by
+   * `permitWaitTimeoutMs`.
    *
    * Rejects when the queue is full, the jobId is already active/queued, or the
    * coordinator is disposed.
@@ -203,12 +280,28 @@ export class ResearchWorkerCoordinator {
     }
     this.forgetSettledJob(jobId);
 
-    const total = this.active.size + this.queue.length;
+    const total = this.active.size + this.queue.length + this.permitPending.size;
     if (total >= this.maxQueueSize) {
       return { accepted: false, status: "rejected", reason: "queue-full" };
     }
 
     const snapshot = Object.freeze({ ...request });
+
+    // Global permit gate: acquire the gateway permit before any fork. The job
+    // stays visibly queued until the permit is granted, then dispatches.
+    if (this.permitGate && this.permitIdentity) {
+      const pending: PermitPendingJob = {
+        jobId,
+        request: snapshot,
+        waitTimer: null,
+        pollTimer: null,
+      };
+      this.permitPending.set(jobId, pending);
+      this.activeJobIds.add(jobId);
+      void this.acquirePermitAndDispatch(jobId);
+      return { accepted: true, status: "queued" };
+    }
+
     if (this.active.size < this.concurrency) {
       if (this.dispatch(jobId, snapshot)) {
         return { accepted: true, status: "dispatched" };
@@ -223,15 +316,28 @@ export class ResearchWorkerCoordinator {
   /**
    * Cancel a job by its public jobId.
    *
-   * - Queued job → removed from the waitlist.
+   * - Queued/permit-pending job → removed from the waitlist; its permit (if
+   *   any) is released.
    * - Running job → the worker is sent a cancel message and force-killed
-   *   after the grace period. Its slot is released once the worker settles
-   *   or the grace timer fires.
+   *   after the grace period. Its slot and permit are released once the worker
+   *   settles or the grace timer fires.
    * - Already settled → no-op.
    * - Unknown jobId → no-op.
    */
   cancel(jobId: string): CancelResult {
     if (this._disposed) return { cancelled: false, status: "not-found" };
+
+    // 0. Permit-pending job: release its permit and remove the wait.
+    const pending = this.permitPending.get(jobId);
+    if (pending) {
+      this.clearPermitWait(pending);
+      this.permitPending.delete(jobId);
+      this.activeJobIds.delete(jobId);
+      if (pending.requestId) {
+        void this.permitGate?.release(pending.requestId).catch(() => {});
+      }
+      return { cancelled: true, status: "queued-removed" };
+    }
 
     // 1. Check the waitlist first.
     const queuedIndex = this.queue.findIndex((j) => j.jobId === jobId);
@@ -288,13 +394,34 @@ export class ResearchWorkerCoordinator {
     // Clear waitlist.
     this.queue.length = 0;
 
-    // Kill every active worker.
+    // Release any permits held by permit-pending jobs.
+    for (const [, pending] of this.permitPending) {
+      this.clearPermitWait(pending);
+      if (pending.requestId) {
+        try {
+          void this.permitGate?.release(pending.requestId).catch(() => {});
+        } catch {
+          // best-effort release during shutdown
+        }
+      }
+    }
+    this.permitPending.clear();
+
+    // Kill every active worker and release its held permit.
     for (const [, attempt] of this.active) {
       this.clearAttemptTimers(attempt);
       try {
         attempt.worker.kill("SIGTERM");
       } catch {
         // Worker may already be dead.
+      }
+      if (attempt.permitRequestId) {
+        try {
+          void this.permitGate?.release(attempt.permitRequestId).catch(() => {});
+        } catch {
+          // best-effort release during shutdown
+        }
+        attempt.permitRequestId = undefined;
       }
     }
     this.active.clear();
@@ -310,7 +437,12 @@ export class ResearchWorkerCoordinator {
   }
 
   get queuedCount(): number {
-    return this.queue.length;
+    return this.queue.length + this.permitPending.size;
+  }
+
+  /** Number of jobs still waiting for a global research permit. */
+  get permitPendingCount(): number {
+    return this.permitPending.size;
   }
 
   get disposed(): boolean {
@@ -319,13 +451,18 @@ export class ResearchWorkerCoordinator {
 
   // ── Internal: dispatch ──────────────────────────────────────────────────
 
-  private dispatch(jobId: string, request: ResearchRequestContext): boolean {
+  private dispatch(
+    jobId: string,
+    request: ResearchRequestContext,
+    permitRequestId?: string,
+  ): boolean {
     const attemptId = this.generateAttemptId();
 
     let worker: WorkerHandle;
     try {
       worker = this.workerFactory({ MARKET_RESEARCH_WORKER: "1" });
     } catch (err) {
+      // The caller (dispatchWithPermit) returns a held permit on `false`.
       this.emitError(
         jobId,
         err instanceof Error ? err : new Error(String(err)),
@@ -340,6 +477,7 @@ export class ResearchWorkerCoordinator {
       terminal: false,
       lastSequence: -1,
       cancelled: false,
+      permitRequestId,
       cancelTimer: null,
       deadlineTimer: null,
       terminalTimer: null,
@@ -440,6 +578,17 @@ export class ResearchWorkerCoordinator {
     this.active.delete(attemptId);
     this.activeJobIds.delete(attempt.jobId);
 
+    // A globally-gated permit is held for the lifetime of the child process.
+    // Release it only now that the child has actually exited.
+    if (attempt.permitRequestId) {
+      try {
+        void this.permitGate?.release(attempt.permitRequestId).catch(() => {});
+      } catch {
+        // best-effort release; the gateway TTL still frees the slot
+      }
+      attempt.permitRequestId = undefined;
+    }
+
     // Track settled job IDs so cancel() can distinguish "already-settled" from
     // "not-found" even after the attempt record is gone.
     this.rememberSettledJob(attempt.jobId);
@@ -510,6 +659,154 @@ export class ResearchWorkerCoordinator {
       const next = this.queue.shift()!;
       this.dispatch(next.jobId, next.request);
     }
+  }
+
+  // ── Internal: global permit gate ────────────────────────────────────────
+
+  /** Acquire the gateway permit, then fork once granted (or fail the job). */
+  private async acquirePermitAndDispatch(jobId: string): Promise<void> {
+    const pending = this.permitPending.get(jobId);
+    if (!pending || this._disposed || !this.permitGate || !this.permitIdentity) return;
+
+    let outcome: ResearchPermitAcquireOutcome;
+    try {
+      outcome = await this.permitGate.acquire(this.permitIdentity());
+    } catch {
+      this.settlePermitFailure(jobId, "permit-acquire-error");
+      return;
+    }
+    if (this._disposed) {
+      if (outcome.requestId) {
+        try {
+          void this.permitGate.release(outcome.requestId).catch(() => {});
+        } catch {
+          // best-effort release
+        }
+      }
+      return;
+    }
+    const current = this.permitPending.get(jobId);
+    if (!current) {
+      // Cancelled while the acquire call was in flight.
+      if (outcome.requestId) {
+        try {
+          void this.permitGate.release(outcome.requestId).catch(() => {});
+        } catch {
+          // best-effort release
+        }
+      }
+      return;
+    }
+    if (!outcome.accepted || !outcome.requestId) {
+      this.settlePermitFailure(jobId, outcome.reason ?? "permit-rejected");
+      return;
+    }
+    current.requestId = outcome.requestId;
+    if (outcome.status === "acquired") {
+      this.dispatchWithPermit(jobId);
+      return;
+    }
+    // Queued: heartbeat/poll until granted or the bounded wait expires.
+    this.startPermitWait(jobId);
+  }
+
+  /** Poll the gateway while a permit is queued; heartbeat keeps the session alive. */
+  private startPermitWait(jobId: string): void {
+    const pending = this.permitPending.get(jobId);
+    if (!pending || this._disposed || !this.permitGate || !pending.requestId) return;
+
+    const poll = () => {
+      if (this._disposed) return;
+      const current = this.permitPending.get(jobId);
+      if (!current || !current.requestId) return;
+      const requestId = current.requestId;
+      void this.permitGate!.status(requestId).then((status) => {
+        if (this._disposed) return;
+        const latest = this.permitPending.get(jobId);
+        if (!latest || latest.requestId !== requestId) return;
+        if (status.status === "acquired") {
+          this.dispatchWithPermit(jobId);
+          return;
+        }
+        if (status.status === "expired" || status.status === "cancelled" || status.status === "released") {
+          this.settlePermitFailure(jobId, `permit-${status.status}`);
+          return;
+        }
+        // Still queued: extend the owning session's idle lease.
+        void this.permitGate!.heartbeat(requestId).catch(() => {});
+        latest.pollTimer = this._setTimeout(poll, this.permitPollIntervalMs);
+        if (latest.pollTimer && typeof latest.pollTimer !== "number") latest.pollTimer.unref?.();
+      }).catch(() => {
+        const latest = this.permitPending.get(jobId);
+        if (!latest) return;
+        latest.pollTimer = this._setTimeout(poll, this.permitPollIntervalMs);
+        if (latest.pollTimer && typeof latest.pollTimer !== "number") latest.pollTimer.unref?.();
+      });
+    };
+
+    pending.waitTimer = this._setTimeout(() => {
+      const current = this.permitPending.get(jobId);
+      if (!current || this._disposed) return;
+      if (current.requestId) {
+        try {
+          void this.permitGate?.release(current.requestId).catch(() => {});
+        } catch {
+          // best-effort release
+        }
+      }
+      this.settlePermitFailure(jobId, "permit-wait-timeout");
+    }, this.permitWaitTimeoutMs);
+    if (pending.waitTimer && typeof pending.waitTimer !== "number") pending.waitTimer.unref?.();
+
+    poll();
+  }
+
+  /** Fork the child once the permit is granted (slot availability permitting). */
+  private dispatchWithPermit(jobId: string): void {
+    const pending = this.permitPending.get(jobId);
+    if (!pending || this._disposed) return;
+    if (!pending.requestId) {
+      this.settlePermitFailure(jobId, "permit-rejected");
+      return;
+    }
+    const requestId = pending.requestId;
+    this.clearPermitWait(pending);
+    if (this.active.size >= this.concurrency) {
+      // A local slot opened late; return to the bounded wait.
+      this.startPermitWait(jobId);
+      return;
+    }
+    this.permitPending.delete(jobId);
+    this.activeJobIds.delete(jobId);
+    if (this.dispatch(jobId, pending.request, requestId)) {
+      // The attempt now owns the permit; it is released on child exit.
+    } else {
+      try {
+        void this.permitGate?.release(requestId).catch(() => {});
+      } catch {
+        // best-effort release
+      }
+    }
+  }
+
+  private clearPermitWait(pending: PermitPendingJob): void {
+    if (pending.waitTimer !== null) {
+      this._clearTimeout(pending.waitTimer);
+      pending.waitTimer = null;
+    }
+    if (pending.pollTimer !== null) {
+      this._clearTimeout(pending.pollTimer);
+      pending.pollTimer = null;
+    }
+  }
+
+  private settlePermitFailure(jobId: string, reason: string): void {
+    const pending = this.permitPending.get(jobId);
+    if (!pending) return;
+    this.clearPermitWait(pending);
+    this.permitPending.delete(jobId);
+    this.activeJobIds.delete(jobId);
+    this.emitError(jobId, new Error(`Research worker could not acquire a global permit: ${reason}`));
   }
 
   private emitError(jobId: string, error: Error): void {

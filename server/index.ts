@@ -58,6 +58,21 @@ import { readPublicSessionWorkerConfig } from "./public-live-config.js";
 import { PublicSessionWorkerLifecycle } from "./public-session-worker.js";
 import { createOpaqueId } from "./public-session-tokens.js";
 import { hasActiveResearchState } from "./research-activity.js";
+import {
+  isWorkspaceCheckpointEnabled,
+  CHECKPOINT_EXPORT_PATH,
+} from "../shared/financial-workspace-checkpoint.js";
+import {
+  createWorkspaceCheckpointExportHandler,
+} from "./workspace-checkpoint-handler.js";
+import {
+  createServerCheckpointEventLog,
+  recordServerCheckpointEvent,
+  workerGenerationEpoch,
+  type ServerCheckpointEventLog,
+  type CheckpointWorkerState,
+} from "./workspace-checkpoint-export.js";
+import { importCheckpointIntoFreshSession } from "./workspace-checkpoint-import.js";
 
 // ==========================================================================
 // Runtime mode — must be resolved before any live-only side effects
@@ -203,6 +218,23 @@ else {
     throw new Error("PUBLIC_SESSION_WORKER requires MARKET_RESEARCH_CONCURRENCY=1");
   }
 
+  // ── Authoritative checkpoint event log (server-observed, not browser) ───
+  const checkpointEventLog: ServerCheckpointEventLog = createServerCheckpointEventLog();
+  let lastCheckpointEventState: {
+    screen?: string;
+    symbol?: string;
+    chartScope?: string;
+    researchActive?: boolean;
+    researchPhase?: string;
+    researchOutcome?: string;
+  } | undefined;
+
+  // A public worker exposes its process generation to the research-permit
+  // client and the checkpoint exporter via process env.
+  if (publicWorkerInstanceId) {
+    process.env.TERMINAL_RUNTIME_WORKER_GENERATION = publicWorkerInstanceId;
+  }
+
   function parseAllowedOrigins(raw: string | undefined): Set<string> | null {
     if (raw === undefined) return null;
     const entries = raw.split(",").map((entry) => entry.trim()).filter(Boolean);
@@ -287,11 +319,152 @@ else {
           // absolute public-session deadline remains unchanged.
           publicWorkerLifecycle.touch();
         }
+        recordCheckpointFrameEvents(rawState);
         sendToClient({ type: "frame", rows, width: cols, rows_count: rows.length, state: rawState });
       } catch (err) {
         console.warn("[render] error:", err instanceof Error ? err.message : String(err));
       }
     });
+  }
+
+  /** Project the authoritative frame state into checkpoint-legal fields. */
+  function projectCheckpointWorkerState(rawState: unknown): CheckpointWorkerState {
+    const state = rawState && typeof rawState === "object" && !Array.isArray(rawState)
+      ? rawState as Record<string, unknown>
+      : {};
+    const research = state.research && typeof state.research === "object"
+      ? state.research as Record<string, unknown>
+      : undefined;
+    const researchQueue = Array.isArray(state.researchQueue)
+      ? state.researchQueue.filter((job): job is Record<string, unknown> =>
+        Boolean(job) && typeof job === "object")
+      : undefined;
+    const dossier = state.dossier && typeof state.dossier === "object"
+      ? state.dossier as Record<string, unknown>
+      : undefined;
+    const packets = dossier?.packets && Array.isArray(dossier.packets)
+      ? dossier.packets.filter((p): p is Record<string, unknown> => Boolean(p) && typeof p === "object")
+      : undefined;
+    return {
+      ...(typeof state.screen === "string" ? { screen: state.screen } : {}),
+      ...(typeof state.symbol === "string" ? { symbol: state.symbol } : {}),
+      ...(typeof state.chartScope === "string" ? { chartScope: state.chartScope } : {}),
+      ...(typeof state.searchQuery === "string" ? { searchQuery: state.searchQuery } : {}),
+      ...(Array.isArray(state.available)
+        ? { available: state.available.filter((s): s is string => typeof s === "string") }
+        : {}),
+      ...(research
+        ? { research: projectResearchState(research) }
+        : {}),
+      ...(researchQueue
+        ? {
+            researchQueue: researchQueue
+              .map(projectResearchState)
+              .filter((job): job is NonNullable<typeof job> => job !== undefined),
+          }
+        : {}),
+      ...(dossier
+        ? {
+            dossier: {
+              ...(typeof dossier.title === "string" ? { title: dossier.title } : {}),
+              ...(typeof dossier.intent === "string" ? { intent: dossier.intent } : {}),
+              ...(typeof dossier.stage === "string" ? { stage: dossier.stage } : {}),
+              ...(typeof dossier.summary === "string" ? { summary: dossier.summary } : {}),
+              ...(Array.isArray(dossier.summarySourceIds)
+                ? { summarySourceIds: dossier.summarySourceIds.filter((s): s is string => typeof s === "string") }
+                : {}),
+              ...(typeof dossier.evidenceStatus === "string" ? { evidenceStatus: dossier.evidenceStatus } : {}),
+              ...(packets
+                ? {
+                    packets: packets.map((p) => ({
+                      ...(typeof p.sourceId === "string" ? { sourceId: p.sourceId } : {}),
+                      ...(typeof p.sourceTitle === "string" ? { sourceTitle: p.sourceTitle } : {}),
+                      ...(typeof p.sourceDomain === "string" ? { sourceDomain: p.sourceDomain } : {}),
+                      ...(typeof p.sourceUrl === "string" ? { sourceUrl: p.sourceUrl } : {}),
+                      ...(typeof p.retrievalStatus === "string" ? { retrievalStatus: p.retrievalStatus } : {}),
+                      ...(typeof p.extractedAt === "number" ? { extractedAt: p.extractedAt } : {}),
+                      ...(typeof p.excerpt === "string" ? { excerpt: p.excerpt } : {}),
+                      ...(typeof p.failureNote === "string" ? { failureNote: p.failureNote } : {}),
+                    })),
+                  }
+                : {}),
+            },
+          }
+        : {}),
+    };
+  }
+
+  function projectResearchState(job: Record<string, unknown>): CheckpointWorkerState["research"] {
+    return {
+      ...(typeof job.id === "string" ? { id: job.id } : {}),
+      ...(typeof job.contextLabel === "string" ? { contextLabel: job.contextLabel } : {}),
+      ...(typeof job.symbol === "string" ? { symbol: job.symbol } : {}),
+      ...(typeof job.outcome === "string" ? { outcome: job.outcome } : {}),
+      ...(typeof job.phase === "string" ? { phase: job.phase } : {}),
+      ...(typeof job.activity === "string" ? { activity: job.activity } : {}),
+      ...(typeof job.active === "boolean" ? { active: job.active } : {}),
+      ...(typeof job.updatedAt === "number" ? { updatedAt: job.updatedAt } : {}),
+    };
+  }
+
+  /** Record authoritative navigate/research events from frame transitions. */
+  function recordCheckpointFrameEvents(rawState: unknown): void {
+    const state = rawState && typeof rawState === "object" && !Array.isArray(rawState)
+      ? rawState as Record<string, unknown>
+      : {};
+    const screen = typeof state.screen === "string" ? state.screen : undefined;
+    const symbol = typeof state.symbol === "string" ? state.symbol : undefined;
+    const chartScope = typeof state.chartScope === "string" ? state.chartScope : undefined;
+    const research = state.research && typeof state.research === "object"
+      ? state.research as Record<string, unknown>
+      : undefined;
+    const researchActive = research?.active === true;
+    const researchPhase = typeof research?.phase === "string" ? research.phase : undefined;
+    const researchOutcome = typeof research?.outcome === "string" ? research.outcome : undefined;
+
+    if (
+      !lastCheckpointEventState
+      || screen !== lastCheckpointEventState.screen
+      || symbol !== lastCheckpointEventState.symbol
+      || chartScope !== lastCheckpointEventState.chartScope
+    ) {
+      recordServerCheckpointEvent(checkpointEventLog, "navigate", {
+        ...(screen ? { screen } : {}),
+        ...(symbol ? { symbol } : {}),
+        ...(chartScope ? { chartScope } : {}),
+      });
+    }
+
+    const wasActive = lastCheckpointEventState?.researchActive ?? false;
+    if (researchActive && !wasActive && (researchPhase === "dispatched" || researchPhase === "running")) {
+      recordServerCheckpointEvent(checkpointEventLog, "research-start", {
+        ...(typeof research?.symbol === "string" ? { symbol: research.symbol } : {}),
+        ...(typeof research?.contextLabel === "string" ? { contextLabel: research.contextLabel } : {}),
+      });
+    }
+    if (!researchActive && wasActive && researchPhase === "settled") {
+      if (researchOutcome === "complete") {
+        recordServerCheckpointEvent(checkpointEventLog, "research-complete", {
+          ...(typeof research?.symbol === "string" ? { symbol: research.symbol } : {}),
+          ...(typeof research?.contextLabel === "string" ? { contextLabel: research.contextLabel } : {}),
+          ...(typeof research?.id === "string" ? { id: research.id } : {}),
+        });
+      } else if (researchOutcome === "failed" || researchOutcome === "cancelled") {
+        recordServerCheckpointEvent(checkpointEventLog, "research-failed", {
+          ...(typeof research?.symbol === "string" ? { symbol: research.symbol } : {}),
+          ...(typeof research?.contextLabel === "string" ? { contextLabel: research.contextLabel } : {}),
+        });
+      }
+    }
+
+    lastCheckpointEventState = {
+      screen,
+      symbol,
+      chartScope,
+      researchActive,
+      researchPhase,
+      researchOutcome,
+    };
   }
 
   const web = createWebUi({
@@ -323,6 +496,32 @@ else {
   let sessionBootState: "starting" | "ready" | "failed" = "starting";
   const principalLease = new PrincipalLease();
 
+  // Fresh private-workspace import: when TERMINAL_WORKSPACE_IMPORT_FILE points
+  // at a validated checkpoint, boot an in-memory session seeded from it
+  // (custom state entry + bounded continuation seed) instead of an empty one.
+  let workspaceImportSessionManager: ReturnType<typeof SessionManager.inMemory> | undefined;
+  if (isWorkspaceCheckpointEnabled() && process.env.TERMINAL_WORKSPACE_IMPORT_FILE?.trim()) {
+    try {
+      const importFile = process.env.TERMINAL_WORKSPACE_IMPORT_FILE.trim();
+      const raw = JSON.parse(readFileSync(importFile, "utf8"));
+      workspaceImportSessionManager = importCheckpointIntoFreshSession({
+        checkpoint: raw,
+        cwd: CWD,
+      }).sessionManager;
+      console.log(`[workspace-import] booting fresh workspace from ${importFile}`);
+    } catch (error) {
+      if (process.env.NODE_ENV === "production") {
+        throw new Error(
+          `Cannot import workspace checkpoint: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      console.error(
+        "[workspace-import] checkpoint import failed; booting an empty session:",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }
+
   async function bootSession(): Promise<AgentSession> {
     console.log("[server] cwd:", CWD);
     console.log(`[server] research worker concurrency: ${RESEARCH_WORKER_CONCURRENCY}`);
@@ -346,7 +545,7 @@ else {
       noTools: "builtin",
       tools: [...MARKET_AGENT_TOOLS],
       resourceLoader: loader,
-      sessionManager: SessionManager.inMemory(CWD),
+      sessionManager: workspaceImportSessionManager ?? SessionManager.inMemory(CWD),
     });
     if (extensionsResult.errors.length) {
       session.dispose();
@@ -383,6 +582,32 @@ else {
       ...(publicWorkerInstanceId ? { publicWorker: true, instanceId: publicWorkerInstanceId } : {}),
     });
   });
+
+  // ── Private workspace checkpoint export (worker-side, never public) ─────
+  // The gateway calls this only for the active assigned session/generation.
+  // The worker's proxy-token middleware already guards every route below;
+  // the handler additionally requires the shared control token.
+  if (isWorkspaceCheckpointEnabled()) {
+    const workspaceCheckpointExport = createWorkspaceCheckpointExportHandler({
+      getExportContext: () => {
+        if (!publicWorkerInstanceId) return undefined;
+        const sessionId = process.env.TERMINAL_RUNTIME_SESSION_ID;
+        const generation = process.env.TERMINAL_RUNTIME_WORKER_GENERATION;
+        if (!sessionId || !generation) return undefined;
+        const rawState =
+          typeof activePanel?.debugState === "function" ? activePanel.debugState() : undefined;
+        return {
+          sessionId,
+          generation: workerGenerationEpoch(generation),
+          sourceRevision: generation,
+          state: projectCheckpointWorkerState(rawState),
+          eventLog: checkpointEventLog,
+        };
+      },
+    });
+    app.post(CHECKPOINT_EXPORT_PATH, workspaceCheckpointExport);
+    console.log("[workspace-checkpoint] worker export endpoint enabled");
+  }
 
   // ── Static files ────────────────────────────────────────────────────────
   if (existsSync(WEB_DIST)) {
@@ -459,6 +684,15 @@ else {
     // client-supplied header (Caddy strips it from the request first).
     const clientIp = (request.headers["x-real-ip"] as string | undefined)?.trim() || socketIp;
 
+    // Bind the current public session identity for permit gating + checkpoint
+    // export authorization. A worker serves one tenant at a time.
+    const connectedPrincipal = requestPrincipal(request);
+    if (connectedPrincipal && connectedPrincipal.startsWith("public:")) {
+      process.env.TERMINAL_RUNTIME_SESSION_ID = connectedPrincipal.slice("public:".length);
+    } else {
+      delete process.env.TERMINAL_RUNTIME_SESSION_ID;
+    }
+
     console.log("[ws] client connected");
     publicWorkerLifecycle?.connectedClient();
     const previousClient = activeClient;
@@ -516,6 +750,10 @@ else {
           publicWorkerLifecycle?.touch();
           // Open a panel by name. "market" with args opens a ticker, e.g. {args:"NKE"}.
           if (msg.name === "market") openMarket(typeof msg.args === "string" ? msg.args : "");
+          recordServerCheckpointEvent(checkpointEventLog, "command", {
+            name: String(msg.name ?? "").slice(0, 32),
+            ...(typeof msg.args === "string" ? { args: msg.args.slice(0, 64) } : {}),
+          });
           break;
         case "select_response": {
           publicWorkerLifecycle?.touch();
@@ -563,6 +801,7 @@ else {
 
     ws.on("close", () => {
       console.log("[ws] client disconnected");
+      delete process.env.TERMINAL_RUNTIME_SESSION_ID;
       if (activeClient !== ws) return;
       activeClient = null;
       sendToClient = () => {};

@@ -141,3 +141,64 @@ deployment fallback for a normal terminal release.
 The authoritative infrastructure details, including production secrets and
 host safety controls, live in
 [`unchained-infra/docs/fin-terminal-route.md`](https://github.com/protostatis/unchained-infra/blob/main/docs/fin-terminal-route.md).
+
+## Private Management API Contract (warm-pool reconciler)
+
+The gateway exposes a **private-only** management listener (default
+`TERMINAL_RUNTIME_MANAGEMENT_PORT=8789`, separate from the public port). It is
+enabled only when **both** `TERMINAL_RUNTIME_FEATURE_ENABLED=1` and
+`TERMINAL_RUNTIME_MANAGEMENT_TOKEN` (>= 32 chars) are set. Every request must
+send the `X-Management-Token` header. No management path is ever mounted on the
+public listener.
+
+Infra reconciler endpoints (POST, JSON):
+
+| Path                             | Body                          | Returns                                        |
+| -------------------------------- | ----------------------------- | ---------------------------------------------- |
+| `/api/management/reconcile-snapshot` | —                         | `{ seats[], plan }` per-seat statuses + plan   |
+| `/api/management/reconcile-plan` | —                             | `{ reconciled, plan }` desired warm-pool plan  |
+| `/api/management/drain`          | `{ workerId, drainId }`       | `{ accepted }` or 409                          |
+| `/api/management/activate`       | `{ workerId }`                | `{ activated }` (sticky drain force-releases)  |
+
+Worker→gateway permit surface (same private listener, same header):
+
+| Path                                     | Body                                                        |
+| ---------------------------------------- | ----------------------------------------------------------- |
+| `/api/management/research-permits/acquire`   | `{ sessionId, workerGeneration, requestId? }`           |
+| `/api/management/research-permits/status`    | `{ requestId }`                                        |
+| `/api/management/research-permits/heartbeat` | `{ requestId, sessionId? }` (extends the session idle lease) |
+| `/api/management/research-permits/release`   | `{ requestId }`                                        |
+
+Workers reach the gateway's private listener via
+`TERMINAL_RUNTIME_MANAGEMENT_URL` (e.g. `http://public-gateway:8789`) and
+`TERMINAL_RUNTIME_MANAGEMENT_TOKEN`. The worker exposes its own identity to the
+permit gate through `TERMINAL_RUNTIME_WORKER_GENERATION` (set at boot) and
+`TERMINAL_RUNTIME_SESSION_ID` (set on public WebSocket attach).
+
+Legacy aliases (`GET /api/management/seats`, `POST /api/management/seats/:id/drain`,
+`POST /api/management/seats/:id/activate`, `POST /api/management/reconcile`,
+`GET /api/management/research`) remain for existing tooling; the reconciler
+contract paths above are canonical.
+
+## Workspace Checkpoint / Handoff Contract
+
+Feature-gated by `FINANCIAL_WORKSPACE_CHECKPOINTS=1`. Checkpoint content is
+always built from the assigned worker's authoritative state; the browser only
+sends an explicit opt-in.
+
+- Worker private export: `POST /internal/financial-workspace/checkpoint-export`
+  on the live worker (requires `X-Fin-Terminal-Control-Token`, plus the normal
+  `X-Fin-Terminal-Proxy-Token` route auth). Body `{ sessionId, generation }`;
+  the generation is a deterministic epoch derived from the opaque worker
+  generation. The gateway calls this only for the active assigned
+  session/generation.
+- Browser opt-in: `POST /api/public/workspace-handoff` on the public listener
+  (visitor + ticket tokens). The gateway exports from the worker, forwards to
+  the workspace service at `FINANCIAL_WORKSPACE_SERVICE_URL` (Bearer
+  `FINANCIAL_WORKSPACE_CONTROL_TOKEN`), and sets the handoff secret as an
+  HttpOnly cookie. The handoff secret never reaches browser JS.
+- Private import boot: a fresh in-memory workspace boots from a validated
+  checkpoint (`SessionManager.inMemory` + custom entry + bounded continuation
+  seed). Raw transcript/process state is never restored. In the terminal image,
+  `TERMINAL_WORKSPACE_IMPORT_FILE` can point at a validated checkpoint JSON for
+  an imported workspace boot; `NODE_ENV=production` fails closed on a bad file.

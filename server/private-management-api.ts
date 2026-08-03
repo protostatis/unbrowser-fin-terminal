@@ -1,16 +1,34 @@
 /**
- * Private management API listener for warm-pool capacity operations.
+ * Private management API listener for warm-pool capacity operations and the
+ * global research-permit surface.
  *
- * Listens on a separate port (default 8789, configurable). Access is gated
- * by a dedicated token (header-based). The API does NOT expose Docker,
- * secrets, or browser identity material.
+ * Listens on a separate port (default 8789, configurable via
+ * `TERMINAL_RUNTIME_MANAGEMENT_PORT`) and is reached only over the private
+ * network. Access is gated by a dedicated token (`X-Management-Token`).
+ * The API does NOT expose Docker, secrets, or browser identity material.
  *
- * Endpoints:
- *   GET  /api/management/seats         — per-seat status/plan
- *   POST /api/management/seats/:id/drain — drain a seat
- *   POST /api/management/seats/:id/activate — activate a drained seat
- *   POST /api/management/reconcile     — force re-evaluation of the warm pool
- *   GET  /api/management/research      — research permit status
+ * Infra reconciler contract (exact paths, POST only):
+ *   POST /api/management/reconcile-snapshot — per-seat statuses + plan
+ *   POST /api/management/reconcile-plan     — desired warm-pool plan only
+ *   POST /api/management/drain              — { workerId, drainId }
+ *   POST /api/management/activate           — { workerId }
+ *
+ * Worker permit surface (worker→gateway private client):
+ *   POST /api/management/research-permits/acquire   — { sessionId, workerGeneration }
+ *   POST /api/management/research-permits/status    — { requestId }
+ *   POST /api/management/research-permits/heartbeat — { requestId, sessionId? }
+ *   POST /api/management/research-permits/release   — { requestId }
+ *
+ * Compatibility aliases (kept for existing tooling):
+ *   GET  /api/management/seats                    → reconcile-snapshot
+ *   POST /api/management/seats/:id/drain          → drain
+ *   POST /api/management/seats/:id/activate       → activate
+ *   POST /api/management/reconcile                → reconcile-plan
+ *   GET  /api/management/research                 → permit metrics
+ *
+ * Feature-gated by `TERMINAL_RUNTIME_FEATURE_ENABLED=1` plus
+ * `TERMINAL_RUNTIME_MANAGEMENT_TOKEN` (>= 32 chars). The public listener
+ * never mounts these paths.
  */
 
 import { createServer, type IncomingMessage, type Server as HttpServer } from "node:http";
@@ -25,7 +43,7 @@ export interface ManagementApiConfig {
   enabled: boolean;
 }
 
-const MATH_SCRIPT_ALLOWED = /^[A-Za-z0-9_-]{1,64}$/;
+const SEAT_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 
 function singleHeader(request: IncomingMessage, name: string): string | undefined {
   const value = request.headers[name];
@@ -110,8 +128,37 @@ interface ManagementApiDependencies {
   getSeatStatuses: () => SeatStatus[];
   getWarmPool: () => CapacityWarmPool;
   getResearchCoordinator: () => ResearchPermitCoordinator;
+  /** Extend the owning public session's idle lease (used by permit heartbeat). */
+  touchSession?: (sessionId: string) => void;
   mutate: <T>(operation: () => T | Promise<T>) => Promise<T>;
   inspect: <T>(operation: () => T) => Promise<T>;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function requireBodyObject(
+  socket: Socket,
+  request: IncomingMessage,
+): Promise<Record<string, unknown> | undefined> {
+  return readJsonBody(request).then(
+    (body) => {
+      if (!isRecord(body)) {
+        textResponse(socket, 400, "Bad Request: JSON object required");
+        return undefined;
+      }
+      return body;
+    },
+    (err: unknown) => {
+      textResponse(
+        socket,
+        400,
+        `Bad Request: ${err instanceof Error ? err.message : "unknown"}`,
+      );
+      return undefined;
+    },
+  );
 }
 
 export function startManagementApi(
@@ -145,135 +192,325 @@ export function startManagementApi(
     const method = (request.method ?? "GET").toUpperCase();
     const path = parsed.pathname;
 
-    // ── GET /api/management/seats ─────────────────────────────
-    if (method === "GET" && path === "/api/management/seats") {
+    // ── Shared plan computation ──────────────────────────────────────────
+    const snapshotFor = (): {
+      seats: SeatStatus[];
+      plan: ReturnType<CapacityWarmPool["plan"]>;
+    } => {
+      const seats = deps.getSeatStatuses();
+      const plan = deps.getWarmPool().plan(seats);
+      return { seats, plan };
+    };
+    const seatList = (seats: SeatStatus[]) => seats.map((s) => ({
+      workerId: s.workerId,
+      phase: s.phase,
+      generation: s.generation ?? null,
+      sessionId: s.sessionId ?? null,
+      idleSinceMs: s.idleSinceMs ?? null,
+      drainRequested: s.drainRequested,
+      drainId: s.drainId ?? null,
+    }));
+
+    // ── POST /api/management/reconcile-snapshot ──────────────────────────
+    if (method === "POST" && path === "/api/management/reconcile-snapshot") {
       try {
-        const seats = await deps.inspect(() => deps.getSeatStatuses());
-        const warmPool = deps.getWarmPool();
-        const plan = warmPool.plan(seats);
+        const snapshot = await deps.inspect(snapshotFor);
         jsonResponse(socket, 200, {
-          seats: seats.map((s) => ({
-            workerId: s.workerId,
-            phase: s.phase,
-            generation: s.generation ?? null,
-            sessionId: s.sessionId ?? null,
-            idleSinceMs: s.idleSinceMs ?? null,
-            drainRequested: s.drainRequested,
-            drainId: s.drainId ?? null,
-          })),
+          seats: seatList(snapshot.seats),
+          plan: {
+            desiredRunning: snapshot.plan.desiredRunning,
+            scaleDownCandidates: snapshot.plan.scaleDownCandidates,
+            activateCandidates: snapshot.plan.activateCandidates,
+          },
+        });
+      } catch {
+        jsonResponse(socket, 500, { error: "internal error" });
+      }
+      return;
+    }
+
+    // ── POST /api/management/reconcile-plan ──────────────────────────────
+    if (method === "POST" && path === "/api/management/reconcile-plan") {
+      try {
+        const plan = await deps.inspect(() => snapshotFor().plan);
+        jsonResponse(socket, 200, {
+          reconciled: true,
           plan: {
             desiredRunning: plan.desiredRunning,
             scaleDownCandidates: plan.scaleDownCandidates,
             activateCandidates: plan.activateCandidates,
           },
         });
-      } catch (error) {
+      } catch {
         jsonResponse(socket, 500, { error: "internal error" });
       }
       return;
     }
 
-    // ── POST /api/management/seats/:id/drain ──────────────────
-    const drainMatch = path.match(/^\/api\/management\/seats\/([A-Za-z0-9_-]+)\/drain$/);
-    if (method === "POST" && drainMatch) {
-      const workerId = drainMatch[1];
-      if (!MATH_SCRIPT_ALLOWED.test(workerId)) {
-        textResponse(socket, 400, "Bad Request: invalid seat id");
+    // ── POST /api/management/drain ───────────────────────────────────────
+    if (method === "POST" && path === "/api/management/drain") {
+      const body = await requireBodyObject(socket, request);
+      if (!body) return;
+      const workerId = body.workerId;
+      const drainId = body.drainId;
+      if (typeof workerId !== "string" || !SEAT_ID_PATTERN.test(workerId)) {
+        textResponse(socket, 400, "Bad Request: workerId required (URL-safe, 1-64 chars)");
         return;
       }
-
-      let body: unknown;
-      try {
-        body = await readJsonBody(request);
-      } catch (err) {
-        textResponse(socket, 400, `Bad Request: ${err instanceof Error ? err.message : "unknown"}`);
-        return;
-      }
-
-      if (!body || typeof body !== "object" || Array.isArray(body)) {
-        textResponse(socket, 400, "Bad Request: JSON object required");
-        return;
-      }
-
-      const drainId = (body as Record<string, unknown>).drainId;
       if (typeof drainId !== "string" || drainId.length === 0 || drainId.length > 128) {
         textResponse(socket, 400, "Bad Request: drainId required (string, 1-128 chars)");
         return;
       }
-
       try {
         const result = await deps.mutate(() => {
-          const seats = deps.getSeatStatuses();
-          const seat = seats.find((s) => s.workerId === workerId);
+          const seat = deps.getSeatStatuses().find((s) => s.workerId === workerId);
           if (!seat) return { accepted: false, reason: "unknown seat" };
           return deps.getWarmPool().requestDrain(seat, drainId);
         });
-
         if (result.accepted) {
           jsonResponse(socket, 200, { accepted: true, drainId: (result as { drainId: string }).drainId });
         } else {
           jsonResponse(socket, 409, { accepted: false, reason: (result as { reason: string }).reason });
         }
-      } catch (error) {
+      } catch {
         jsonResponse(socket, 500, { error: "internal error" });
       }
       return;
     }
 
-    // ── POST /api/management/seats/:id/activate ──────────────
-    const activateMatch = path.match(/^\/api\/management\/seats\/([A-Za-z0-9_-]+)\/activate$/);
-    if (method === "POST" && activateMatch) {
-      const workerId = activateMatch[1];
-      if (!MATH_SCRIPT_ALLOWED.test(workerId)) {
-        textResponse(socket, 400, "Bad Request: invalid seat id");
+    // ── POST /api/management/activate ────────────────────────────────────
+    if (method === "POST" && path === "/api/management/activate") {
+      const body = await requireBodyObject(socket, request);
+      if (!body) return;
+      const workerId = body.workerId;
+      if (typeof workerId !== "string" || !SEAT_ID_PATTERN.test(workerId)) {
+        textResponse(socket, 400, "Bad Request: workerId required (URL-safe, 1-64 chars)");
         return;
       }
-
       try {
         const result = await deps.mutate(() => {
-          const seats = deps.getSeatStatuses();
-          const seat = seats.find((s) => s.workerId === workerId);
+          const seat = deps.getSeatStatuses().find((s) => s.workerId === workerId);
           if (!seat) return { released: false, reason: "unknown seat" };
           return deps.getWarmPool().releaseDrain(workerId, seat.generation);
         });
-
         if (result.released) {
           jsonResponse(socket, 200, { activated: true });
         } else {
-          // Try force release if sticky
+          // Try force release if sticky.
           deps.getWarmPool().forceReleaseDrain(workerId);
           jsonResponse(socket, 200, { activated: true, note: "force-released" });
         }
-      } catch (error) {
+      } catch {
         jsonResponse(socket, 500, { error: "internal error" });
       }
       return;
     }
 
-    // ── POST /api/management/reconcile ──────────────────────
-    if (method === "POST" && path === "/api/management/reconcile") {
+    // ── Research-permit surface ──────────────────────────────────────────
+
+    // POST /api/management/research-permits/acquire
+    if (method === "POST" && path === "/api/management/research-permits/acquire") {
+      const body = await requireBodyObject(socket, request);
+      if (!body) return;
+      const sessionId = body.sessionId;
+      const workerGeneration = body.workerGeneration;
+      const requestId = body.requestId;
+      if (typeof sessionId !== "string" || sessionId.length === 0 || sessionId.length > 128) {
+        textResponse(socket, 400, "Bad Request: sessionId required (1-128 chars)");
+        return;
+      }
+      if (typeof workerGeneration !== "string" || workerGeneration.length === 0 || workerGeneration.length > 160) {
+        textResponse(socket, 400, "Bad Request: workerGeneration required (1-160 chars)");
+        return;
+      }
+      if (requestId !== undefined && (typeof requestId !== "string" || requestId.length === 0 || requestId.length > 128)) {
+        textResponse(socket, 400, "Bad Request: requestId must be a string (1-128 chars)");
+        return;
+      }
+      try {
+        const result = await deps.mutate(() =>
+          deps.getResearchCoordinator().acquire(
+            sessionId,
+            workerGeneration,
+            typeof requestId === "string" ? requestId : undefined,
+          ),
+        );
+        jsonResponse(socket, 200, {
+          accepted: result.accepted,
+          status: result.status,
+          ...(result.permit ? { requestId: result.permit.requestId } : {}),
+          ...(result.queuePosition !== undefined ? { queuePosition: result.queuePosition } : {}),
+          ...(result.reason ? { reason: result.reason } : {}),
+        });
+      } catch {
+        jsonResponse(socket, 500, { error: "internal error" });
+      }
+      return;
+    }
+
+    // POST /api/management/research-permits/status
+    if (method === "POST" && path === "/api/management/research-permits/status") {
+      const body = await requireBodyObject(socket, request);
+      if (!body) return;
+      const requestId = body.requestId;
+      if (typeof requestId !== "string" || requestId.length === 0 || requestId.length > 128) {
+        textResponse(socket, 400, "Bad Request: requestId required (1-128 chars)");
+        return;
+      }
+      try {
+        const permit = await deps.inspect(() => deps.getResearchCoordinator().status(requestId));
+        jsonResponse(socket, 200, {
+          requestId,
+          status: permit?.status ?? "not-found",
+        });
+      } catch {
+        jsonResponse(socket, 500, { error: "internal error" });
+      }
+      return;
+    }
+
+    // POST /api/management/research-permits/heartbeat
+    if (method === "POST" && path === "/api/management/research-permits/heartbeat") {
+      const body = await requireBodyObject(socket, request);
+      if (!body) return;
+      const requestId = body.requestId;
+      const sessionId = body.sessionId;
+      if (typeof requestId !== "string" || requestId.length === 0 || requestId.length > 128) {
+        textResponse(socket, 400, "Bad Request: requestId required (1-128 chars)");
+        return;
+      }
       try {
         const result = await deps.mutate(() => {
-          const seats = deps.getSeatStatuses();
-          const plan = deps.getWarmPool().plan(seats);
-          return plan;
+          const hb = deps.getResearchCoordinator().heartbeat(requestId);
+          // A queued research wait must keep an otherwise active session from
+          // idle-expiring; the 15-minute absolute limit remains unchanged.
+          if (hb.alive && typeof sessionId === "string" && sessionId.length > 0) {
+            deps.touchSession?.(sessionId);
+          }
+          return hb;
         });
+        jsonResponse(socket, 200, { alive: result.alive, ...(result.reason ? { reason: result.reason } : {}) });
+      } catch {
+        jsonResponse(socket, 500, { error: "internal error" });
+      }
+      return;
+    }
 
+    // POST /api/management/research-permits/release
+    if (method === "POST" && path === "/api/management/research-permits/release") {
+      const body = await requireBodyObject(socket, request);
+      if (!body) return;
+      const requestId = body.requestId;
+      if (typeof requestId !== "string" || requestId.length === 0 || requestId.length > 128) {
+        textResponse(socket, 400, "Bad Request: requestId required (1-128 chars)");
+        return;
+      }
+      try {
+        const result = await deps.mutate(() => deps.getResearchCoordinator().release(requestId));
+        jsonResponse(socket, 200, { released: result.released, ...(result.reason ? { reason: result.reason } : {}) });
+      } catch {
+        jsonResponse(socket, 500, { error: "internal error" });
+      }
+      return;
+    }
+
+    // ── Compatibility aliases ────────────────────────────────────────────
+
+    // GET /api/management/seats (alias for reconcile-snapshot)
+    if (method === "GET" && path === "/api/management/seats") {
+      try {
+        const snapshot = await deps.inspect(snapshotFor);
+        jsonResponse(socket, 200, {
+          seats: seatList(snapshot.seats),
+          plan: {
+            desiredRunning: snapshot.plan.desiredRunning,
+            scaleDownCandidates: snapshot.plan.scaleDownCandidates,
+            activateCandidates: snapshot.plan.activateCandidates,
+          },
+        });
+      } catch {
+        jsonResponse(socket, 500, { error: "internal error" });
+      }
+      return;
+    }
+
+    // POST /api/management/seats/:id/drain (alias for drain)
+    const drainMatch = path.match(/^\/api\/management\/seats\/([A-Za-z0-9_-]+)\/drain$/);
+    if (method === "POST" && drainMatch) {
+      const workerId = drainMatch[1];
+      if (!SEAT_ID_PATTERN.test(workerId)) {
+        textResponse(socket, 400, "Bad Request: invalid seat id");
+        return;
+      }
+      const body = await requireBodyObject(socket, request);
+      if (!body) return;
+      const drainId = body.drainId;
+      if (typeof drainId !== "string" || drainId.length === 0 || drainId.length > 128) {
+        textResponse(socket, 400, "Bad Request: drainId required (string, 1-128 chars)");
+        return;
+      }
+      try {
+        const result = await deps.mutate(() => {
+          const seat = deps.getSeatStatuses().find((s) => s.workerId === workerId);
+          if (!seat) return { accepted: false, reason: "unknown seat" };
+          return deps.getWarmPool().requestDrain(seat, drainId);
+        });
+        if (result.accepted) {
+          jsonResponse(socket, 200, { accepted: true, drainId: (result as { drainId: string }).drainId });
+        } else {
+          jsonResponse(socket, 409, { accepted: false, reason: (result as { reason: string }).reason });
+        }
+      } catch {
+        jsonResponse(socket, 500, { error: "internal error" });
+      }
+      return;
+    }
+
+    // POST /api/management/seats/:id/activate (alias for activate)
+    const activateMatch = path.match(/^\/api\/management\/seats\/([A-Za-z0-9_-]+)\/activate$/);
+    if (method === "POST" && activateMatch) {
+      const workerId = activateMatch[1];
+      if (!SEAT_ID_PATTERN.test(workerId)) {
+        textResponse(socket, 400, "Bad Request: invalid seat id");
+        return;
+      }
+      try {
+        const result = await deps.mutate(() => {
+          const seat = deps.getSeatStatuses().find((s) => s.workerId === workerId);
+          if (!seat) return { released: false, reason: "unknown seat" };
+          return deps.getWarmPool().releaseDrain(workerId, seat.generation);
+        });
+        if (result.released) {
+          jsonResponse(socket, 200, { activated: true });
+        } else {
+          deps.getWarmPool().forceReleaseDrain(workerId);
+          jsonResponse(socket, 200, { activated: true, note: "force-released" });
+        }
+      } catch {
+        jsonResponse(socket, 500, { error: "internal error" });
+      }
+      return;
+    }
+
+    // POST /api/management/reconcile (alias for reconcile-plan)
+    if (method === "POST" && path === "/api/management/reconcile") {
+      try {
+        const plan = await deps.inspect(() => snapshotFor().plan);
         jsonResponse(socket, 200, {
           reconciled: true,
           plan: {
-            desiredRunning: result.desiredRunning,
-            scaleDownCandidates: result.scaleDownCandidates,
-            activateCandidates: result.activateCandidates,
+            desiredRunning: plan.desiredRunning,
+            scaleDownCandidates: plan.scaleDownCandidates,
+            activateCandidates: plan.activateCandidates,
           },
         });
-      } catch (error) {
+      } catch {
         jsonResponse(socket, 500, { error: "internal error" });
       }
       return;
     }
 
-    // ── GET /api/management/research ─────────────────────────
+    // GET /api/management/research (alias for permit metrics)
     if (method === "GET" && path === "/api/management/research") {
       try {
         const metrics = await deps.inspect(() => deps.getResearchCoordinator().metrics());
@@ -284,13 +521,13 @@ export function startManagementApi(
             maxConcurrent: metrics.maxConcurrent,
           },
         });
-      } catch (error) {
+      } catch {
         jsonResponse(socket, 500, { error: "internal error" });
       }
       return;
     }
 
-    // ── 404 ──────────────────────────────────────────────────
+    // ── 404 ──────────────────────────────────────────────────────────────
     textResponse(socket, 404, "Not Found");
   });
 

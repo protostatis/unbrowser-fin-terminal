@@ -1,60 +1,35 @@
 /**
- * Client-side checkpoint builder and submitter for the public live terminal.
+ * Client-side workspace-handoff opt-in.
  *
- * Accumulates a semantic event projection from user actions and frame state,
- * builds a validated checkpoint when the user explicitly opts in before timeout,
- * and submits it to the gateway's checkpoint endpoint.
- *
- * This module never has access to server-side secrets, cookies, or
- * credentials — those are handled entirely server-side via HttpOnly cookies.
+ * The browser NEVER builds checkpoint content: checkpoints are exported from
+ * the assigned worker's authoritative state by the gateway, which then sets
+ * the handoff secret as an HttpOnly cookie. This module only records a local
+ * "meaningful activity" flag for CTA gating and sends the explicit opt-in
+ * request. The handoff secret never reaches browser JS.
  */
 
 import type {
-  FinancialTerminalCheckpoint,
   CheckpointEvent,
-  CheckpointCanvas,
-  CheckpointPacket,
-  CheckpointContext,
-  CheckpointInterruptedWork,
 } from "../../shared/financial-workspace-checkpoint";
-import type { TerminalFrameState, ChartScope } from "./mobile-controls";
-import type { TerminalDossier, DossierPacket } from "./dossier";
 
-const CHECKPOINT_SUBMIT_PATH = "/internal/financial-workspace/checkpoints";
+const WORKSPACE_HANDOFF_PATH = "/api/public/workspace-handoff";
 
-// ──── Accumulated Session State ─────────────────────────────────────────────
+// ──── Accumulated Session State (display gating only) ───────────────────────
 
 export interface SessionAccumulator {
-  /** Running log of semantic user-visible events. */
+  /** Running log of semantic user-visible events (display diagnostics only). */
   events: CheckpointEvent[];
-  /** Last known terminal frame state (for context extraction). */
-  lastFrameState?: TerminalFrameState;
-  /** Last known dossier (for canvas extraction). */
-  lastDossier?: TerminalDossier;
   /** Whether any meaningful user activity has occurred in this session. */
   hasMeaningfulActivity: boolean;
-  /** Latest research state if interrupted. */
-  latestResearchState?: TerminalFrameState["research"];
-  /** Count of completed research runs. */
-  researchRunCount: number;
-  /** Latest watchlist. */
-  watchlist: string[];
 }
 
 export function createSessionAccumulator(): SessionAccumulator {
-  return {
-    events: [],
-    hasMeaningfulActivity: false,
-    researchRunCount: 0,
-    watchlist: [],
-  };
+  return { events: [], hasMeaningfulActivity: false };
 }
 
-// ──── Event Recording ───────────────────────────────────────────────────────
-
 /**
- * Record a user-visible semantic event.
- * Called by the UI layer when the user types, navigates, starts research, etc.
+ * Record a user-visible semantic event locally. This data is never uploaded;
+ * it only drives whether the "Keep in workspace" CTA is shown at all.
  */
 export function recordEvent(
   acc: SessionAccumulator,
@@ -63,8 +38,6 @@ export function recordEvent(
 ): void {
   const now = Date.now();
   acc.events.push({ at: now, type, data });
-
-  // Track meaningful activity
   if (
     type === "prompt"
     || type === "command"
@@ -73,221 +46,22 @@ export function recordEvent(
   ) {
     acc.hasMeaningfulActivity = true;
   }
-
-  // Track research completions
-  if (type === "research-complete") {
-    acc.researchRunCount += 1;
-  }
 }
 
 /**
- * Update the accumulator with the latest frame state.
- * Call on every frame message received from the server.
+ * Update the local activity gate from a frame. This never produces checkpoint
+ * content — it only decides whether the "Keep in workspace" CTA is shown.
  */
-export function updateFrameState(
+export function updateFrameActivity(
   acc: SessionAccumulator,
-  state: TerminalFrameState | undefined,
-  dossier?: TerminalDossier,
+  state: { research?: { active?: boolean }; symbol?: string; screen?: string } | undefined,
 ): void {
-  acc.lastFrameState = state;
-  if (dossier) acc.lastDossier = dossier;
-
-  if (state) {
-    // Track screen/symbol changes
-    if (state.screen) {
-      const lastScreen = acc.events
-        .filter((e) => e.type === "navigate")
-        .slice(-1)[0];
-      if (!lastScreen || lastScreen.data.screen !== state.screen) {
-        const data: Record<string, unknown> = { screen: state.screen };
-        if (state.mode === "ticker" && state.symbol) data.symbol = state.symbol;
-        if (state.chartScope) data.chartScope = state.chartScope;
-        recordEvent(acc, "navigate", data);
-      }
-    }
-
-    // Track research state changes
-    if (state.research) {
-      const currentResearch = acc.latestResearchState;
-      if (
-        !currentResearch?.active
-        && state.research.active
-        && state.research.phase === "dispatched"
-      ) {
-        recordEvent(acc, "research-start", {
-          symbol: state.research.symbol ?? state.symbol,
-          contextLabel: state.research.contextLabel,
-        });
-      }
-      if (
-        currentResearch?.active
-        && !state.research.active
-        && state.research.phase === "settled"
-        && state.research.outcome === "complete"
-      ) {
-        recordEvent(acc, "research-complete", {
-          symbol: state.research.symbol ?? state.symbol,
-          contextLabel: state.research.contextLabel,
-          id: state.research.id,
-        });
-      }
-      if (
-        currentResearch?.active
-        && !state.research.active
-        && state.research.phase === "settled"
-        && state.research.outcome === "failed"
-      ) {
-        recordEvent(acc, "research-failed", {
-          symbol: state.research.symbol ?? state.symbol,
-          contextLabel: state.research.contextLabel,
-        });
-      }
-      acc.latestResearchState = state.research;
-    }
-
-    // Track watchlist
-    if (state.available && Array.isArray(state.available) && state.screen === "WATCH") {
-      acc.watchlist = state.available.filter(
-        (s): s is string => typeof s === "string" && s.length > 0,
-      );
-    }
-  }
+  if (!state) return;
+  if (state.research?.active === true) acc.hasMeaningfulActivity = true;
+  if (typeof state.symbol === "string" && state.symbol.length > 0) acc.hasMeaningfulActivity = true;
 }
 
-// ──── Checkpoint Builder ────────────────────────────────────────────────────
-
-/**
- * Build a checkpoint from accumulated session state.
- * This is called when the user explicitly opts in before a public timeout.
- */
-export function buildCheckpoint(
-  acc: SessionAccumulator,
-  sessionId: string,
-  generation: number,
-  sourceRevision?: string,
-): FinancialTerminalCheckpoint {
-  const now = Date.now();
-
-  // Extract context from last frame state
-  const context: CheckpointContext = {};
-  if (acc.lastFrameState) {
-    const state = acc.lastFrameState;
-    if (state.screen) context.screen = state.screen;
-    if (state.symbol) context.symbol = state.symbol;
-    if (state.chartScope) context.chartScope = state.chartScope as ChartScope;
-    if (state.searchQuery) context.searchQuery = state.searchQuery;
-  }
-  if (acc.watchlist.length > 0) {
-    context.watchlist = acc.watchlist;
-  }
-
-  // Extract canvases from dossier
-  const canvases: CheckpointCanvas[] = [];
-  if (acc.lastDossier) {
-    canvases.push(buildCanvasFromDossier(acc.lastDossier));
-  }
-
-  // Extract interrupted work
-  let interruptedWork: CheckpointInterruptedWork | undefined;
-  if (acc.latestResearchState?.active) {
-    interruptedWork = {
-      activeResearch: {
-        symbol: acc.latestResearchState.symbol,
-        contextLabel: acc.latestResearchState.contextLabel,
-        activity: acc.latestResearchState.activity,
-        phase: acc.latestResearchState.phase,
-        startedAt: acc.latestResearchState.updatedAt,
-      },
-    };
-  }
-
-  // Build the checkpoint
-  const checkpoint: FinancialTerminalCheckpoint = {
-    version: 1,
-    id: `${sessionId}-checkpoint-${now.toString(36)}`,
-    source: {
-      sessionId,
-      generation,
-      ...(sourceRevision ? { sourceRevision } : {}),
-    },
-    createdAt: now,
-    expiresAt: now + 60 * 60 * 1000, // 1 hour unclaimed retention
-    eventLog: acc.events,
-    context,
-    canvases,
-    ...(interruptedWork ? { interruptedWork } : {}),
-    continuationSummary: "",
-  };
-
-  // Build continuation summary
-  checkpoint.continuationSummary = buildContinuationSummary(checkpoint);
-
-  return checkpoint;
-}
-
-function buildCanvasFromDossier(dossier: TerminalDossier): CheckpointCanvas {
-  const packets: CheckpointPacket[] = (dossier.packets ?? []).map(
-    (packet: DossierPacket): CheckpointPacket => ({
-      sourceId: packet.sourceId,
-      sourceTitle: packet.sourceTitle,
-      sourceDomain: packet.sourceDomain,
-      excerpt: packet.excerpt,
-      retrievalStatus: packet.retrievalStatus,
-      extractedAt: packet.extractedAt,
-    }),
-  );
-
-  return {
-    id: `canvas-${Date.now().toString(36)}`,
-    title: dossier.title,
-    intent: dossier.intent ?? "brief",
-    stage: dossier.stage ?? "partial",
-    summary: dossier.summary,
-    summarySourceIds: dossier.summarySourceIds,
-    evidenceStatus: dossier.evidenceStatus ?? "pending",
-    packets,
-  };
-}
-
-function buildContinuationSummary(checkpoint: FinancialTerminalCheckpoint): string {
-  const lines: string[] = [];
-
-  if (checkpoint.context.symbol) {
-    lines.push(`Continue from a saved checkpoint: ${checkpoint.context.symbol}`);
-  } else {
-    lines.push("Continue from a saved checkpoint");
-  }
-
-  if (checkpoint.canvases.length > 0) {
-    const completed = checkpoint.canvases.filter((c) => c.stage === "complete").length;
-    const partial = checkpoint.canvases.filter((c) => c.stage === "partial").length;
-    const parts: string[] = [];
-    if (completed > 0) parts.push(`${completed} completed canvas${completed !== 1 ? "es" : ""}`);
-    if (partial > 0) parts.push(`${partial} partial`);
-    lines.push(`Research: ${parts.join(", ")}`);
-  }
-
-  const researchComplete = checkpoint.eventLog.filter(
-    (e) => e.type === "research-complete",
-  ).length;
-  if (researchComplete > 0) {
-    lines.push(`${researchComplete} research run${researchComplete !== 1 ? "s" : ""} completed`);
-  }
-
-  if (checkpoint.interruptedWork?.activeResearch) {
-    const label =
-      checkpoint.interruptedWork.activeResearch.contextLabel
-      ?? checkpoint.interruptedWork.activeResearch.symbol
-      ?? "unknown";
-    lines.push(`Interrupted research on ${label} — available for continuation`);
-  }
-
-  return lines.join(". ") + ".";
-}
-
-// ──── Checkpoint Submission ─────────────────────────────────────────────────
-
-export interface CheckpointSubmitResult {
+export interface WorkspaceHandoffResult {
   checkpointId: string;
   expiresAt: number;
   handoffId: string;
@@ -295,33 +69,20 @@ export interface CheckpointSubmitResult {
 }
 
 /**
- * Submit a checkpoint to the gateway's internal endpoint.
- * The handoff secret is handled server-side via HttpOnly cookie.
+ * Explicit opt-in. Sends the verified visitor + ticket tokens; the gateway
+ * verifies the active assignment, exports the authoritative checkpoint from
+ * the worker, forwards it to workspace control, and sets the HttpOnly handoff
+ * cookie. Only safe fields are returned to JS.
  */
-export async function submitCheckpoint(
-  sessionId: string,
-  workerId: string,
-  generation: number,
-  sourceRevision: string | undefined,
-  checkpoint: FinancialTerminalCheckpoint,
-): Promise<{ success: true; result: CheckpointSubmitResult } | { success: false; error: string }> {
-  const requestId = `${sessionId}-${Date.now().toString(36)}`;
-
+export async function requestWorkspaceHandoff(
+  headers: HeadersInit,
+): Promise<{ success: true; result: WorkspaceHandoffResult } | { success: false; error: string }> {
   let response: globalThis.Response;
   try {
-    response = await fetch(CHECKPOINT_SUBMIT_PATH, {
+    response = await fetch(WORKSPACE_HANDOFF_PATH, {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        requestId,
-        source: {
-          sessionId,
-          workerId,
-          generation,
-          sourceRevision,
-        },
-        checkpoint,
-      }),
+      headers: { "content-type": "application/json", ...headers },
+      body: JSON.stringify({}),
       signal: AbortSignal.timeout(15_000),
     });
   } catch {
@@ -340,7 +101,7 @@ export async function submitCheckpoint(
   }
 
   try {
-    const result = (await response.json()) as CheckpointSubmitResult;
+    const result = (await response.json()) as WorkspaceHandoffResult;
     if (
       !result.checkpointId
       || !result.handoffId
