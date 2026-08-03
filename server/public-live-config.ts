@@ -17,7 +17,7 @@ export interface PublicLiveGatewayConfig {
   turnstileSiteKey: string;
   turnstileSecret: string;
   turnstileRequired: boolean;
-  turnstileExpectedHostname?: string;
+  turnstileExpectedHostname: string;
   workerEndpoints: readonly PublicWorkerEndpoint[];
   maxQueue: number;
   ticketTtlMs: number;
@@ -195,12 +195,15 @@ export function readPublicLiveGatewayConfig(
   if (edgeProxyToken && edgeProxyToken.length < 32) {
     throw new Error("PUBLIC_EDGE_PROXY_TOKEN must be at least 32 characters");
   }
+  const publicOrigin = canonicalOrigin(required(env, "PUBLIC_ALLOWED_ORIGIN"), "PUBLIC_ALLOWED_ORIGIN");
+  const turnstileExpectedHostname = optional(env.PUBLIC_TURNSTILE_EXPECTED_HOSTNAME)
+    ?? new URL(publicOrigin).hostname;
 
   return {
     host: optional(env.HOST) ?? "127.0.0.1",
     port: integer(env, "PORT", 8788, 1, 65_535),
     publicBasePath: publicBasePath(env.PUBLIC_BASE_PATH),
-    publicOrigin: canonicalOrigin(required(env, "PUBLIC_ALLOWED_ORIGIN"), "PUBLIC_ALLOWED_ORIGIN"),
+    publicOrigin,
     redisUrl: redisUrl(required(env, "PUBLIC_REDIS_URL"), isProduction),
     signingKey,
     edgeProxyToken,
@@ -208,9 +211,7 @@ export function readPublicLiveGatewayConfig(
     turnstileSiteKey: turnstileRequired ? required(env, "PUBLIC_TURNSTILE_SITE_KEY") : "",
     turnstileSecret: turnstileRequired ? required(env, "PUBLIC_TURNSTILE_SECRET") : "",
     turnstileRequired,
-    ...(optional(env.PUBLIC_TURNSTILE_EXPECTED_HOSTNAME)
-      ? { turnstileExpectedHostname: optional(env.PUBLIC_TURNSTILE_EXPECTED_HOSTNAME) }
-      : {}),
+    turnstileExpectedHostname,
     workerEndpoints: parseWorkerEndpoints(required(env, "PUBLIC_WORKER_ENDPOINTS"), maxSessions),
     maxQueue: integer(env, "PUBLIC_MAX_QUEUE", 50, 1, 500),
     ticketTtlMs: millisecondsFromSeconds(env, "PUBLIC_TICKET_TTL_SECONDS", 600, 30, 3_600),

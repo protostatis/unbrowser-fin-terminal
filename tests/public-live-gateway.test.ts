@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   FixedWindowRateLimiter,
+  isAcceptedTurnstileVerification,
   isAllowedPublicClientMessage,
   isAllowedPublicWorkerMessage,
   resolvePublicClientIp,
@@ -118,4 +119,22 @@ test("forwarded client IP is trusted only from the authenticated edge", () => {
     "",
     undefined,
   ), "198.51.100.10");
+});
+
+test("Turnstile verification requires both the configured hostname and action", () => {
+  assert.equal(isAcceptedTurnstileVerification({
+    success: true,
+    hostname: "unbrowser.unchainedsky.com",
+    action: "public_terminal_admission",
+  }, "unbrowser.unchainedsky.com"), true);
+  assert.equal(isAcceptedTurnstileVerification({
+    success: true,
+    hostname: "other.example",
+    action: "public_terminal_admission",
+  }, "unbrowser.unchainedsky.com"), false);
+  assert.equal(isAcceptedTurnstileVerification({
+    success: true,
+    hostname: "unbrowser.unchainedsky.com",
+    action: "other_action",
+  }, "unbrowser.unchainedsky.com"), false);
 });

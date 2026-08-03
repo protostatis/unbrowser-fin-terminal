@@ -11,6 +11,7 @@ import { existsSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server as HttpServer } from "node:http";
 import { isIP } from "node:net";
 import path from "node:path";
+import type { Duplex } from "node:stream";
 import { fileURLToPath } from "node:url";
 import express, { type Request } from "express";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
@@ -35,6 +36,9 @@ const MAX_WORKER_MESSAGE_BYTES = 512 * 1024;
 const MAX_WEBSOCKET_BUFFERED_BYTES = 512 * 1024;
 const CLIENT_MESSAGE_RATE_PER_SECOND = 30;
 const CLIENT_MESSAGE_BURST = 60;
+const CLIENT_ATTACH_RATE_PER_SECOND = 1;
+const CLIENT_ATTACH_BURST = 4;
+const CLIENT_UPGRADE_ATTEMPTS_PER_MINUTE = 120;
 const ACTIVITY_PERSIST_INTERVAL_MS = 2_000;
 const TURNSTILE_ACTION = "public_terminal_admission";
 const SESSION_ENDED_CLOSE_CODE = 4408;
@@ -43,6 +47,15 @@ const WORKER_HEALTH_INTERVAL_MS = 2_000;
 const WORKER_HEALTH_TIMEOUT_MS = 1_500;
 
 type TurnstileVerification = { success?: unknown; hostname?: unknown; action?: unknown };
+
+export function isAcceptedTurnstileVerification(
+  result: TurnstileVerification,
+  expectedHostname: string,
+): boolean {
+  return result.success === true
+    && result.action === TURNSTILE_ACTION
+    && result.hostname === expectedHostname;
+}
 
 export interface PublicLiveGateway {
   server: HttpServer;
@@ -59,6 +72,12 @@ interface GatewayBridge {
   lastActivityPersistedAt: number;
   lastActivityObservedAt: number;
   messageLimiter: TokenBucketRateLimiter;
+}
+
+interface SessionTrafficState {
+  messageLimiter: TokenBucketRateLimiter;
+  attachLimiter: TokenBucketRateLimiter;
+  upgradeInFlight: boolean;
 }
 
 export class FixedWindowRateLimiter {
@@ -332,9 +351,7 @@ async function verifyTurnstile(
   } catch {
     return false;
   }
-  if (result.success !== true) return false;
-  if (result.action !== TURNSTILE_ACTION) return false;
-  return !config.turnstileExpectedHostname || result.hostname === config.turnstileExpectedHostname;
+  return isAcceptedTurnstileVerification(result, config.turnstileExpectedHostname);
 }
 
 function workerGeneration(value: unknown): string | undefined {
@@ -372,6 +389,7 @@ export async function startPublicLiveGateway(): Promise<PublicLiveGateway> {
     await persistence.connect();
 
     const bridges = new Map<string, GatewayBridge>();
+    const trafficBySession = new Map<string, SessionTrafficState>();
     const coordinator = new PublicSessionCoordinator({
       workerIds: config.workerEndpoints.map(({ id }) => id),
       maxQueue: config.maxQueue,
@@ -383,6 +401,7 @@ export async function startPublicLiveGateway(): Promise<PublicLiveGateway> {
       dailyBudgetMicroUsd: config.dailyBudgetMicroUsd,
       researchRunReservationMicroUsd: config.researchRunReservationMicroUsd,
       onSessionEnded: (session, reason) => {
+        trafficBySession.delete(session.id);
         const bridge = bridges.get(session.id);
         closeBridge(bridge, SESSION_ENDED_CLOSE_CODE, reason);
       },
@@ -425,6 +444,14 @@ export async function startPublicLiveGateway(): Promise<PublicLiveGateway> {
     const peerAdmissionLimiter = new FixedWindowRateLimiter(
       config.admissionAttemptsPerWindow * Math.max(config.maxQueue, 10),
       config.admissionWindowMs,
+    );
+    const websocketUpgradeLimiter = new FixedWindowRateLimiter(
+      CLIENT_UPGRADE_ATTEMPTS_PER_MINUTE,
+      60_000,
+    );
+    const websocketPeerUpgradeLimiter = new FixedWindowRateLimiter(
+      CLIENT_UPGRADE_ATTEMPTS_PER_MINUTE * Math.max(config.maxQueue, 10),
+      60_000,
     );
 
     const identityFor = (request: IncomingMessage, create = false): string | undefined => {
@@ -540,27 +567,177 @@ export async function startPublicLiveGateway(): Promise<PublicLiveGateway> {
     const browserWss = new WebSocketServer({ noServer: true, maxPayload: MAX_CLIENT_MESSAGE_BYTES });
     const workerById = new Map(config.workerEndpoints.map((worker) => [worker.id, worker]));
 
+    const trafficFor = (sessionId: string): SessionTrafficState => {
+      const existing = trafficBySession.get(sessionId);
+      if (existing) return existing;
+      const created: SessionTrafficState = {
+        messageLimiter: new TokenBucketRateLimiter(
+          CLIENT_MESSAGE_RATE_PER_SECOND,
+          CLIENT_MESSAGE_BURST,
+        ),
+        attachLimiter: new TokenBucketRateLimiter(
+          CLIENT_ATTACH_RATE_PER_SECOND,
+          CLIENT_ATTACH_BURST,
+        ),
+        upgradeInFlight: false,
+      };
+      trafficBySession.set(sessionId, created);
+      return created;
+    };
+    const rejectUpgrade = (socket: Duplex, status: string) => {
+      if (socket.destroyed) return;
+      socket.end(`HTTP/1.1 ${status}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+    };
+
     server.on("upgrade", (request, socket, head) => {
-      const parsed = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
+      let parsed: URL;
+      try {
+        // Origin-form request targets do not need the untrusted Host header as
+        // a parsing base. A fixed base also makes malformed Host values inert.
+        parsed = new URL(request.url ?? "/", "http://localhost");
+      } catch {
+        rejectUpgrade(socket, "400 Bad Request");
+        return;
+      }
       if (parsed.pathname !== "/ws" || !isAllowedOrigin(request, config)) {
-        socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+        rejectUpgrade(socket, "403 Forbidden");
+        return;
+      }
+      if (
+        !websocketPeerUpgradeLimiter.take(request.socket.remoteAddress ?? "unknown")
+        || !websocketUpgradeLimiter.take(publicClientIp(request, config))
+      ) {
+        rejectUpgrade(socket, "429 Too Many Requests");
         return;
       }
       const ticketId = websocketTicketFor(request);
       if (!ticketId) {
-        socket.end("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+        rejectUpgrade(socket, "401 Unauthorized");
         return;
       }
-      void mutate(() => coordinator.attach(ticketId)).then((assignment) => {
-        if (!assignment) {
-          socket.end("HTTP/1.1 409 Conflict\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+      const traffic = trafficFor(ticketId);
+      if (traffic.upgradeInFlight || !traffic.attachLimiter.take()) {
+        rejectUpgrade(socket, "429 Too Many Requests");
+        return;
+      }
+      traffic.upgradeInFlight = true;
+      let socketClosed = socket.destroyed;
+      let reservationVersion: number | undefined;
+      const releaseUpgrade = () => {
+        traffic.upgradeInFlight = false;
+      };
+      const cancelReservedUpgrade = () => {
+        if (reservationVersion === undefined) return;
+        const version = reservationVersion;
+        reservationVersion = undefined;
+        releaseUpgrade();
+        void mutate(() => coordinator.cancelAttachment(ticketId, version))
+          .catch((error) => fatal?.(error));
+      };
+      const onSocketClose = () => {
+        socketClosed = true;
+        cancelReservedUpgrade();
+      };
+      socket.once("close", onSocketClose);
+      socket.once("error", onSocketClose);
+
+      void mutate(() => coordinator.reserveAttachment(ticketId)).then((reservation) => {
+        if (!reservation) {
+          socket.off("close", onSocketClose);
+          socket.off("error", onSocketClose);
+          releaseUpgrade();
+          if (!bridges.has(ticketId) && trafficBySession.get(ticketId) === traffic) {
+            trafficBySession.delete(ticketId);
+          }
+          rejectUpgrade(socket, "409 Conflict");
           return;
         }
-        browserWss.handleUpgrade(request, socket, head, (browser) => {
-          browserWss.emit("connection", browser, request, assignment);
-        });
+        reservationVersion = reservation.connectionVersion;
+        if (socketClosed || socket.destroyed) {
+          socket.off("close", onSocketClose);
+          socket.off("error", onSocketClose);
+          cancelReservedUpgrade();
+          return;
+        }
+        try {
+          browserWss.handleUpgrade(request, socket, head, (browser) => {
+            socket.off("close", onSocketClose);
+            socket.off("error", onSocketClose);
+            reservationVersion = undefined;
+            browser.pause();
+            let browserClosed = browser.readyState !== WebSocket.OPEN;
+            const markBrowserClosed = () => {
+              browserClosed = true;
+            };
+            browser.once("close", markBrowserClosed);
+            browser.once("error", markBrowserClosed);
+            const previousBridge = bridges.get(ticketId);
+            void mutate(() => {
+              if (browserClosed || browser.readyState !== WebSocket.OPEN) {
+                coordinator.cancelAttachment(ticketId, reservation.connectionVersion);
+                return undefined;
+              }
+              const assignment = coordinator.activateAttachment(
+                ticketId,
+                reservation.connectionVersion,
+              );
+              return assignment && coordinator.markWorkerConnectionStarted(
+                ticketId,
+                assignment.connectionVersion,
+              )
+                ? assignment
+                : undefined;
+            }).then((assignment) => {
+              releaseUpgrade();
+              browser.off("close", markBrowserClosed);
+              browser.off("error", markBrowserClosed);
+              if (!assignment) {
+                browser.resume();
+                if (browser.readyState === WebSocket.OPEN) {
+                  browser.close(SESSION_ENDED_CLOSE_CODE, "Public session unavailable");
+                }
+                return;
+              }
+              if (browserClosed || browser.readyState !== WebSocket.OPEN) {
+                if (
+                  previousBridge
+                  && bridges.get(ticketId) === previousBridge
+                  && reservation.previousConnectionVersion
+                ) {
+                  void mutate(() => coordinator.rollbackAttachment(
+                    ticketId,
+                    assignment.connectionVersion,
+                    reservation.previousConnectionVersion!,
+                  )).catch((error) => fatal?.(error));
+                } else {
+                  void mutate(() => coordinator.detach(ticketId, assignment.connectionVersion))
+                    .catch((error) => fatal?.(error));
+                }
+                if (browser.readyState !== WebSocket.CLOSED) browser.terminate();
+                return;
+              }
+              browserWss.emit("connection", browser, request, assignment);
+              browser.resume();
+            }).catch((error) => {
+              releaseUpgrade();
+              browser.off("close", markBrowserClosed);
+              browser.off("error", markBrowserClosed);
+              browser.terminate();
+              fatal?.(error);
+            });
+          });
+        } catch {
+          socket.off("close", onSocketClose);
+          socket.off("error", onSocketClose);
+          cancelReservedUpgrade();
+          if (!socket.destroyed) socket.destroy();
+        }
       }).catch(() => {
-        socket.end("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+        socket.off("close", onSocketClose);
+        socket.off("error", onSocketClose);
+        releaseUpgrade();
+        cancelReservedUpgrade();
+        rejectUpgrade(socket, "503 Service Unavailable");
       });
     });
 
@@ -601,6 +778,7 @@ export async function startPublicLiveGateway(): Promise<PublicLiveGateway> {
       const previous = bridges.get(assignment.id);
       closeBridge(previous, 4001, "Replaced by a newer browser connection");
       const attachedAt = Date.now();
+      const traffic = trafficFor(assignment.id);
       const bridge: GatewayBridge = {
         sessionId: assignment.id,
         browser,
@@ -608,10 +786,7 @@ export async function startPublicLiveGateway(): Promise<PublicLiveGateway> {
         activityInFlight: false,
         lastActivityPersistedAt: attachedAt,
         lastActivityObservedAt: attachedAt,
-        messageLimiter: new TokenBucketRateLimiter(
-          CLIENT_MESSAGE_RATE_PER_SECOND,
-          CLIENT_MESSAGE_BURST,
-        ),
+        messageLimiter: traffic.messageLimiter,
       };
       bridges.set(assignment.id, bridge);
       const endpoint = workerById.get(assignment.workerId);
@@ -764,14 +939,19 @@ export async function startPublicLiveGateway(): Promise<PublicLiveGateway> {
       if (maintenanceRunning) return;
       maintenanceRunning = true;
       try {
-        const results = await Promise.all(config.workerEndpoints.map(async (worker) => ({
+        const probes = await inspect(() => config.workerEndpoints.map((worker) => ({
+          ...worker,
+          probeEpoch: coordinator.workerProbeEpoch(worker.id),
+        })));
+        const results = await Promise.all(probes.map(async (worker) => ({
           id: worker.id,
+          probeEpoch: worker.probeEpoch,
           generation: await healthCheck(worker.url),
         })));
         await mutate(() => {
           coordinator.sweep();
-          for (const { id, generation } of results) {
-            coordinator.setWorkerReady(id, Boolean(generation), generation);
+          for (const { id, generation, probeEpoch } of results) {
+            coordinator.setWorkerReady(id, Boolean(generation), generation, probeEpoch);
           }
         });
       } finally {
@@ -837,7 +1017,6 @@ function publicStatus(session: PublicSessionSnapshot): Record<string, unknown> {
     ...(session.queuePosition ? { queuePosition: session.queuePosition } : {}),
     ...(session.sessionExpiresAt ? { sessionExpiresAt: session.sessionExpiresAt } : {}),
     ...(session.idleExpiresAt ? { idleExpiresAt: session.idleExpiresAt } : {}),
-    researchRunsRemaining: session.researchRunsRemaining,
     ...(session.endReason ? { reason: session.endReason } : {}),
   };
 }

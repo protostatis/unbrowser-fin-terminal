@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   PUBLIC_ENDED_SESSION_RETENTION_MS,
+  PUBLIC_MAX_CONNECTION_ATTEMPTS,
   PublicSessionCoordinator,
   type PublicSessionEndReason,
 } from "../server/public-session-coordinator.js";
@@ -192,6 +193,73 @@ test("a stale socket detach cannot disconnect its newer replacement", () => {
   assert.equal(coordinator.status(admitted.session.id)?.endReason, "disconnect-timeout");
 });
 
+test("an aborted upgrade never activates or contaminates its assigned worker", () => {
+  const { coordinator, advance } = createCoordinator({ workerIds: ["seat-01"] });
+  coordinator.setWorkerReady("seat-01", true, "instance-a");
+  const admitted = coordinator.admit("visitor-a");
+  assert.equal(admitted.accepted, true);
+  if (!admitted.accepted) return;
+
+  const reservation = coordinator.reserveAttachment(admitted.session.id);
+  assert.ok(reservation);
+  if (!reservation) return;
+  assert.equal(coordinator.status(admitted.session.id)?.state, "admitted");
+  coordinator.cancelAttachment(admitted.session.id, reservation.connectionVersion);
+  advance(30_000);
+  coordinator.sweep();
+  assert.equal(coordinator.status(admitted.session.id)?.endReason, "no-show");
+  assert.equal(coordinator.metrics().readyWorkers, 1);
+});
+
+test("a replacement that closes during activation restores the live connection version", () => {
+  const { coordinator, advance } = createCoordinator({ workerIds: ["seat-01"] });
+  coordinator.setWorkerReady("seat-01", true, "instance-a");
+  const admitted = coordinator.admit("visitor-a");
+  assert.equal(admitted.accepted, true);
+  if (!admitted.accepted) return;
+  const first = coordinator.attach(admitted.session.id);
+  assert.ok(first);
+  if (!first) return;
+
+  const replacement = coordinator.reserveAttachment(admitted.session.id);
+  assert.ok(replacement);
+  if (!replacement) return;
+  const activated = coordinator.activateAttachment(
+    admitted.session.id,
+    replacement.connectionVersion,
+  );
+  assert.ok(activated);
+  if (!activated) return;
+  coordinator.markWorkerConnectionStarted(admitted.session.id, activated.connectionVersion);
+  coordinator.rollbackAttachment(
+    admitted.session.id,
+    activated.connectionVersion,
+    first.connectionVersion,
+  );
+
+  coordinator.detach(admitted.session.id, first.connectionVersion);
+  advance(30_000);
+  coordinator.sweep();
+  assert.equal(coordinator.status(admitted.session.id)?.endReason, "disconnect-timeout");
+});
+
+test("connection attempts are capped across repeated attachment reservations", () => {
+  const { coordinator } = createCoordinator({ workerIds: ["seat-01"] });
+  coordinator.setWorkerReady("seat-01", true, "instance-a");
+  const admitted = coordinator.admit("visitor-a");
+  assert.equal(admitted.accepted, true);
+  if (!admitted.accepted) return;
+
+  for (let attempt = 0; attempt < PUBLIC_MAX_CONNECTION_ATTEMPTS; attempt += 1) {
+    const reservation = coordinator.reserveAttachment(admitted.session.id);
+    assert.ok(reservation);
+    if (!reservation) return;
+    coordinator.cancelAttachment(admitted.session.id, reservation.connectionVersion);
+  }
+  assert.equal(coordinator.reserveAttachment(admitted.session.id), undefined);
+  assert.equal(coordinator.status(admitted.session.id)?.endReason, "rate-limited");
+});
+
 test("a worker generation reached after assignment is fenced until replacement", () => {
   const { coordinator } = createCoordinator({ workerIds: ["seat-01"] });
   coordinator.setWorkerReady("seat-01", true, "instance-a");
@@ -209,6 +277,35 @@ test("a worker generation reached after assignment is fenced until replacement",
     "instance-b",
   ), false);
   assert.equal(coordinator.status(assignment.id)?.endReason, "worker-unavailable");
+  coordinator.setWorkerReady("seat-01", true, "instance-b");
+  assert.equal(coordinator.metrics().readyWorkers, 0);
+  coordinator.setWorkerReady("seat-01", true, "instance-c");
+  assert.equal(coordinator.metrics().readyWorkers, 1);
+});
+
+test("a health result started before generation fencing is discarded", () => {
+  const { coordinator } = createCoordinator({ workerIds: ["seat-01"] });
+  coordinator.setWorkerReady("seat-01", true, "instance-a");
+  const admitted = coordinator.admit("visitor-a");
+  assert.equal(admitted.accepted, true);
+  if (!admitted.accepted) return;
+  const staleProbeEpoch = coordinator.workerProbeEpoch("seat-01");
+  const assignment = coordinator.attach(admitted.session.id);
+  assert.ok(assignment);
+  if (!assignment) return;
+  coordinator.confirmWorkerGeneration(
+    assignment.id,
+    assignment.connectionVersion,
+    "instance-b",
+  );
+
+  assert.equal(coordinator.setWorkerReady(
+    "seat-01",
+    true,
+    "instance-a",
+    staleProbeEpoch,
+  ), false);
+  assert.equal(coordinator.metrics().readyWorkers, 0);
   coordinator.setWorkerReady("seat-01", true, "instance-b");
   assert.equal(coordinator.metrics().readyWorkers, 0);
   coordinator.setWorkerReady("seat-01", true, "instance-c");
@@ -234,6 +331,9 @@ test("a missing worker generation header requires an unavailable transition", ()
   assert.equal(coordinator.metrics().readyWorkers, 0);
   coordinator.setWorkerReady("seat-01", false);
   coordinator.setWorkerReady("seat-01", true, "instance-b");
+  assert.equal(coordinator.metrics().readyWorkers, 0);
+  coordinator.setWorkerReady("seat-01", false);
+  coordinator.setWorkerReady("seat-01", true, "instance-c");
   assert.equal(coordinator.metrics().readyWorkers, 1);
 });
 

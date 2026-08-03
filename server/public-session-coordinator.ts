@@ -39,6 +39,7 @@ export interface PublicWorkerAssignment {
   workerId: string;
   workerGeneration: string;
   connectionVersion: number;
+  previousConnectionVersion?: number;
   sessionExpiresAt: number;
   idleExpiresAt: number;
   researchRunsRemaining: number;
@@ -78,6 +79,11 @@ export interface PublicSessionCoordinatorState {
     lastActivityAt?: number;
     disconnectedAt?: number;
     connectionVersion: number;
+    nextConnectionVersion?: number;
+    pendingConnectionVersion?: number;
+    pendingConnectionReservedAt?: number;
+    connectionAttempts?: number;
+    workerConnectionStarted?: boolean;
     researchRuns: number;
     researchReservedMicroUsd: number;
     endedAt?: number;
@@ -89,6 +95,8 @@ export interface PublicSessionCoordinatorState {
     generation?: string;
     replacementOfGeneration?: string;
     requiresUnavailable?: boolean;
+    quarantinedGeneration?: string;
+    unavailableAfterQuarantine?: boolean;
   }>;
 }
 
@@ -113,6 +121,11 @@ type Session = {
   lastActivityAt?: number;
   disconnectedAt?: number;
   connectionVersion: number;
+  nextConnectionVersion: number;
+  pendingConnectionVersion?: number;
+  pendingConnectionReservedAt?: number;
+  connectionAttempts: number;
+  workerConnectionStarted: boolean;
   researchRuns: number;
   researchReservedMicroUsd: number;
   endedAt?: number;
@@ -126,10 +139,14 @@ type WorkerSlot = {
   generation?: string;
   replacementOfGeneration?: string;
   requiresUnavailable: boolean;
+  quarantinedGeneration?: string;
+  unavailableAfterQuarantine: boolean;
+  probeEpoch: number;
 };
 
 const NOOP = () => {};
 export const PUBLIC_ENDED_SESSION_RETENTION_MS = 2 * 60_000;
+export const PUBLIC_MAX_CONNECTION_ATTEMPTS = 32;
 const MAX_ENDED_SESSION_TOMBSTONES = 1_000;
 
 function assertPositiveInteger(name: string, value: number): void {
@@ -172,7 +189,13 @@ export class PublicSessionCoordinator {
     assertPositiveInteger("researchRunReservationMicroUsd", options.researchRunReservationMicroUsd);
 
     for (const id of options.workerIds) {
-      this.workers.set(id, { id, ready: false, requiresUnavailable: false });
+      this.workers.set(id, {
+        id,
+        ready: false,
+        requiresUnavailable: false,
+        unavailableAfterQuarantine: false,
+        probeEpoch: 0,
+      });
     }
     this.now = options.now ?? Date.now;
     let sequence = 0;
@@ -203,6 +226,9 @@ export class PublicSessionCoordinator {
       createdAt: now,
       ticketExpiresAt: now + this.options.ticketTtlMs,
       connectionVersion: 0,
+      nextConnectionVersion: 0,
+      connectionAttempts: 0,
+      workerConnectionStarted: false,
       researchRuns: 0,
       researchReservedMicroUsd: 0,
     };
@@ -214,12 +240,45 @@ export class PublicSessionCoordinator {
   }
 
   /** Report a worker's lifecycle health. Only an idle ready worker can be assigned. */
-  setWorkerReady(workerId: string, ready: boolean, generation?: string): void {
+  setWorkerReady(
+    workerId: string,
+    ready: boolean,
+    generation?: string,
+    probeEpoch?: number,
+  ): boolean {
     const worker = this.workers.get(workerId);
     if (!worker) throw new Error(`unknown public worker "${workerId}"`);
+    if (probeEpoch !== undefined && probeEpoch !== worker.probeEpoch) return false;
+    this.bumpWorkerProbeEpoch(worker);
+    if (worker.requiresUnavailable) {
+      worker.ready = false;
+      if (!ready || !generation) {
+        if (worker.quarantinedGeneration) worker.unavailableAfterQuarantine = true;
+        this.pump();
+        return true;
+      }
+      if (!worker.quarantinedGeneration) {
+        // The generation accepted by a missing-header handshake is unknowable.
+        // Quarantine the first subsequently observed process, then require it
+        // to become unavailable before a different generation can enter.
+        worker.quarantinedGeneration = generation;
+        worker.unavailableAfterQuarantine = false;
+        this.pump();
+        return true;
+      }
+      if (
+        !worker.unavailableAfterQuarantine
+        || generation === worker.quarantinedGeneration
+      ) {
+        this.pump();
+        return true;
+      }
+      worker.requiresUnavailable = false;
+      worker.quarantinedGeneration = undefined;
+      worker.unavailableAfterQuarantine = false;
+    }
     if (!ready || !generation) {
       worker.ready = false;
-      worker.requiresUnavailable = false;
       if (worker.sessionId) {
         const session = this.sessions.get(worker.sessionId);
         if (session && session.state !== "ended") this.end(session, "worker-unavailable");
@@ -250,6 +309,14 @@ export class PublicSessionCoordinator {
       this.markIdleWorkerReady(worker, generation);
     }
     this.pump();
+    return true;
+  }
+
+  /** Snapshot used to discard health responses started before a seat transition. */
+  workerProbeEpoch(workerId: string): number {
+    const worker = this.workers.get(workerId);
+    if (!worker) throw new Error(`unknown public worker "${workerId}"`);
+    return worker.probeEpoch;
   }
 
   /** Confirm that the assigned internal WebSocket reached the probed process. */
@@ -269,6 +336,7 @@ export class PublicSessionCoordinator {
     }
     const worker = this.workers.get(session.workerId);
     if (!worker || worker.sessionId !== session.id) return false;
+    this.bumpWorkerProbeEpoch(worker);
     if (observedGeneration && observedGeneration === session.workerGeneration) {
       worker.generation = observedGeneration;
       return true;
@@ -285,6 +353,8 @@ export class PublicSessionCoordinator {
       // cannot identify the process that accepted the connection. Require an
       // observed unavailable transition before any process can re-enter.
       worker.requiresUnavailable = true;
+      worker.quarantinedGeneration = undefined;
+      worker.unavailableAfterQuarantine = false;
     }
     this.end(session, "worker-unavailable");
     return false;
@@ -305,20 +375,100 @@ export class PublicSessionCoordinator {
     }
   }
 
-  /** Attach a browser WebSocket to an admitted session. */
-  attach(sessionId: string): PublicWorkerAssignment | undefined {
+  /** Reserve one browser upgrade without starting the active session lease. */
+  reserveAttachment(sessionId: string): PublicWorkerAssignment | undefined {
     this.sweep();
     const session = this.sessions.get(sessionId);
     if (!session || !session.workerId || session.state === "ended") return undefined;
+    if (session.pendingConnectionVersion !== undefined) return undefined;
+    if (session.connectionAttempts >= PUBLIC_MAX_CONNECTION_ATTEMPTS) {
+      this.end(session, "rate-limited");
+      return undefined;
+    }
     const now = this.now();
+    session.connectionAttempts += 1;
+    session.nextConnectionVersion += 1;
+    session.pendingConnectionVersion = session.nextConnectionVersion;
+    session.pendingConnectionReservedAt = now;
+    this.bumpSessionWorkerProbeEpoch(session);
+    return this.reservation(session, session.pendingConnectionVersion, now);
+  }
+
+  /** Activate a reservation only after the HTTP WebSocket upgrade succeeds. */
+  activateAttachment(sessionId: string, connectionVersion: number): PublicWorkerAssignment | undefined {
+    const session = this.sessions.get(sessionId);
+    if (
+      !session
+      || !session.workerId
+      || session.state === "ended"
+      || session.pendingConnectionVersion !== connectionVersion
+    ) {
+      return undefined;
+    }
+    const now = this.now();
+    session.pendingConnectionVersion = undefined;
+    session.pendingConnectionReservedAt = undefined;
     if (session.state === "admitted") {
       session.state = "active";
       session.startedAt = now;
     }
     session.lastActivityAt = now;
     session.disconnectedAt = undefined;
-    session.connectionVersion += 1;
+    session.connectionVersion = connectionVersion;
+    this.bumpSessionWorkerProbeEpoch(session);
     return this.assignment(session);
+  }
+
+  /** Persist the conservative tenant-exposure fence before dialing a worker. */
+  markWorkerConnectionStarted(sessionId: string, connectionVersion: number): boolean {
+    const session = this.sessions.get(sessionId);
+    if (
+      !session
+      || session.state !== "active"
+      || session.connectionVersion !== connectionVersion
+      || !session.workerId
+    ) {
+      return false;
+    }
+    session.workerConnectionStarted = true;
+    this.bumpSessionWorkerProbeEpoch(session);
+    return true;
+  }
+
+  /** Restore the prior live bridge if its replacement closes during activation. */
+  rollbackAttachment(
+    sessionId: string,
+    connectionVersion: number,
+    previousConnectionVersion: number,
+  ): void {
+    const session = this.sessions.get(sessionId);
+    if (
+      session?.state !== "active"
+      || session.connectionVersion !== connectionVersion
+      || previousConnectionVersion <= 0
+    ) {
+      return;
+    }
+    session.connectionVersion = previousConnectionVersion;
+    this.bumpSessionWorkerProbeEpoch(session);
+  }
+
+  /** Release an upgrade reservation that closed before WebSocket activation. */
+  cancelAttachment(sessionId: string, connectionVersion: number): void {
+    const session = this.sessions.get(sessionId);
+    if (session?.pendingConnectionVersion !== connectionVersion) return;
+    session.pendingConnectionVersion = undefined;
+    session.pendingConnectionReservedAt = undefined;
+    this.bumpSessionWorkerProbeEpoch(session);
+  }
+
+  /** Convenience for non-network callers and coordinator unit tests. */
+  attach(sessionId: string): PublicWorkerAssignment | undefined {
+    const reservation = this.reserveAttachment(sessionId);
+    if (!reservation) return undefined;
+    const assignment = this.activateAttachment(sessionId, reservation.connectionVersion);
+    if (assignment) this.markWorkerConnectionStarted(sessionId, assignment.connectionVersion);
+    return assignment;
   }
 
   /** Count a meaningful user action toward the idle lease. */
@@ -347,6 +497,7 @@ export class PublicSessionCoordinator {
     const session = this.sessions.get(sessionId);
     if (session?.state === "active" && session.connectionVersion === connectionVersion) {
       session.disconnectedAt = this.now();
+      this.bumpSessionWorkerProbeEpoch(session);
     }
   }
 
@@ -366,6 +517,15 @@ export class PublicSessionCoordinator {
   sweep(): void {
     const now = this.now();
     for (const session of this.sessions.values()) {
+      if (
+        session.pendingConnectionVersion !== undefined
+        && session.pendingConnectionReservedAt !== undefined
+        && now - session.pendingConnectionReservedAt >= this.options.reconnectGraceMs
+      ) {
+        session.pendingConnectionVersion = undefined;
+        session.pendingConnectionReservedAt = undefined;
+        this.bumpSessionWorkerProbeEpoch(session);
+      }
       if (session.state === "queued" && now >= session.ticketExpiresAt) {
         this.end(session, "ticket-expired");
         continue;
@@ -427,12 +587,16 @@ export class PublicSessionCoordinator {
         generation,
         replacementOfGeneration,
         requiresUnavailable,
+        quarantinedGeneration,
+        unavailableAfterQuarantine,
       }) => ({
         id,
         ...(sessionId ? { sessionId } : {}),
         ...(generation ? { generation } : {}),
         ...(replacementOfGeneration ? { replacementOfGeneration } : {}),
         ...(requiresUnavailable ? { requiresUnavailable: true } : {}),
+        ...(quarantinedGeneration ? { quarantinedGeneration } : {}),
+        ...(unavailableAfterQuarantine ? { unavailableAfterQuarantine: true } : {}),
       })),
     };
   }
@@ -462,11 +626,22 @@ export class PublicSessionCoordinator {
       if (!["queued", "admitted", "active", "ended"].includes(raw.state)) {
         throw new Error("invalid persisted public session state");
       }
+      const connectionVersion = Number.isInteger(raw.connectionVersion) && raw.connectionVersion >= 0
+        ? raw.connectionVersion
+        : 0;
       const session: Session = {
         ...raw,
-        connectionVersion: Number.isInteger(raw.connectionVersion) && raw.connectionVersion >= 0
-          ? raw.connectionVersion
+        connectionVersion,
+        nextConnectionVersion: Number.isInteger(raw.nextConnectionVersion)
+          && (raw.nextConnectionVersion ?? -1) >= connectionVersion
+          ? raw.nextConnectionVersion!
+          : connectionVersion,
+        connectionAttempts: Number.isInteger(raw.connectionAttempts) && (raw.connectionAttempts ?? -1) >= 0
+          ? raw.connectionAttempts!
           : 0,
+        workerConnectionStarted: raw.workerConnectionStarted === true || raw.startedAt !== undefined,
+        pendingConnectionVersion: undefined,
+        pendingConnectionReservedAt: undefined,
         ...(raw.state === "ended" && !Number.isFinite(raw.endedAt) ? { endedAt: now } : {}),
       };
       // A gateway restart severs browser proxy connections. Keep the original
@@ -485,7 +660,10 @@ export class PublicSessionCoordinator {
       worker.generation = persisted?.generation;
       worker.replacementOfGeneration = persisted?.replacementOfGeneration;
       worker.requiresUnavailable = persisted?.requiresUnavailable === true;
+      worker.quarantinedGeneration = persisted?.quarantinedGeneration;
+      worker.unavailableAfterQuarantine = persisted?.unavailableAfterQuarantine === true;
       worker.ready = false;
+      worker.probeEpoch = 0;
     }
     this.dailyBudgetDay = state.dailyBudgetDay;
     this.dailyReservedMicroUsd = state.dailyReservedMicroUsd;
@@ -514,21 +692,25 @@ export class PublicSessionCoordinator {
       this.dailyReservedMicroUsd += reservation;
       worker.sessionId = session.id;
       worker.ready = false;
+      this.bumpWorkerProbeEpoch(worker);
     }
   }
 
   private end(session: Session, reason: PublicSessionEndReason): void {
     if (session.state === "ended") return;
-    const hadConnectedBrowser = session.startedAt !== undefined;
+    const workerMayContainTenantState = session.workerConnectionStarted;
     session.state = "ended";
     session.endReason = reason;
     session.endedAt = this.now();
+    session.pendingConnectionVersion = undefined;
+    session.pendingConnectionReservedAt = undefined;
     this.visitorSessions.delete(session.visitorId);
     if (session.workerId) {
       const worker = this.workers.get(session.workerId);
       if (worker?.sessionId === session.id) {
+        this.bumpWorkerProbeEpoch(worker);
         worker.sessionId = undefined;
-        if (hadConnectedBrowser) {
+        if (workerMayContainTenantState) {
           // The worker process is terminated after a visitor reaches it. Its
           // replacement must pass a health check before this slot becomes ready.
           worker.ready = false;
@@ -592,6 +774,35 @@ export class PublicSessionCoordinator {
       idleExpiresAt: session.lastActivityAt + this.options.idleTimeoutMs,
       researchRunsRemaining: this.options.maxResearchRuns - session.researchRuns,
     };
+  }
+
+  private reservation(session: Session, connectionVersion: number, now: number): PublicWorkerAssignment {
+    if (!session.workerId || !session.workerGeneration) {
+      throw new Error("cannot reserve a session without a worker generation");
+    }
+    const leaseStart = session.startedAt ?? now;
+    const activityStart = session.lastActivityAt ?? now;
+    return {
+      id: session.id,
+      visitorId: session.visitorId,
+      workerId: session.workerId,
+      workerGeneration: session.workerGeneration,
+      connectionVersion,
+      previousConnectionVersion: session.connectionVersion,
+      sessionExpiresAt: leaseStart + this.options.absoluteTimeoutMs,
+      idleExpiresAt: activityStart + this.options.idleTimeoutMs,
+      researchRunsRemaining: this.options.maxResearchRuns - session.researchRuns,
+    };
+  }
+
+  private bumpSessionWorkerProbeEpoch(session: Session): void {
+    if (!session.workerId) return;
+    const worker = this.workers.get(session.workerId);
+    if (worker?.sessionId === session.id) this.bumpWorkerProbeEpoch(worker);
+  }
+
+  private bumpWorkerProbeEpoch(worker: WorkerSlot): void {
+    worker.probeEpoch += 1;
   }
 
   private removeEndedQueueEntries(): void {

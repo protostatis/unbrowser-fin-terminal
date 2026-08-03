@@ -7,7 +7,6 @@ type Admission = {
   queuePosition?: number;
   sessionExpiresAt?: number;
   idleExpiresAt?: number;
-  researchRunsRemaining: number;
   reason?: string;
   ticketToken?: string;
 };
@@ -209,7 +208,7 @@ export function PublicLiveApp({
         const next = await readJson<Admission>(response);
         if (!active) return;
         if (!response.ok || !next) {
-          setAdmission({ status: "ended", researchRunsRemaining: 0, reason: "ticket-expired" });
+          setAdmission({ status: "ended", reason: "ticket-expired" });
           return;
         }
         setAdmission(next);
@@ -271,10 +270,10 @@ export function PublicLiveApp({
       <>
         {renderTerminal(() => {
           storeToken(TICKET_STORAGE_KEY, undefined);
-          setAdmission({ status: "ended", researchRunsRemaining: 0, reason: "session-ended" });
+          setAdmission({ status: "ended", reason: "session-ended" });
         }, `fin-terminal-session.${ticketToken}`)}
         <div className="public-session-banner" role="status">
-          PUBLIC LIVE SESSION · UP TO {admission.researchRunsRemaining} RESEARCH RUNS · 15 MIN MAX
+          PUBLIC LIVE SESSION · UP TO {config?.maxResearchRuns ?? 5} RESEARCH RUNS · 15 MIN MAX
         </div>
       </>
     );

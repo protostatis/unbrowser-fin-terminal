@@ -32,6 +32,7 @@ test("public live gateway requires an explicit, bounded isolated-worker contract
   assert.equal(config.maxResearchRuns, 5);
   assert.equal(config.dailyBudgetMicroUsd, 10_000_000);
   assert.equal(config.edgeProxyToken, "edge-proxy-token-0123456789012345");
+  assert.equal(config.turnstileExpectedHostname, "unbrowser.unchainedsky.com");
 });
 
 test("public gateway rejects unsafe origins, worker endpoints, and impossible budget reservations", () => {

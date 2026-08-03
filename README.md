@@ -166,10 +166,15 @@ and therefore fails closed at the daily cap.
 Before any worker content or queued browser input is relayed, the gateway
 compares the worker WebSocket generation header with the generation probed for
 that seat. A changed or missing generation ends the ticket and fences the
-reached process until replacement. Both WebSocket directions have payload and
-backpressure ceilings; browser messages also pass semantic validation and a
-per-connection token bucket. Ended ticket tombstones are short-lived and
-bounded rather than accumulated in Redis indefinitely.
+reached process until replacement. Probe epochs discard health responses that
+began before a later assignment or fence transition. Browser upgrades reserve
+an attachment first and activate the lease only after the WebSocket handshake;
+the possible worker-exposure fence is persisted before dialing the worker.
+Both WebSocket directions have payload and backpressure ceilings; browser
+messages also pass semantic validation and a ticket-scoped token bucket that
+survives reconnects. Attachment attempts are rate- and count-bounded. Ended
+ticket tombstones are short-lived and bounded rather than accumulated in Redis
+indefinitely.
 
 The defaults bound a visitor to a 10-minute queue ticket, 5-minute idle lease,
 15-minute absolute lease, 30-second reconnect grace, and five research launches.
@@ -177,6 +182,8 @@ The public edge must strip and overwrite `X-Real-IP`; the gateway applies both
 visitor-IP and coarser proxy-peer admission limits. It trusts the forwarded
 address only when Caddy also overwrites `X-Fin-Terminal-Edge-Token` with the
 configured edge token. Never publish the gateway container port directly.
+Turnstile verification always compares the widget action and a hostname derived
+from `PUBLIC_ALLOWED_ORIGIN` unless an explicit expected hostname is configured.
 See [`docs/deployment.md`](docs/deployment.md) for the release and verification
 contract. Account signup, persistent workspaces, claims, and billing shown in
 the conversion preview are design handoff only and are not wired into this

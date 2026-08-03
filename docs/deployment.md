@@ -79,11 +79,13 @@ deployment fallback for a normal terminal release.
   extraction, and no public ingress. A worker reached by a visitor is not
   reusable until a replacement generation passes readiness. The gateway must
   confirm the authenticated worker WebSocket generation header before relaying
-  queued browser input or worker output.
+  queued browser input or worker output. Probe epochs must discard health
+  responses started before a newer assignment, connection, or fencing event.
 - Public browser messages are semantically allowlisted, rate-limited, and
   backpressure-bounded. Worker frames are text-only, schema-checked, and bounded
   before crossing the public boundary. Public token/status responses are marked
-  `no-store`.
+  `no-store`. Message and attachment limits are ticket-scoped across reconnects;
+  attachment leases activate only after a completed browser WebSocket upgrade.
 - Replay remains available as a separate static fallback. It starts no
   AgentSession, WebSocket, model, or source request.
 - Authenticated/worker containers listen on `8787`; the public gateway uses its
@@ -125,6 +127,9 @@ deployment fallback for a normal terminal release.
 - Confirm an overlapping browser reconnect does not let the stale socket close
   expire its replacement, and a generation change between health probe and
   worker WebSocket attachment ends and fences the ticket.
+- Confirm a delayed pre-fence health response cannot return the slot to service,
+  malformed Host headers do not crash the gateway, and failed/aborted upgrades
+  leave an unexposed worker reusable.
 - Confirm oversized, binary, malformed, and sustained-rate browser/worker
   traffic is rejected without unbounded gateway or Redis work.
 - Confirm the daily reservation ceiling rejects new seats before configured
