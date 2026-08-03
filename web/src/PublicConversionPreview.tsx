@@ -485,10 +485,6 @@ function TerminalShell({
       )}
 
       <div className="status-line conversion-status-line">
-        <span className="status-conn" aria-live="polite">
-          <span className={`status-dot ${privateWorkspace ? "connected conversion-private-dot" : "connected"}`} aria-hidden="true" />
-          <span>{privateWorkspace ? "PRIVATE · SAVED" : "CONNECTED · 144×48"}</span>
-        </span>
         <span className={`conversion-brief-state ${running ? "is-running" : "is-complete"}`}>
           {running ? "BRIEF RUNNING · SOURCES 7/9" : privateWorkspace ? "AAPL BRIEF · SAVED" : "BRIEF COMPLETE · EVIDENCE 9/9"}
         </span>

@@ -66,11 +66,6 @@ export function ReplayApp() {
       </p>
 
       <div className="status-line replay-status">
-        <span className="status-conn" aria-live="polite">
-          <span className="status-dot replay-dot" aria-hidden="true" />
-          <span>{REPLAY_SCREEN.statusLabel}</span>
-        </span>
-
         <button
           type="button"
           className="evidence-chip replay-chip-pilot"
