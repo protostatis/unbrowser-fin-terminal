@@ -30,6 +30,7 @@ import {
 import type { FrameMessage, SelectRequestMessage } from "./socket";
 import { ReplayApp } from "./ReplayApp";
 import { PublicLiveApp } from "./PublicLiveApp";
+import type { TerminalDossier } from "./dossier";
 import "./styles.css";
 
 const RESEARCH_OUTCOME_DISPLAY_MS = 8_000;
@@ -89,9 +90,15 @@ function useResearchStatus(state: FrameMessage["state"]) {
 export function App({
   onPublicSessionEnd,
   publicSessionProtocol,
+  onFrameUpdate,
 }: {
   onPublicSessionEnd?: () => void;
   publicSessionProtocol?: string;
+  /** Called on every frame with the latest state for checkpoint accumulation. */
+  onFrameUpdate?: (
+    state: FrameMessage["state"],
+    dossier?: TerminalDossier,
+  ) => void;
 } = {}) {
   const socketRef = useRef<TerminalSocket>();
   const socket = socketRef.current ?? (socketRef.current = new TerminalSocket(publicSessionProtocol));
@@ -180,6 +187,7 @@ export function App({
       rowsCountRef.current = msg.rows_count;
       frameStateRef.current = msg.state;
       isClosedRef.current = false;
+      onFrameUpdate?.(msg.state, msg.state?.dossier);
       forceUpdate();
     });
 
@@ -631,8 +639,12 @@ if (!rootEl) throw new Error("#root element not found");
 // Replay-only builds never construct a socket. Public-live builds defer the
 // real client until Turnstile admission assigns an isolated worker seat.
 function PublicLiveRoot() {
-  return <PublicLiveApp renderTerminal={(onSessionEnd, publicSessionProtocol) => (
-    <App onPublicSessionEnd={onSessionEnd} publicSessionProtocol={publicSessionProtocol} />
+  return <PublicLiveApp renderTerminal={(onSessionEnd, publicSessionProtocol, onFrameUpdate) => (
+    <App
+      onPublicSessionEnd={onSessionEnd}
+      publicSessionProtocol={publicSessionProtocol}
+      onFrameUpdate={onFrameUpdate}
+    />
   )} />;
 }
 

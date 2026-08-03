@@ -25,6 +25,11 @@ import { PublicSessionPersistence } from "./public-session-persistence.js";
 import { createOpaqueId, signOpaqueId, verifyOpaqueId } from "./public-session-tokens.js";
 import { matchesProxyToken } from "./proxy-auth.js";
 import { isActiveResearchFramePayload } from "./research-activity.js";
+import { createWorkspaceCheckpointHandler } from "./workspace-checkpoint-handler.js";
+import {
+  isWorkspaceCheckpointEnabled,
+  workspaceServiceUrl,
+} from "../shared/financial-workspace-checkpoint.js";
 
 const VISITOR_TOKEN_HEADER = "x-public-visitor-token";
 const TICKET_TOKEN_HEADER = "x-public-ticket-token";
@@ -487,6 +492,8 @@ export async function startPublicLiveGateway(): Promise<PublicLiveGateway> {
     });
     app.get("/api/public/config", (request, response) => {
       const visitorId = identityFor(request, true);
+      const checkpointEnabled = isWorkspaceCheckpointEnabled()
+        && Boolean(workspaceServiceUrl());
       response.json({
         visitorToken: signOpaqueId(visitorId!, config.signingKey),
         turnstileSiteKey: config.turnstileSiteKey,
@@ -494,6 +501,7 @@ export async function startPublicLiveGateway(): Promise<PublicLiveGateway> {
         ticketTtlMs: config.ticketTtlMs,
         maxSessionMs: config.absoluteTimeoutMs,
         maxResearchRuns: config.maxResearchRuns,
+        workspaceHandoffAvailable: checkpointEnabled,
       });
     });
     app.post("/api/public/admission", async (request, response) => {
@@ -552,6 +560,10 @@ export async function startPublicLiveGateway(): Promise<PublicLiveGateway> {
         response.status(503).json({ error: "admission_unavailable" });
       }
     });
+
+    // ── Workspace checkpoint handler (feature-flagged) ───────────────────
+    const workspaceCheckpointHandler = createWorkspaceCheckpointHandler();
+    app.post("/internal/financial-workspace/checkpoints", workspaceCheckpointHandler);
 
     const __filename = fileURLToPath(import.meta.url);
     const cwd = path.resolve(process.env.MARKET_ROOT?.trim() || path.resolve(path.dirname(__filename), ".."));
