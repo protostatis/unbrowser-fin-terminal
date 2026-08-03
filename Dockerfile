@@ -2,6 +2,7 @@ FROM node:22.23.2-bookworm-slim@sha256:f32b81066cde10a75dbac96646099533316d94bac
 
 WORKDIR /app
 COPY package.json package-lock.json ./
+COPY scripts/patch-pi-brace-expansion.mjs ./scripts/
 RUN npm ci
 
 COPY tsconfig.server.json tsconfig.extension.json vite.config.ts ./
@@ -19,6 +20,7 @@ FROM node:22.23.2-bookworm-slim@sha256:f32b81066cde10a75dbac96646099533316d94bac
 
 WORKDIR /app
 COPY package.json package-lock.json ./
+COPY scripts/patch-pi-brace-expansion.mjs ./scripts/
 RUN npm ci --omit=dev --omit=optional && npm cache clean --force
 
 
