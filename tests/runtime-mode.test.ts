@@ -101,6 +101,9 @@ test("production build manifest must match the resolved runtime mode", () => {
   assert.doesNotThrow(() =>
     verifyBuildModeManifest("live", '<meta name="x-build-mode" content="live">'),
   );
+  assert.doesNotThrow(() =>
+    verifyBuildModeManifest("public-gateway", '<meta name="x-build-mode" content="public-live">'),
+  );
   assert.throws(
     () => verifyBuildModeManifest("replay", null),
     /Production build artifact missing/,
@@ -112,5 +115,20 @@ test("production build manifest must match the resolved runtime mode", () => {
   assert.throws(
     () => verifyBuildModeManifest("replay", '<meta name="x-build-mode" content="live">'),
     /Build-mode mismatch/,
+  );
+});
+
+test("public live gateway requires an explicit runtime mode without legacy replay flags", () => {
+  assert.equal(
+    resolveRuntimeMode({ NODE_ENV: "production", TERMINAL_RUNTIME_MODE: "public-gateway" }),
+    "public-gateway",
+  );
+  assert.throws(
+    () => resolveRuntimeMode({ TERMINAL_RUNTIME_MODE: "public-gateway", PUBLIC_DEMO: "0" }),
+    /must not set PUBLIC_DEMO/,
+  );
+  assert.throws(
+    () => resolveRuntimeMode({ TERMINAL_RUNTIME_MODE: "unknown" }),
+    /Invalid TERMINAL_RUNTIME_MODE/,
   );
 });

@@ -2214,6 +2214,119 @@ strong {
   width: min(100%, 520px);
 }
 
+/* ── Public live-session admission ─────────────────────────────────────────── */
+
+.public-admission {
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  color: #c9d1d9;
+  background:
+    linear-gradient(180deg, #0b0e14 0%, #101722 100%);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.public-admission-card {
+  width: min(100%, 520px);
+  padding: 24px;
+  border: 1px solid #30363d;
+  border-top: 2px solid #58a6ff;
+  background: #0d1117;
+  box-shadow: 0 20px 60px #00000066;
+}
+
+.public-admission-kicker,
+.public-admission-state {
+  margin: 0 0 14px;
+  color: #58a6ff;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+.public-admission-card h1 {
+  margin: 0 0 14px;
+  color: #f0f6fc;
+  font-size: clamp(22px, 4vw, 30px);
+  line-height: 1.15;
+}
+
+.public-admission-card p:not(.public-admission-kicker):not(.public-admission-state) {
+  margin: 0 0 18px;
+  color: #8b949e;
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.public-admission-state-warning,
+.public-admission-error {
+  color: #f0a64a;
+}
+
+.public-turnstile {
+  min-height: 65px;
+  margin: 12px 0 16px;
+}
+
+.public-admission-action {
+  width: 100%;
+  min-height: 42px;
+  border: 1px solid #1f6feb;
+  color: #f0f6fc;
+  background: #1f6feb;
+  font: 700 12px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  letter-spacing: 0.06em;
+  cursor: pointer;
+}
+
+.public-admission-action:hover:not(:disabled) {
+  background: #388bfd;
+}
+
+.public-admission-action:disabled {
+  border-color: #30363d;
+  color: #6e7681;
+  background: #21262d;
+  cursor: not-allowed;
+}
+
+.public-admission-error {
+  margin: 16px 0 0;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.public-session-banner {
+  position: fixed;
+  z-index: 220;
+  top: max(8px, env(safe-area-inset-top));
+  right: max(8px, env(safe-area-inset-right));
+  padding: 6px 9px;
+  border: 1px solid #1f6feb99;
+  color: #79c0ff;
+  background: #0d1117e6;
+  font: 700 10px/1.25 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  letter-spacing: 0.04em;
+  pointer-events: none;
+}
+
+@media (max-width: 560px) {
+  .public-admission {
+    padding: 14px;
+  }
+
+  .public-admission-card {
+    padding: 20px;
+  }
+
+  .public-session-banner {
+    max-width: calc(100vw - 16px);
+    font-size: 9px;
+  }
+}
+
 .replay-dialog-body {
   display: flex;
   flex-direction: column;

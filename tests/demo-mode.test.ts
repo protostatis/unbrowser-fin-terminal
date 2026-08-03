@@ -3,8 +3,10 @@ import test from "node:test";
 import {
   isReplayDemoBuild,
   PUBLIC_DEMO,
+  PUBLIC_LIVE_DEMO,
   REPLAY_DEMO,
   REPLAY_DEMO_SEGMENT,
+  resolveTerminalBuildMode,
 } from "../web/src/demo-mode.js";
 
 test("demo segment constant is the exact fin-terminal-demo path segment", () => {
@@ -48,7 +50,17 @@ test("live deployments never resolve to the replay build", () => {
 test("flags are booleans and agree with the segment matcher", () => {
   assert.equal(typeof REPLAY_DEMO, "boolean");
   assert.equal(typeof PUBLIC_DEMO, "boolean");
+  assert.equal(typeof PUBLIC_LIVE_DEMO, "boolean");
   // PUBLIC_DEMO is the backwards-compatible alias for the unchanged live
   // terminal; the kiosk deployment is now the replay-only build.
   assert.equal(REPLAY_DEMO, PUBLIC_DEMO);
+});
+
+test("explicit public-live builds retain the demo URL without selecting replay", () => {
+  assert.equal(
+    resolveTerminalBuildMode("/fin-terminal-demo/", "public-live"),
+    "public-live",
+  );
+  assert.equal(resolveTerminalBuildMode("/fin-terminal-demo/", "live"), "live");
+  assert.equal(resolveTerminalBuildMode("/fin-terminal-demo/"), "replay");
 });

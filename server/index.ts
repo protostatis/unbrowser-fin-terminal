@@ -1,9 +1,10 @@
 /**
- * Market Terminal web backend — Express + WebSocket (live) or static-only (replay).
+ * Market Terminal web backend — signed-in live, static replay, or public live gateway.
  *
- * The runtime mode is determined by PUBLIC_DEMO:
+ * The runtime mode is determined by PUBLIC_DEMO or TERMINAL_RUNTIME_MODE:
  *   PUBLIC_DEMO=1|true  → replay-only server (static files, no agent)
  *   PUBLIC_DEMO=0|false → live server (full agent session + WebSocket)
+ *   TERMINAL_RUNTIME_MODE=public-gateway → Turnstile admission + isolated workers
  *
  * In production PUBLIC_DEMO must be explicitly set; dev defaults to live.
  *
@@ -52,6 +53,11 @@ import {
 } from "./proxy-auth.js";
 import { readResearchWorkerConcurrency } from "./research-worker-coordinator.js";
 import { resolveWebAction } from "./web-actions.js";
+import { startPublicLiveGateway } from "./public-live-gateway.js";
+import { readPublicSessionWorkerConfig } from "./public-live-config.js";
+import { PublicSessionWorkerLifecycle } from "./public-session-worker.js";
+import { createOpaqueId } from "./public-session-tokens.js";
+import { hasActiveResearchState } from "./research-activity.js";
 
 // ==========================================================================
 // Runtime mode — must be resolved before any live-only side effects
@@ -59,6 +65,7 @@ import { resolveWebAction } from "./web-actions.js";
 
 const RUNTIME_MODE = resolveRuntimeMode();
 const isReplay = RUNTIME_MODE === "replay";
+const isPublicGateway = RUNTIME_MODE === "public-gateway";
 
 // ==========================================================================
 // Common configuration
@@ -76,7 +83,7 @@ const PROXY_TOKEN_HEADER = "x-fin-terminal-proxy-token";
 
 // Production guard: PROXY_TOKEN required in live mode only.
 // Replay mode may serve without a token if the deployer chooses.
-if (process.env.NODE_ENV === "production" && !isReplay && !PROXY_TOKEN) {
+if (process.env.NODE_ENV === "production" && RUNTIME_MODE === "live" && !PROXY_TOKEN) {
   throw new Error("MARKET_PROXY_TOKEN is required in production");
 }
 
@@ -93,6 +100,15 @@ if (process.env.NODE_ENV === "production") {
 // Express app — shared across both modes
 // ==========================================================================
 
+if (isPublicGateway) {
+  void startPublicLiveGateway().catch((error) => {
+    console.error(
+      "[public-gateway] failed to start:",
+      error instanceof Error ? error.stack ?? error.message : String(error),
+    );
+    process.exitCode = 1;
+  });
+} else {
 const app = express();
 
 app.get("/api/health", (_req, res) => res.json({ status: "ok", uptime: process.uptime() }));
@@ -177,9 +193,15 @@ else {
 
   // ── Live-only constants ─────────────────────────────────────────────────
   const PRINCIPAL_HEADER = "x-fin-terminal-user";
+  const PUBLIC_WORKER_GENERATION_HEADER = "X-Fin-Terminal-Worker-Generation";
   const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
   const CLIENT_REPLACED_CLOSE_CODE = 4001;
+  const publicSessionWorker = readPublicSessionWorkerConfig();
+  const publicWorkerInstanceId = publicSessionWorker.enabled ? createOpaqueId() : undefined;
   const RESEARCH_WORKER_CONCURRENCY = readResearchWorkerConcurrency();
+  if (publicSessionWorker.enabled && RESEARCH_WORKER_CONCURRENCY !== 1) {
+    throw new Error("PUBLIC_SESSION_WORKER requires MARKET_RESEARCH_CONCURRENCY=1");
+  }
 
   function parseAllowedOrigins(raw: string | undefined): Set<string> | null {
     if (raw === undefined) return null;
@@ -260,6 +282,11 @@ else {
         const rows = raw.map((r) => ansiToHtml(r));
         const rawState =
           typeof activePanel.debugState === "function" ? activePanel.debugState() : undefined;
+        if (publicWorkerLifecycle && hasActiveResearchState(rawState)) {
+          // Trusted model/tool progress extends the idle lease, while the
+          // absolute public-session deadline remains unchanged.
+          publicWorkerLifecycle.touch();
+        }
         sendToClient({ type: "frame", rows, width: cols, rows_count: rows.length, state: rawState });
       } catch (err) {
         console.warn("[render] error:", err instanceof Error ? err.message : String(err));
@@ -302,6 +329,11 @@ else {
     validateUnbrowserRuntime();
     const agentDir = getAgentDir();
     const { modelRuntime, model, config } = await createAgentModelRuntime(agentDir);
+    if (publicSessionWorker.enabled && (!config.provider || !config.modelId)) {
+      throw new Error(
+        "PUBLIC_SESSION_WORKER requires an explicit MARKET_MODEL_PROVIDER/MARKET_MODEL_ID or OpenRouter model configuration",
+      );
+    }
     const loader = new DefaultResourceLoader({ cwd: CWD, agentDir });
     await loader.reload();
 
@@ -346,7 +378,10 @@ else {
   // ── /api/ready (live) ───────────────────────────────────────────────────
   app.get("/api/ready", (_req, res) => {
     const ready = sessionBootState === "ready" && Boolean(session);
-    res.status(ready ? 200 : 503).json({ status: ready ? "ready" : sessionBootState });
+    res.status(ready ? 200 : 503).json({
+      status: ready ? "ready" : sessionBootState,
+      ...(publicWorkerInstanceId ? { publicWorker: true, instanceId: publicWorkerInstanceId } : {}),
+    });
   });
 
   // ── Static files ────────────────────────────────────────────────────────
@@ -395,6 +430,27 @@ else {
       done(true);
     },
   });
+  if (publicWorkerInstanceId) {
+    wss.on("headers", (headers) => {
+      // The gateway compares this authenticated internal handshake with the
+      // generation it probed before assigning the seat. Browser-controlled
+      // traffic never reaches this worker listener directly.
+      headers.push(`${PUBLIC_WORKER_GENERATION_HEADER}: ${publicWorkerInstanceId}`);
+    });
+  }
+
+  const publicWorkerLifecycle = publicSessionWorker.enabled
+    ? new PublicSessionWorkerLifecycle({
+      idleTimeoutMs: publicSessionWorker.idleTimeoutMs,
+      absoluteTimeoutMs: publicSessionWorker.absoluteTimeoutMs,
+      reconnectGraceMs: publicSessionWorker.reconnectGraceMs,
+      onEnd: (reason) => {
+        console.log(`[public-worker] ending disposable session: ${reason}`);
+        for (const client of wss.clients) client.close(4408, `Public session ${reason}`);
+        void shutdown(`public session ${reason}`);
+      },
+    })
+    : undefined;
 
   wss.on("connection", (ws: WebSocket, request: IncomingMessage) => {
     const socketIp = request.socket.remoteAddress ?? "unknown";
@@ -404,6 +460,7 @@ else {
     const clientIp = (request.headers["x-real-ip"] as string | undefined)?.trim() || socketIp;
 
     console.log("[ws] client connected");
+    publicWorkerLifecycle?.connectedClient();
     const previousClient = activeClient;
     activeClient = ws;
     if (previousClient && previousClient.readyState === WebSocket.OPEN) {
@@ -442,6 +499,7 @@ else {
       if (!msg || typeof msg !== "object") return;
       switch (msg.type) {
         case "input": {
+          publicWorkerLifecycle?.touch();
           web.sendInput(String(msg.data ?? ""));
           pushFrame(); // ensure a frame after state mutation
           break;
@@ -455,10 +513,12 @@ else {
           break;
         }
         case "command":
+          publicWorkerLifecycle?.touch();
           // Open a panel by name. "market" with args opens a ticker, e.g. {args:"NKE"}.
           if (msg.name === "market") openMarket(typeof msg.args === "string" ? msg.args : "");
           break;
         case "select_response": {
+          publicWorkerLifecycle?.touch();
           const id = String(msg.id ?? "");
           const pending = pendingSelects.get(id);
           if (pending) {
@@ -468,6 +528,7 @@ else {
           break;
         }
         case "web_action": {
+          publicWorkerLifecycle?.touch();
           const isScrollAction =
             typeof msg.data === "object" &&
             msg.data !== null &&
@@ -505,6 +566,7 @@ else {
       if (activeClient !== ws) return;
       activeClient = null;
       sendToClient = () => {};
+      publicWorkerLifecycle?.disconnectedClient();
       // Reject any pending selects so they don't leak.
       cancelPendingSelects();
     });
@@ -557,6 +619,7 @@ else {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(`[server] shutting down (${signal})...`);
+    publicWorkerLifecycle?.dispose();
     const forceExit = setTimeout(() => process.exit(1), 30_000);
     forceExit.unref();
     for (const client of wss.clients) client.close(1012, "Server shutting down");
@@ -579,4 +642,5 @@ else {
 
   process.on("SIGINT", () => void shutdown("SIGINT"));
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
+}
 }

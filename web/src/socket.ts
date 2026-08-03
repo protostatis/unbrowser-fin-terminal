@@ -63,6 +63,10 @@ const CLIENT_REPLACED_CLOSE_CODE = 4001;
 
 /** Server close code for the public demo: seat busy or rate-limited. */
 export const DEMO_BUSY_CLOSE_CODE = 1013;
+/** Public gateway ended this guest lease; the client must return to admission. */
+export const PUBLIC_SESSION_ENDED_CLOSE_CODE = 4408;
+/** The assigned disposable worker became unavailable before the lease ended. */
+export const PUBLIC_WORKER_UNAVAILABLE_CLOSE_CODE = 4410;
 
 export class TerminalSocket {
   private ws: WebSocket | null = null;
@@ -74,6 +78,8 @@ export class TerminalSocket {
   /** Read-only connection indicator for quick UI checks. */
   connectionState: "connecting" | "connected" | "disconnected" =
     "disconnected";
+
+  constructor(private readonly protocols?: string | string[]) {}
 
   /* ── Event subscription ─────────────────────────────────────────────── */
 
@@ -122,7 +128,7 @@ export class TerminalSocket {
       ? ""
       : import.meta.env.BASE_URL.replace(/\/$/, "");
     const url = `${protocol}://${location.host}${basePath}/ws`;
-    const ws = new WebSocket(url);
+    const ws = this.protocols ? new WebSocket(url, this.protocols) : new WebSocket(url);
     this.ws = ws;
 
     ws.onopen = () => {
@@ -152,7 +158,10 @@ export class TerminalSocket {
       // 1013 (demo seat busy / rate-limited) must not trigger the fast
       // reconnect loop either: the waiting room owns retry timing, with
       // jitter, so clients don't churn the server with connections.
-      const stopAutoRetry = replaced || event.code === DEMO_BUSY_CLOSE_CODE;
+      const stopAutoRetry = replaced
+        || event.code === DEMO_BUSY_CLOSE_CODE
+        || event.code === PUBLIC_SESSION_ENDED_CLOSE_CODE
+        || event.code === PUBLIC_WORKER_UNAVAILABLE_CLOSE_CODE;
       if (stopAutoRetry) this._disconnected = true;
       this.setConnectionState("disconnected");
       this.dispatch("_close", {
