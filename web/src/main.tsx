@@ -504,17 +504,10 @@ export function App({
         </div>
       )}
 
-      {/* Status line */}
+      {/* Status line (container retained as the positioning context for the
+          absolutely-positioned evidence chip; the connection/dimensions
+          readout was removed as display-only noise) */}
       <div className="status-line">
-        <span className="status-conn" aria-live="polite">
-          <span className={`status-dot ${cs}`} />
-          {cs === "connected"
-            ? `${colsRef.current}×${rowsCountRef.current}`
-            : cs === "connecting"
-              ? "Connecting…"
-              : "Disconnected"}
-        </span>
-
         {dossier && (
           <EvidenceControl
             dossier={dossier}

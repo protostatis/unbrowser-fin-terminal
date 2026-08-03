@@ -217,16 +217,6 @@ strong {
   pointer-events: none;
 }
 
-.status-conn {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .research-beacon {
   --research-color: #d29922;
   position: absolute;
@@ -341,28 +331,6 @@ strong {
 
 .research-beacon-partial {
   --research-color: #d29922;
-}
-
-.status-dot {
-  display: inline-block;
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: #6e7681;
-}
-
-.status-dot.connected {
-  background: #3fb950;
-  box-shadow: 0 0 4px #3fb95080;
-}
-
-.status-dot.connecting {
-  background: #d29922;
-  animation: pulse 1s ease-in-out infinite;
-}
-
-.status-dot.disconnected {
-  background: #f85149;
 }
 
 @keyframes pulse {
@@ -1516,7 +1484,6 @@ strong {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .status-dot.connecting,
   .research-beacon-lamp,
   .mobile-research-lamp,
   .toast,
@@ -2200,13 +2167,6 @@ strong {
     padding: 8px;
     font-size: 12px;
   }
-}
-
-/* Static (blue) status dot — connected/green implies a live session that
- * the replay build deliberately does not have. */
-.replay-status .replay-dot {
-  background: #58a6ff;
-  box-shadow: 0 0 4px #58a6ff80;
 }
 
 /* Pilot chip — informational only; visually distinct from the source locker. */

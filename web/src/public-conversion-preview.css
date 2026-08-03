@@ -582,10 +582,6 @@
   pointer-events: auto;
 }
 
-.conversion-status-line .status-conn {
-  flex: 0 1 auto;
-}
-
 .conversion-brief-state {
   min-width: 0;
   overflow: hidden;
@@ -671,10 +667,6 @@
 .conversion-session-banner.is-private {
   color: #72c97f;
   border-color: #3fb95088;
-}
-
-.conversion-private-dot {
-  background: var(--preview-green);
 }
 
 /* Workspace transfer cartridge */
@@ -1464,8 +1456,7 @@
     animation: none;
   }
 
-  .conversion-preview .research-beacon-lamp,
-  .conversion-preview .status-dot {
+  .conversion-preview .research-beacon-lamp {
     animation: none !important;
   }
 }
