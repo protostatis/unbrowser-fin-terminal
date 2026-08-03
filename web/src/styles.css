@@ -2064,8 +2064,14 @@ strong {
     position: relative;
     margin: 0 auto 4px 8px;
     bottom: auto;
-    width: 44px;
-    height: 44px;
+    width: 26px;
+    height: 20px;
+    border-radius: 3px;
+    padding: 0;
+  }
+
+  .interaction-toggle-chevron {
+    font-size: 8px;
   }
 
   .interaction-panel {
@@ -2112,8 +2118,14 @@ strong {
     position: relative;
     margin: 0 auto 4px 8px;
     bottom: auto;
-    width: 44px;
-    height: 44px;
+    width: 26px;
+    height: 20px;
+    border-radius: 3px;
+    padding: 0;
+  }
+
+  .interaction-toggle-chevron {
+    font-size: 8px;
   }
 
   .interaction-panel {
