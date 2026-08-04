@@ -99,6 +99,13 @@ export interface PublicSessionCoordinatorState {
     unavailableAfterQuarantine?: boolean;
     /** Epoch ms when the slot last became healthy + unassigned (ready-idle). */
     idleSince?: number;
+    /**
+     * True while an operator drain is accepted. The slot is pinned out of the
+     * assignable pool until an explicit activation clears both the warm-pool
+     * drain and this flag. Additive and backward compatible: old Redis state
+     * without the field restores as eligible.
+     */
+    drainIneligible?: boolean;
   }>;
 }
 
@@ -146,6 +153,8 @@ type WorkerSlot = {
   probeEpoch: number;
   /** Epoch ms when the slot last became healthy + unassigned (ready-idle). */
   idleSince?: number;
+  /** Pinned out of assignment while an operator drain is in effect. */
+  drainIneligible: boolean;
 };
 
 const NOOP = () => {};
@@ -198,6 +207,7 @@ export class PublicSessionCoordinator {
         ready: false,
         requiresUnavailable: false,
         unavailableAfterQuarantine: false,
+        drainIneligible: false,
         probeEpoch: 0,
       });
     }
@@ -253,6 +263,18 @@ export class PublicSessionCoordinator {
     const worker = this.workers.get(workerId);
     if (!worker) throw new Error(`unknown public worker "${workerId}"`);
     if (probeEpoch !== undefined && probeEpoch !== worker.probeEpoch) return false;
+    if (worker.drainIneligible) {
+      // An operator drain pins the slot out of the assignable pool until an
+      // explicit activation. A health probe — same or new generation — must
+      // never re-enable it. The observed generation is still recorded so the
+      // warm-pool plan can propose an activation once the container was
+      // replaced (new generation alone stays ineligible).
+      if (generation) worker.generation = generation;
+      worker.ready = false;
+      worker.idleSince = undefined;
+      this.pump();
+      return true;
+    }
     this.bumpWorkerProbeEpoch(worker);
     if (worker.requiresUnavailable) {
       worker.ready = false;
@@ -324,6 +346,32 @@ export class PublicSessionCoordinator {
     const worker = this.workers.get(workerId);
     if (!worker) throw new Error(`unknown public worker "${workerId}"`);
     return worker.probeEpoch;
+  }
+
+  /**
+   * Fence a worker out of (or back into) the assignable pool as part of an
+   * atomic operator drain/activate mutation. Marking ineligible immediately
+   * removes assignment eligibility and bumps the probe epoch so a health
+   * response already in flight cannot re-enable the slot. Clearing only lifts
+   * the fence: the slot becomes assignable again after a fresh probe confirms
+   * the replacement process.
+   */
+  setWorkerDrainIneligible(workerId: string, ineligible: boolean): boolean {
+    const worker = this.workers.get(workerId);
+    if (!worker) return false;
+    worker.drainIneligible = ineligible;
+    if (ineligible) {
+      worker.ready = false;
+      worker.idleSince = undefined;
+      this.bumpWorkerProbeEpoch(worker);
+    }
+    this.pump();
+    return true;
+  }
+
+  /** Whether the slot is currently fenced by an accepted operator drain. */
+  isWorkerDrainIneligible(workerId: string): boolean {
+    return this.workers.get(workerId)?.drainIneligible === true;
   }
 
   /** Confirm that the assigned internal WebSocket reached the probed process. */
@@ -592,7 +640,7 @@ export class PublicSessionCoordinator {
     let assignedWorkers = 0;
     for (const worker of this.workers.values()) {
       if (worker.sessionId) assignedWorkers += 1;
-      else if (worker.ready) readyWorkers += 1;
+      else if (worker.ready && !worker.drainIneligible) readyWorkers += 1;
     }
     return {
       readyWorkers,
@@ -609,7 +657,7 @@ export class PublicSessionCoordinator {
    */
   getSeatStatuses(): Array<{
     workerId: string;
-    phase: "absent" | "starting" | "ready-idle" | "assigned" | "admitted" | "active" | "disconnected" | "recycling";
+    phase: "absent" | "starting" | "ready-idle" | "assigned" | "admitted" | "active" | "disconnected" | "draining" | "recycling";
     generation?: string;
     sessionId?: string;
     idleSinceMs?: number;
@@ -646,6 +694,10 @@ export class PublicSessionCoordinator {
               break;
           }
         }
+      } else if (worker.drainIneligible) {
+        // An accepted drain pins the slot here until an explicit activation.
+        // The slot is never an idle scale-down candidate while draining.
+        phase = "draining";
       } else if (worker.ready && worker.generation) {
         phase = "ready-idle";
         idleSinceMs = worker.idleSince !== undefined
@@ -684,6 +736,7 @@ export class PublicSessionCoordinator {
         quarantinedGeneration,
         unavailableAfterQuarantine,
         idleSince,
+        drainIneligible,
       }) => ({
         id,
         ...(sessionId ? { sessionId } : {}),
@@ -693,6 +746,7 @@ export class PublicSessionCoordinator {
         ...(quarantinedGeneration ? { quarantinedGeneration } : {}),
         ...(unavailableAfterQuarantine ? { unavailableAfterQuarantine: true } : {}),
         ...(idleSince !== undefined ? { idleSince } : {}),
+        ...(drainIneligible ? { drainIneligible: true } : {}),
       })),
     };
   }
@@ -758,6 +812,11 @@ export class PublicSessionCoordinator {
       worker.requiresUnavailable = persisted?.requiresUnavailable === true;
       worker.quarantinedGeneration = persisted?.quarantinedGeneration;
       worker.unavailableAfterQuarantine = persisted?.unavailableAfterQuarantine === true;
+      // A drain accepted before a gateway restart stays in force: the fence is
+      // persisted and re-applied here so a fresh health probe cannot re-enable
+      // the seat before the operator explicitly activates it. Old Redis state
+      // predating the field restores as eligible.
+      worker.drainIneligible = persisted?.drainIneligible === true;
       // Persisted idleSince continues a ready-idle seat's scale-down clock
       // across a gateway restart. Old Redis state predating the field gets a
       // conservative current-time stamp so idleSinceMs starts at zero and can
@@ -780,7 +839,10 @@ export class PublicSessionCoordinator {
   private pump(): void {
     this.removeEndedQueueEntries();
     for (const worker of this.workers.values()) {
-      if (!worker.ready || worker.sessionId) continue;
+      // An ineligible (drained) seat must never be assigned, even when a
+      // health probe still reports it healthy. Only an explicit activation
+      // lifts the fence.
+      if (!worker.ready || worker.sessionId || worker.drainIneligible) continue;
       const nextId = this.queue.shift();
       if (!nextId) return;
       const session = this.sessions.get(nextId);

@@ -442,6 +442,19 @@ export async function startPublicLiveGateway(): Promise<PublicLiveGateway> {
     const capacityRestored = await persistence.loadCapacityState();
     if (capacityRestored) warmPool.restore(capacityRestored);
 
+    // A drain accepted by a previous gateway process must stay enforced after
+    // a restart even if only one half of the persisted state survived (or the
+    // state predates the coordinator ineligibility fence). Every warm-pool
+    // drain re-fences its seat in the coordinator before the first health
+    // probe could re-enable it. The gateway persists capacity before the
+    // coordinator state so a partial write always leaves the warm-pool drain
+    // present for this reconciliation to rediscover.
+    for (const seat of coordinator.getSeatStatuses()) {
+      if (warmPool.isDraining(seat.workerId)) {
+        coordinator.setWorkerDrainIneligible(seat.workerId, true);
+      }
+    }
+
     // ── Research permit coordinator ─────────────────────────────────────
     const researchPermits = new ResearchPermitCoordinator({
       maxConcurrent: RESEARCH_PERMIT_MAX_CONCURRENT,
@@ -465,9 +478,15 @@ export async function startPublicLiveGateway(): Promise<PublicLiveGateway> {
     const mutate = <T>(operation: () => T | Promise<T>): Promise<T> => {
       const result = mutations.then(async () => {
         const value = await operation();
+        if (runtimeFeaturesEnabled) {
+          // Persist capacity FIRST: if the coordinator write fails after this
+          // point the gateway exits and the restarted gateway re-fences every
+          // warm-pool drain against the coordinator, so a drain can never be
+          // lost between the two Redis keys.
+          await persistence.saveCapacityState(warmPool.exportState());
+        }
         await persistence.save(coordinator.exportState());
         if (runtimeFeaturesEnabled) {
-          await persistence.saveCapacityState(warmPool.exportState());
           await persistence.saveResearchPermitState(researchPermits.exportState());
         }
         return value;
@@ -1163,6 +1182,8 @@ export async function startPublicLiveGateway(): Promise<PublicLiveGateway> {
           getResearchCoordinator: () => researchPermits,
           getQueueCount: () => coordinator.metrics().queuedVisitors,
           touchSession: (sessionId) => coordinator.touch(sessionId),
+          setWorkerDrainIneligible: (workerId, ineligible) =>
+            coordinator.setWorkerDrainIneligible(workerId, ineligible),
           mutate,
           inspect,
         },

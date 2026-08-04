@@ -30,6 +30,15 @@
  *   drain → 200 { accepted: true, drainId } | 409 { accepted: false, reason }
  *   activate → 200 { accepted: true } | 409 { accepted: false, reason }
  *
+ * A drain is atomic: the seat must be READY_IDLE (unassigned), the generation
+ * must match `expectedGeneration`, and it must have been continuously idle for
+ * the configured scale-down threshold before the warm-pool drain AND the
+ * coordinator ineligibility fence are both applied in one serialized mutation.
+ * Once accepted, the seat is pinned out of the assignable pool: health probes
+ * (old or new generation) never re-enable it, the fence survives a gateway
+ * restart, and only an explicit activation with a changed process generation
+ * clears both halves. A same-generation activation is rejected.
+ *
  * idleSeconds is the whole number of elapsed idle seconds (floored) for
  * ready-idle seats (since the slot became healthy and unassigned, persisted
  * across gateway restarts) and active seats (since the last meaningful
@@ -190,6 +199,12 @@ interface ManagementApiDependencies {
   getQueueCount: () => number;
   /** Extend the owning public session's idle lease (used by permit heartbeat). */
   touchSession?: (sessionId: string) => void;
+  /**
+   * Fence a seat in/out of the PublicSessionCoordinator assignable pool.
+   * Applied atomically with the warm-pool drain under the same serialized
+   * mutation so a drain/activate can never leave one half behind.
+   */
+  setWorkerDrainIneligible: (workerId: string, ineligible: boolean) => boolean;
   mutate: <T>(operation: () => T | Promise<T>) => Promise<T>;
   inspect: <T>(operation: () => T) => Promise<T>;
 }
@@ -412,7 +427,19 @@ export async function startManagementApi(
           if (expectedGeneration && seat.generation !== expectedGeneration) {
             return { accepted: false as const, reason: "generation mismatch" };
           }
-          return deps.getWarmPool().requestDrain(seat, drainId);
+          // Validation (ready + unassigned + idle threshold) happens inside
+          // requestDrain before any state is touched.
+          const drain = deps.getWarmPool().requestDrain(seat, drainId);
+          if (!drain.accepted) return drain;
+          // Fence the seat in the coordinator in the SAME mutation. If the
+          // fence cannot be applied, roll the warm-pool drain back so the two
+          // halves never diverge. Both halves are persisted by the gateway's
+          // mutate serialization before this call reports accepted.
+          if (!deps.setWorkerDrainIneligible(workerId, true)) {
+            deps.getWarmPool().forceReleaseDrain(workerId);
+            return { accepted: false as const, reason: "seat unavailable" };
+          }
+          return drain;
         });
         if (result.accepted) {
           jsonResponse(socket, 200, { accepted: true, drainId: (result as { drainId: string }).drainId });
@@ -439,20 +466,22 @@ export async function startManagementApi(
           const seat = deps.getSeatStatuses().find((s) => s.workerId === workerId);
           if (!seat) return { accepted: false as const, reason: "unknown seat" };
           const drain = deps.getWarmPool().getDrain(workerId);
-          if (!drain) {
-            // Nothing to release — an explicit activate is a safe no-op.
-            return { accepted: true as const };
-          }
           // Drain is sticky: only an explicit activation with a changed
           // process generation (the reconciler restarted the container)
           // releases it. A same-generation activate is rejected.
-          if (seat.generation && seat.generation === drain.generation) {
+          if (drain && seat.generation && seat.generation === drain.generation) {
             return { accepted: false as const, reason: "drain sticky; generation unchanged" };
           }
-          const released = deps.getWarmPool().releaseDrain(workerId, seat.generation);
-          if (!released.released) {
-            deps.getWarmPool().forceReleaseDrain(workerId);
+          // Clear BOTH halves in the same mutation: the warm-pool drain (when
+          // present) and the coordinator ineligibility fence. The gateway
+          // persists both before this call reports accepted.
+          if (drain) {
+            const released = deps.getWarmPool().releaseDrain(workerId, seat.generation);
+            if (!released.released) {
+              deps.getWarmPool().forceReleaseDrain(workerId);
+            }
           }
+          deps.setWorkerDrainIneligible(workerId, false);
           return { accepted: true as const };
         });
         if (result.accepted) {
@@ -618,7 +647,13 @@ export async function startManagementApi(
           if (expectedGeneration && seat.generation !== expectedGeneration) {
             return { accepted: false as const, reason: "generation mismatch" };
           }
-          return deps.getWarmPool().requestDrain(seat, drainId);
+          const drain = deps.getWarmPool().requestDrain(seat, drainId);
+          if (!drain.accepted) return drain;
+          if (!deps.setWorkerDrainIneligible(workerId, true)) {
+            deps.getWarmPool().forceReleaseDrain(workerId);
+            return { accepted: false as const, reason: "seat unavailable" };
+          }
+          return drain;
         });
         if (result.accepted) {
           jsonResponse(socket, 200, { accepted: true, drainId: (result as { drainId: string }).drainId });
@@ -644,12 +679,14 @@ export async function startManagementApi(
           const seat = deps.getSeatStatuses().find((s) => s.workerId === workerId);
           if (!seat) return { accepted: false as const, reason: "unknown seat" };
           const drain = deps.getWarmPool().getDrain(workerId);
-          if (!drain) return { accepted: true as const };
-          if (seat.generation && seat.generation === drain.generation) {
+          if (drain && seat.generation && seat.generation === drain.generation) {
             return { accepted: false as const, reason: "drain sticky; generation unchanged" };
           }
-          const released = deps.getWarmPool().releaseDrain(workerId, seat.generation);
-          if (!released.released) deps.getWarmPool().forceReleaseDrain(workerId);
+          if (drain) {
+            const released = deps.getWarmPool().releaseDrain(workerId, seat.generation);
+            if (!released.released) deps.getWarmPool().forceReleaseDrain(workerId);
+          }
+          deps.setWorkerDrainIneligible(workerId, false);
           return { accepted: true as const };
         });
         if (result.accepted) {

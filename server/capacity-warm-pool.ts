@@ -14,6 +14,12 @@
  *     sticky until explicit activation, and immediately remove assignment
  *     eligibility.
  *
+ * The warm pool owns the drain lifecycle; the coordinator owns assignment. The
+ * management API applies BOTH halves in one serialized mutation — this pool's
+ * drain flag plus the coordinator's ineligibility fence (see
+ * `PublicSessionCoordinator.setWorkerDrainIneligible`) — so an accepted drain
+ * can never be assigned by `pump()`, and an activation clears both halves.
+ *
  * Docker authority stays host-side. This module only computes desired state
  * and manages drain flags — never touches containers.
  */

@@ -35,39 +35,250 @@ function createCoordinator(overrides: Partial<ConstructorParameters<typeof Publi
   };
 }
 
-test("admission-vs-drain race: drained seat is never assigned to a new visitor", () => {
-  const { coordinator } = createCoordinator();
-
-  // Make seat-01 ready
-  coordinator.setWorkerReady("seat-01", true, "gen-a");
-
-  // Create a warm pool with drain active on seat-01
+/**
+ * Full drain harness: the coordinator AND the warm pool share one clock, and
+ * the helpers below mirror the gateway's atomic drain/activate mutations
+ * (validation → warm-pool drain → coordinator fence, both halves applied in a
+ * single synchronous operation exactly as under the gateway mutate chain).
+ */
+function createHarness() {
+  let now = 1_700_000_000_000;
+  const workerIds = ["seat-01", "seat-02", "seat-03", "seat-04", "seat-05", "seat-06"];
+  const coordinator = new PublicSessionCoordinator({
+    workerIds,
+    maxQueue: 3,
+    ticketTtlMs: 10 * 60_000,
+    reconnectGraceMs: 30_000,
+    idleTimeoutMs: 5 * 60_000,
+    absoluteTimeoutMs: 15 * 60_000,
+    maxResearchRuns: 5,
+    dailyBudgetMicroUsd: 10_000_000,
+    researchRunReservationMicroUsd: 200_000,
+    now: () => now,
+  });
   const warmPool = new CapacityWarmPool({
     totalSeats: 6,
     idleScaleDownMs: 5 * 60_000,
     warmSpares: 1,
+    now: () => now,
   });
+  return {
+    coordinator,
+    warmPool,
+    advance(ms: number) { now += ms; },
+  };
+}
 
-  // Drain seat-01 while it's ready-idle (idle long enough to be eligible).
-  warmPool.requestDrain(
-    { workerId: "seat-01", phase: "ready-idle", generation: "gen-a", drainRequested: false, idleSinceMs: 400_000 },
-    "drain-op-1",
-  );
+function seatWithDrain(coordinator: PublicSessionCoordinator, warmPool: CapacityWarmPool, workerId: string) {
+  const seat = coordinator.getSeatStatuses().find((s) => s.workerId === workerId);
+  if (!seat) return undefined;
+  const drain = warmPool.getDrain(workerId);
+  return {
+    ...seat,
+    drainRequested: warmPool.isDraining(workerId),
+    drainId: drain?.drainId,
+    drainGeneration: drain?.generation,
+    drainSinceMs: drain ? Date.now() - drain.requestedAt : undefined,
+  };
+}
 
-  // The drain doesn't directly affect the coordinator — it's the operator's
-  // responsibility to stop the worker. But the warm pool should report the
-  // seat as draining so it won't be assigned by the coordinator if we were
-  // to integrate drain awareness into the pump.
+/** Mirrors POST /api/management/drain under the gateway mutate serialization. */
+function drainSeat(
+  coordinator: PublicSessionCoordinator,
+  warmPool: CapacityWarmPool,
+  workerId: string,
+  drainId: string,
+  expectedGeneration?: string,
+): { accepted: boolean; drainId?: string; reason?: string } {
+  const seat = seatWithDrain(coordinator, warmPool, workerId);
+  if (!seat) return { accepted: false, reason: "unknown seat" };
+  if (expectedGeneration && seat.generation !== expectedGeneration) {
+    return { accepted: false, reason: "generation mismatch" };
+  }
+  const drain = warmPool.requestDrain(seat, drainId);
+  if (!drain.accepted) return drain;
+  if (!coordinator.setWorkerDrainIneligible(workerId, true)) {
+    warmPool.forceReleaseDrain(workerId);
+    return { accepted: false, reason: "seat unavailable" };
+  }
+  return drain;
+}
 
-  // Verify the coordinator can still assign drained seats (current behavior
-  // — integration of drain into coordinator pump would prevent this).
+/** Mirrors POST /api/management/activate under the gateway mutate serialization. */
+function activateSeat(
+  coordinator: PublicSessionCoordinator,
+  warmPool: CapacityWarmPool,
+  workerId: string,
+): { accepted: boolean; reason?: string } {
+  const seat = seatWithDrain(coordinator, warmPool, workerId);
+  if (!seat) return { accepted: false, reason: "unknown seat" };
+  const drain = warmPool.getDrain(workerId);
+  if (drain && seat.generation && seat.generation === drain.generation) {
+    return { accepted: false, reason: "drain sticky; generation unchanged" };
+  }
+  if (drain) {
+    const released = warmPool.releaseDrain(workerId, seat.generation);
+    if (!released.released) warmPool.forceReleaseDrain(workerId);
+  }
+  coordinator.setWorkerDrainIneligible(workerId, false);
+  return { accepted: true };
+}
+
+test("admission before drain is unaffected; no session is assigned after drain accepted", () => {
+  const { coordinator, warmPool, advance } = createHarness();
+
+  // A visitor admitted BEFORE the drain takes the ready seat normally.
+  coordinator.setWorkerReady("seat-01", true, "gen-a");
+  const before = coordinator.admit("visitor-a");
+  assert.equal(before.accepted, true);
+  if (!before.accepted) return;
+  assert.equal(before.session.state, "admitted");
+  assert.equal(before.session.workerId, "seat-01");
+
+  // The admitted visitor never opens a socket → no-show returns the pristine
+  // seat to ready-idle. Now the operator drains it.
+  advance(30_000);
+  coordinator.sweep();
+  assert.equal(coordinator.getSeatStatuses().find((s) => s.workerId === "seat-01")?.phase, "ready-idle");
+  advance(300_000);
+  const drain = drainSeat(coordinator, warmPool, "seat-01", "drain-a", "gen-a");
+  assert.equal(drain.accepted, true);
+
+  // The drained seat is pinned: it reports draining and is never assigned.
+  assert.equal(coordinator.getSeatStatuses().find((s) => s.workerId === "seat-01")?.phase, "draining");
+
+  // A visitor admitted AFTER the drain is queued — never assigned, even after
+  // sweeps and repeated health probes.
+  const after = coordinator.admit("visitor-b");
+  assert.equal(after.accepted, true);
+  if (!after.accepted) return;
+  assert.equal(after.session.state, "queued");
+  assert.equal(after.session.workerId, undefined);
+  coordinator.sweep();
+  coordinator.setWorkerReady("seat-01", true, "gen-a");
+  assert.equal(coordinator.status(after.session.id)?.state, "queued");
+  assert.equal(coordinator.getSeatStatuses().find((s) => s.workerId === "seat-01")?.phase, "draining");
+});
+
+test("a drain is atomic under serialized admission: a concurrent visitor never lands on the drained seat", () => {
+  const { coordinator, warmPool, advance } = createHarness();
+  coordinator.setWorkerReady("seat-01", true, "gen-a");
+  coordinator.setWorkerReady("seat-02", true, "gen-b");
+  advance(400_000);
+
+  // Serialized operations (the gateway mutate chain runs one at a time): an
+  // admission takes seat-01, the drain fences seat-02, and a later admission
+  // must queue instead of landing on the drained seat-02.
+  const first = coordinator.admit("visitor-a");
+  const drain = drainSeat(coordinator, warmPool, "seat-02", "drain-race", "gen-b");
+  const second = coordinator.admit("visitor-b");
+  assert.equal(first.accepted && drain.accepted && second.accepted, true);
+  if (!first.accepted || !second.accepted) return;
+
+  assert.equal(first.session.state, "admitted");
+  assert.equal(first.session.workerId, "seat-01");
+  assert.equal(second.session.state, "queued");
+  assert.equal(second.session.workerId, undefined);
+
+  // seat-02 stays draining and seat-01 keeps serving its session.
+  assert.equal(coordinator.getSeatStatuses().find((s) => s.workerId === "seat-02")?.phase, "draining");
+  assert.equal(coordinator.status(first.session.id)?.state, "admitted");
+});
+
+test("a drained seat survives gateway restart, restore, and fresh health probes", () => {
+  const first = createHarness();
+  first.coordinator.setWorkerReady("seat-01", true, "gen-a");
+  first.advance(400_000);
+  const drain = drainSeat(first.coordinator, first.warmPool, "seat-01", "drain-restart", "gen-a");
+  assert.equal(drain.accepted, true);
+
+  // Persist both halves (the gateway mutate serialization) and restart.
+  const coordinatorState = first.coordinator.exportState();
+  const capacityState = first.warmPool.exportState();
+  const second = createHarness();
+  second.coordinator.restore(coordinatorState);
+  second.warmPool.restore(capacityState);
+  // Startup reconciliation re-fences every warm-pool drain.
+  for (const seat of second.coordinator.getSeatStatuses()) {
+    if (second.warmPool.isDraining(seat.workerId)) {
+      second.coordinator.setWorkerDrainIneligible(seat.workerId, true);
+    }
+  }
+
+  // Still draining after the restart, even after fresh probes of the same and
+  // of a NEW generation (a new generation alone never re-enables the seat).
+  const seat1 = second.coordinator.getSeatStatuses().find((s) => s.workerId === "seat-01");
+  assert.equal(seat1?.phase, "draining");
+  second.coordinator.setWorkerReady("seat-01", true, "gen-a");
+  second.coordinator.setWorkerReady("seat-01", true, "gen-b");
+  assert.equal(second.coordinator.getSeatStatuses().find((s) => s.workerId === "seat-01")?.phase, "draining");
+
+  const admitted = second.coordinator.admit("visitor-a");
+  assert.equal(admitted.accepted, true);
+  if (!admitted.accepted) return;
+  assert.equal(admitted.session.state, "queued");
+  assert.equal(admitted.session.workerId, undefined);
+});
+
+test("same-generation activate is rejected; a new generation activates only via explicit activate", () => {
+  const { coordinator, warmPool, advance } = createHarness();
+  coordinator.setWorkerReady("seat-01", true, "gen-a");
+  advance(400_000);
+  const drain = drainSeat(coordinator, warmPool, "seat-01", "drain-sticky", "gen-a");
+  assert.equal(drain.accepted, true);
+
+  // Same-generation activation is rejected and leaves BOTH halves in force.
+  const sticky = activateSeat(coordinator, warmPool, "seat-01");
+  assert.equal(sticky.accepted, false);
+  assert.equal(coordinator.isWorkerDrainIneligible("seat-01"), true);
+  assert.ok(warmPool.isDraining("seat-01"));
+
+  // A probe with a new generation keeps the seat ineligible but records the
+  // generation so the warm-pool plan proposes an activation.
+  coordinator.setWorkerReady("seat-01", true, "gen-b");
+  assert.equal(coordinator.getSeatStatuses().find((s) => s.workerId === "seat-01")?.phase, "draining");
+  const seats = coordinator.getSeatStatuses().map((s) => ({
+    ...s,
+    drainRequested: warmPool.isDraining(s.workerId),
+    drainId: warmPool.getDrain(s.workerId)?.drainId,
+  }));
+  const plan = warmPool.plan(seats);
+  assert.ok(plan.activateCandidates.includes("seat-01"));
+
+  // Explicit activation with the changed generation clears BOTH halves.
+  const released = activateSeat(coordinator, warmPool, "seat-01");
+  assert.equal(released.accepted, true);
+  assert.equal(coordinator.isWorkerDrainIneligible("seat-01"), false);
+  assert.ok(!warmPool.isDraining("seat-01"));
+
+  // The seat needs a fresh probe before it is assignable again.
+  assert.notEqual(coordinator.getSeatStatuses().find((s) => s.workerId === "seat-01")?.phase, "ready-idle");
+  coordinator.setWorkerReady("seat-01", true, "gen-b");
+  assert.equal(coordinator.getSeatStatuses().find((s) => s.workerId === "seat-01")?.phase, "ready-idle");
   const admitted = coordinator.admit("visitor-a");
   assert.equal(admitted.accepted, true);
-  if (admitted.accepted) {
-    assert.equal(admitted.session.state, "admitted");
-    // Currently, without drain integration in pump, seat-01 is assigned.
-    // With full integration, drain would prevent assignment.
-  }
+  if (!admitted.accepted) return;
+  assert.equal(admitted.session.state, "admitted");
+  assert.equal(admitted.session.workerId, "seat-01");
+});
+
+test("a health probe already in flight when a drain is accepted cannot re-enable the seat", () => {
+  const { coordinator, warmPool, advance } = createHarness();
+  coordinator.setWorkerReady("seat-01", true, "gen-a");
+  advance(400_000);
+
+  // The maintenance loop captured the probe epoch, then the drain lands (the
+  // fence bumps the epoch), then the stale probe response arrives.
+  const staleEpoch = coordinator.workerProbeEpoch("seat-01");
+  const drain = drainSeat(coordinator, warmPool, "seat-01", "drain-probe", "gen-a");
+  assert.equal(drain.accepted, true);
+  assert.equal(coordinator.setWorkerReady("seat-01", true, "gen-a", staleEpoch), false);
+
+  const seat1 = coordinator.getSeatStatuses().find((s) => s.workerId === "seat-01");
+  assert.equal(seat1?.phase, "draining");
+  const admitted = coordinator.admit("visitor-a");
+  assert.equal(admitted.accepted, true);
+  if (admitted.accepted) assert.equal(admitted.session.state, "queued");
 });
 
 test("getSeatStatuses reports correct phases for all 6 seats", () => {
@@ -424,8 +635,8 @@ test("recycling phase reflects ended sessions awaiting replacement", () => {
   assert.equal(seat1?.phase, "recycling");
 });
 
-test("warm-pool drain does not prevent coordinator from managing sessions independently", () => {
-  const { coordinator } = createCoordinator();
+test("a drain pins only its own seat and never disturbs an independent active session", () => {
+  const { coordinator, warmPool, advance } = createHarness();
 
   coordinator.setWorkerReady("seat-01", true, "gen-a");
   coordinator.setWorkerReady("seat-02", true, "gen-b");
@@ -438,22 +649,16 @@ test("warm-pool drain does not prevent coordinator from managing sessions indepe
   assert.ok(assignment);
   assert.equal(assignment?.workerId, "seat-01");
 
-  // The warm pool drain is advisory — it doesn't prevent the coordinator
-  // from assigning or managing the seat. The operator must separately stop
-  // the Docker container.
-  const warmPool = new CapacityWarmPool({
-    totalSeats: 6,
-    idleScaleDownMs: 5 * 60_000,
-    warmSpares: 1,
-  });
+  // seat-02 is ready-idle; idle it long enough, then drain it atomically
+  // (warm-pool drain + coordinator fence applied together).
+  advance(400_000);
+  const drain = drainSeat(coordinator, warmPool, "seat-02", "drain-1", "gen-b");
+  assert.equal(drain.accepted, true);
 
-  // Drain seat-02 (ready-idle but has no session, idle long enough)
-  warmPool.requestDrain(
-    { workerId: "seat-02", phase: "ready-idle", generation: "gen-b", drainRequested: false, idleSinceMs: 400_000 },
-    "drain-1",
-  );
-
-  // seat-02 drain doesn't affect seat-01's active session
+  // seat-02 is pinned out of the pool, while seat-01's active session is
+  // completely unaffected.
   assert.equal(coordinator.status(admitted.session.id)?.state, "active");
+  assert.equal(coordinator.getSeatStatuses().find((s) => s.workerId === "seat-02")?.phase, "draining");
   assert.ok(warmPool.isDraining("seat-02"));
+  assert.equal(coordinator.isWorkerDrainIneligible("seat-02"), true);
 });

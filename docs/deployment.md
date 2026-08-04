@@ -174,13 +174,22 @@ Infra reconciler endpoints (POST, JSON):
   slot became healthy and unassigned (persisted across gateway restarts);
   active seats count from the last meaningful activity. Draining seats report
   `0`. The value is monotonic and never negative.
-- `drain` performs a **generation CAS** on `expectedGeneration`: a stale
-  generation is rejected with 409 so a replaced worker is never drained. A
-  ready-idle seat is only drainable after `TERMINAL_RUNTIME_IDLE_SCALE_DOWN`
-  seconds (default 300) of continuous idle; earlier drain requests are
-  rejected with 409.
+- `drain` is **atomic**: a ready-idle (unassigned) seat is only drainable after
+  `TERMINAL_RUNTIME_IDLE_SCALE_DOWN` seconds (default 300) of continuous idle,
+  and the **generation CAS** on `expectedGeneration` rejects a stale
+  generation with 409 so a replaced worker is never drained. Once accepted the
+  warm-pool drain AND the coordinator ineligibility fence are applied in one
+  serialized mutation and persisted before the caller sees `accepted: true`.
+  The drained seat is immediately removed from the assignable pool: health
+  probes (old or new generation) never re-enable it, the fence survives a
+  gateway restart, and no session — queued before or admitted after — is ever
+  assigned to it.
 - `activate` releases a sticky drain only when the process generation changed;
-  a non-draining seat is an accepted no-op.
+  a same-generation activation is rejected with 409. The explicit activation
+  clears both the warm-pool drain and the coordinator ineligibility fence in
+  one serialized mutation; the slot becomes assignable again after a fresh
+  health probe confirms the replacement process. Activating a seat with no
+  drain is an accepted no-op.
 
 Worker→gateway permit surface (same private listener, same header):
 

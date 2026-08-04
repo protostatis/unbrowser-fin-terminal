@@ -77,6 +77,20 @@ function createManagementApi(port: number) {
     seats,
     mutate,
     inspect,
+    // Mirror the gateway wiring: fencing a seat flips its phase between
+    // ready-idle and draining so the snapshot/plan surfaces agree.
+    setWorkerDrainIneligible: (workerId: string, ineligible: boolean): boolean => {
+      const seat = seats.find((s) => s.workerId === workerId);
+      if (!seat) return false;
+      if (ineligible) {
+        seat.phase = "draining";
+        seat.idleSinceMs = undefined;
+      } else {
+        seat.phase = "ready-idle";
+        seat.idleSinceMs = 400_000;
+      }
+      return true;
+    },
     // v1 contract: queue count and drain-aware seat statuses.
     getQueueCount: () => 2,
     getSeatStatuses: () => seats.map((s) => ({
@@ -94,6 +108,7 @@ function managementDeps(port: number) {
     getWarmPool: () => deps.warmPool,
     getResearchCoordinator: () => deps.researchPermits,
     getQueueCount: deps.getQueueCount,
+    setWorkerDrainIneligible: deps.setWorkerDrainIneligible,
     mutate: deps.mutate,
     inspect: deps.inspect,
   };

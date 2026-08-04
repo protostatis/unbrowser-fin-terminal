@@ -76,11 +76,26 @@ function createDeps() {
     return result;
   };
   const inspect = <T>(operation: () => T): Promise<T> => mutations.then(operation);
+  // Mirror the gateway wiring: fencing a seat flips its coordinator phase
+  // between ready-idle and draining so the snapshot/plan surfaces agree.
+  const setWorkerDrainIneligible = (workerId: string, ineligible: boolean): boolean => {
+    const seat = seats.find((s) => s.workerId === workerId);
+    if (!seat) return false;
+    if (ineligible) {
+      seat.phase = "draining";
+      seat.idleSinceMs = undefined;
+    } else {
+      seat.phase = "ready-idle";
+      seat.idleSinceMs = 400_000;
+    }
+    return true;
+  };
   return {
     warmPool,
     researchPermits,
     seats,
     touched,
+    setWorkerDrainIneligible,
     mutate,
     inspect,
     // Overlay drain flags from the warm pool, mirroring the gateway wiring.
@@ -107,6 +122,7 @@ async function startApi(t: { after(fn: () => Promise<void> | void): void }) {
       getResearchCoordinator: () => deps.researchPermits,
       getQueueCount: () => 2,
       touchSession: (sessionId) => deps.touched.push(sessionId),
+      setWorkerDrainIneligible: deps.setWorkerDrainIneligible,
       mutate: deps.mutate,
       inspect: deps.inspect,
     },
@@ -252,6 +268,48 @@ test("drain performs a generation CAS and rejects a stale expectedGeneration", a
   });
   assert.equal(noCas.status, 200);
   assert.equal(noCas.body.accepted, true);
+});
+
+test("a drain accepted through the API fences the seat; activate with a new generation releases it", async (t) => {
+  const { port, deps } = await startApi(t);
+  const drain = await fetchJson(`http://${HOST}:${port}/api/management/drain`, {
+    method: "POST",
+    headers: { ...auth, "content-type": "application/json" },
+    body: JSON.stringify({ workerId: "seat-02", drainId: "drain-fence", expectedGeneration: "gen-b" }),
+  });
+  assert.equal(drain.status, 200);
+  // Both halves applied atomically: the warm pool records the drain and the
+  // coordinator surface reports the seat as draining.
+  assert.ok(deps.warmPool.isDraining("seat-02"));
+  const drainingSeat = deps.seats.find((s) => s.workerId === "seat-02");
+  assert.equal(drainingSeat?.phase, "draining");
+
+  const snapshot = await fetchJson(`http://${HOST}:${port}/api/management/reconcile-snapshot`, {
+    method: "POST",
+    headers: auth,
+  });
+  const seats = snapshot.body.seats as Record<string, Record<string, unknown>>;
+  assert.equal(seats["seat-02"]?.status, "draining");
+
+  // The replacement process registers a new generation; the plan proposes an
+  // activation, and the explicit activate clears the fence.
+  deps.seats[1] = { ...deps.seats[1]!, generation: "gen-b2" };
+  const plan = await fetchJson(`http://${HOST}:${port}/api/management/reconcile-plan`, {
+    method: "POST",
+    headers: auth,
+  });
+  const planBody = plan.body.plan as Record<string, unknown>;
+  assert.ok((planBody.activateCandidates as string[]).includes("seat-02"));
+
+  const released = await fetchJson(`http://${HOST}:${port}/api/management/activate`, {
+    method: "POST",
+    headers: { ...auth, "content-type": "application/json" },
+    body: JSON.stringify({ workerId: "seat-02" }),
+  });
+  assert.equal(released.status, 200);
+  assert.equal(released.body.accepted, true);
+  assert.ok(!deps.warmPool.isDraining("seat-02"));
+  assert.equal(deps.seats.find((s) => s.workerId === "seat-02")?.phase, "ready-idle");
 });
 
 test("activate reports {accepted} and releases a drained seat only when the generation changed", async (t) => {
@@ -403,6 +461,7 @@ test("management API disabled when feature flag / token are absent (private-only
       getWarmPool: () => deps.warmPool,
       getResearchCoordinator: () => deps.researchPermits,
       getQueueCount: () => 0,
+      setWorkerDrainIneligible: deps.setWorkerDrainIneligible,
       mutate: deps.mutate,
       inspect: deps.inspect,
     },
@@ -508,6 +567,7 @@ test("management API fails closed when its listener cannot bind", async () => {
           getWarmPool: () => deps.warmPool,
           getResearchCoordinator: () => deps.researchPermits,
           getQueueCount: () => 0,
+          setWorkerDrainIneligible: deps.setWorkerDrainIneligible,
           mutate: deps.mutate,
           inspect: deps.inspect,
         },
