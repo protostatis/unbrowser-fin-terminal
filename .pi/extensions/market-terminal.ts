@@ -15,6 +15,9 @@ import {
 } from "../../shared/unbrowser-mcp.js";
 import { sanitizePublicUrl } from "../../shared/public-url.js";
 import {
+	filterKnownBotWallSources,
+} from "../../shared/research-source-policy.js";
+import {
 	createDefaultWorkerFactory,
 	readResearchWorkerConcurrency,
 	ResearchWorkerCoordinator,
@@ -239,7 +242,16 @@ type EventLane = {
 	briefQuestion: string;
 	whyQuestion: string;
 };
-type MarketSnapshot = { quotes: Quote[]; movers: RankedMover[]; headlines: Headline[]; challenge?: string; updatedAt: number; chartScope: ChartScope };
+type MarketSnapshot = {
+	quotes: Quote[];
+	movers: RankedMover[];
+	headlines: Headline[];
+	challenge?: string;
+	blockedDomains?: string[];
+	blockedSourceCount?: number;
+	updatedAt: number;
+	chartScope: ChartScope;
+};
 type MarketHubNavigationState = {
 	screen: number;
 	selected: number;
@@ -259,6 +271,14 @@ type TerminalResult =
 type ResearchRequest = Extract<TerminalResult, { action: "research" }>;
 type ResearchOutcome = "queued" | "running" | "partial" | "complete" | "failed" | "cancelled";
 type ResearchActivity = "seeding" | "fetching" | "extracting" | "synthesizing";
+export type DiscoveryCandidate = {
+	id: string;
+	title: string;
+	url: string;
+	source: string;
+	status: "search-only";
+	candidateId?: string;
+};
 type ResearchSchedulerPhase = "queued" | "dispatched" | "running" | "cancelling" | "settled";
 type ResearchJob = {
 	id: string;
@@ -1234,7 +1254,11 @@ async function fetchQuote(symbol: string, scope: ChartScope = DEFAULT_CHART_SCOP
 	};
 }
 
-function extractSearchCandidates(samples: Array<{ text?: unknown; href?: unknown }>, limit = 8): Array<{ text: string; url: string }> {
+export function extractSearchCandidates(samples: Array<{ text?: unknown; href?: unknown }>, limit = 8): {
+	candidates: Array<{ text: string; url: string }>;
+	blockedDomains: string[];
+	blockedSourceCount: number;
+} {
 	const candidates: Array<{ text: string; url: string }> = [];
 	const seen = new Set<string>();
 	for (const link of samples) {
@@ -1261,9 +1285,35 @@ function extractSearchCandidates(samples: Array<{ text?: unknown; href?: unknown
 			try { text = new URL(url).hostname.replace(/^www\./, ""); } catch { text = "Untitled result"; }
 		}
 		candidates.push({ text: text.slice(0, 240), url });
-		if (candidates.length >= limit) break;
+		// Search pages can contain many navigation links. Bound policy work while
+		// still scanning beyond blocked top results for viable alternatives.
+		if (candidates.length >= Math.max(limit * 4, 32)) break;
 	}
-	return candidates;
+	const filtered = filterKnownBotWallSources(candidates);
+	return {
+		candidates: filtered.allowed.slice(0, limit),
+		blockedDomains: filtered.blockedDomains,
+		blockedSourceCount: filtered.blockedCount,
+	};
+}
+
+export function grantAllowedExtractionCandidates(
+	registry: ResearchCandidateRegistry,
+	researchId: string | undefined,
+	candidates: DiscoveryCandidate[],
+): DiscoveryCandidate[] {
+	// Capability issuance owns the invariant: even a future discovery path that
+	// forgets to filter cannot grant market_extract access to a blocked source.
+	const allowed = filterKnownBotWallSources(candidates).allowed;
+	if (!researchId || allowed.length === 0) return allowed;
+	const granted: GrantedResearchCandidate[] = registry.register(researchId, allowed.map((candidate) => ({
+		sourceId: candidate.id,
+		title: candidate.title,
+		url: candidate.url,
+		source: candidate.source,
+	})));
+	const candidateIds = new Map(granted.map((candidate) => [candidate.sourceId, candidate.candidateId]));
+	return allowed.map((candidate) => ({ ...candidate, candidateId: candidateIds.get(candidate.id) }));
 }
 
 function configuredUnbrowserMcpUrl(): string | undefined {
@@ -1303,7 +1353,7 @@ async function unbrowserResearch(pi: ExtensionAPI, symbol: string, question: str
 
 	const challenge = result.challenge;
 	const samples = result.blockmap?.interactives?.link_samples ?? [];
-	const sources = extractSearchCandidates(samples, 8);
+	const discovery = extractSearchCandidates(samples, 8);
 
 	return {
 		query,
@@ -1311,14 +1361,22 @@ async function unbrowserResearch(pi: ExtensionAPI, symbol: string, question: str
 		challenge: challenge
 			? { provider: cleanText(challenge.provider || "bot wall"), reason: cleanText(challenge.reason || challenge.hint || "challenge detected") }
 			: null,
-		sources,
+		sources: discovery.candidates,
+		blockedDomains: discovery.blockedDomains,
+		blockedSourceCount: discovery.blockedSourceCount,
 	};
 }
 
-async function unbrowserHeadlines(pi: ExtensionAPI, query: string, signal?: AbortSignal): Promise<{ headlines: Headline[]; challenge?: string }> {
+async function unbrowserHeadlines(pi: ExtensionAPI, query: string, signal?: AbortSignal): Promise<{
+	headlines: Headline[];
+	challenge?: string;
+	blockedDomains: string[];
+	blockedSourceCount: number;
+}> {
 	const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
 	const result = await navigatePublicPage(pi, url, signal) as { challenge?: { provider?: string }; blockmap?: { interactives?: { link_samples?: Array<{ text?: string; href?: string }> } } };
-	const headlines = extractSearchCandidates(result.blockmap?.interactives?.link_samples ?? [], 8)
+	const discovery = extractSearchCandidates(result.blockmap?.interactives?.link_samples ?? [], 8);
+	const headlines = discovery.candidates
 		.map((link) => {
 			const url = link.url;
 			let source = "web";
@@ -1326,7 +1384,12 @@ async function unbrowserHeadlines(pi: ExtensionAPI, query: string, signal?: Abor
 			return { title: link.text, url, source };
 		})
 		.filter((item) => item.title && item.url);
-	return { headlines, challenge: result.challenge?.provider ? cleanText(result.challenge.provider) : undefined };
+	return {
+		headlines,
+		challenge: result.challenge?.provider ? cleanText(result.challenge.provider) : undefined,
+		blockedDomains: discovery.blockedDomains,
+		blockedSourceCount: discovery.blockedSourceCount,
+	};
 }
 
 async function fetchQuotes(symbols: readonly string[], scope: ChartScope = DEFAULT_CHART_SCOPE, signal?: AbortSignal): Promise<Quote[]> {
@@ -1352,13 +1415,23 @@ async function fetchMarketSnapshot(pi: ExtensionAPI, scope: ChartScope = DEFAULT
 	const [quotes, news] = await Promise.all([
 		fetchQuotes(allSymbols, scope, signal),
 		unbrowserHeadlines(pi, headlineQuery, signal)
-			.catch((error): { headlines: Headline[]; challenge?: string } => ({
+			.catch((error): { headlines: Headline[]; challenge?: string; blockedDomains: string[]; blockedSourceCount: number } => ({
 				headlines: [],
 				challenge: `Source headlines unavailable: ${cleanText(error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 180) || "request failed"}`,
+				blockedDomains: [],
+				blockedSourceCount: 0,
 			})),
 	]);
 	const movers = rankMovers(quotes);
-	return { quotes, movers, headlines: news.headlines, challenge: news.challenge, updatedAt: Date.now(), chartScope: scope };
+	return {
+		quotes,
+		movers,
+		headlines: news.headlines,
+		challenge: news.challenge,
+		...(news.blockedDomains.length ? { blockedDomains: news.blockedDomains, blockedSourceCount: news.blockedSourceCount } : {}),
+		updatedAt: Date.now(),
+		chartScope: scope,
+	};
 }
 
 function safeChartTimezone(timezone: string | undefined): string {
@@ -6835,14 +6908,6 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	type DiscoveryCandidate = {
-		id: string;
-		title: string;
-		url: string;
-		source: string;
-		status: "search-only";
-		candidateId?: string;
-	};
 	type MarketDiscoveryDetails = {
 		scope: "ticker" | "market";
 		query: string;
@@ -6850,6 +6915,8 @@ export default function (pi: ExtensionAPI) {
 		researchId?: string;
 		context: { quote?: { price: number; changePercent: number | null }; scoreboard?: string };
 		searchResults: DiscoveryCandidate[];
+		blockedDomains: string[];
+		blockedSourceCount: number;
 		failures: string[];
 		challenge?: string;
 		canvas?: Canvas;
@@ -6872,15 +6939,7 @@ export default function (pi: ExtensionAPI) {
 		details,
 	});
 	const grantExtractionCandidates = (job: ResearchJob | undefined, candidates: DiscoveryCandidate[]): DiscoveryCandidate[] => {
-		if (!job || candidates.length === 0) return candidates;
-		const granted: GrantedResearchCandidate[] = researchCandidates.register(job.id, candidates.map((candidate) => ({
-			sourceId: candidate.id,
-			title: candidate.title,
-			url: candidate.url,
-			source: candidate.source,
-		})));
-		const candidateIds = new Map(granted.map((candidate) => [candidate.sourceId, candidate.candidateId]));
-		return candidates.map((candidate) => ({ ...candidate, candidateId: candidateIds.get(candidate.id) }));
+		return grantAllowedExtractionCandidates(researchCandidates, job?.id, candidates);
 	};
 	const recordEvidencePacket = (job: ResearchJob, packet: EvidencePacket): void => {
 		const current = requireWritableResearchJob(job);
@@ -7040,6 +7099,7 @@ export default function (pi: ExtensionAPI) {
 			"When the terminal supplies a background research job ID, pass it unchanged as research_id.",
 			"market_discover returns search-only sources and opaque candidate IDs. These are NOT evidence. Call market_extract for 2–4 selected candidates before using them as evidence.",
 			"Never treat a search-result title or snippet as a factual claim. Open the source page and extract its actual content before drawing conclusions.",
+			"Known persistent bot-wall domains are omitted from candidates. Do not retry or work around them; use returned alternatives or rerun market_discover with a query for primary sources, company investor relations, SEC filings, regulators, exchanges, or government releases covering the same fact.",
 			"On challenge / likely_js_filled, report the blocker and escalate; do NOT bypass bot walls or CAPTCHAs silently.",
 			"After extraction, publish market_canvas with structural blocks and source IDs.",
 		],
@@ -7090,6 +7150,8 @@ export default function (pi: ExtensionAPI) {
 					return { id: `S${i + 1}`, title: s.text, url: s.url, source, status: "search-only" };
 				});
 				const searchResults = grantExtractionCandidates(job, dedupeCandidates(raw));
+				const blockedDomains = research?.blockedDomains ?? [];
+				const blockedSourceCount = research?.blockedSourceCount ?? 0;
 				const challenge = research?.challenge
 					? `${research.challenge.provider}: ${research.challenge.reason}`
 					: researchResult.status === "rejected"
@@ -7105,6 +7167,7 @@ export default function (pi: ExtensionAPI) {
 					"",
 					`Candidate search results (${searchResults.length}):`,
 					...searchResults.map((r) => `  [${r.id}] ${r.title} — ${r.source}\n       ${r.url}  status=${r.status}${r.candidateId ? `  candidate_id=${r.candidateId}` : ""}`),
+					blockedSourceCount > 0 ? `Skipped ${blockedSourceCount} known bot-wall candidate(s): ${blockedDomains.join(", ")}.` : "",
 					"",
 					failures.length ? `Partial failures: ${failures.join(" | ")}` : "",
 					"",
@@ -7112,6 +7175,7 @@ export default function (pi: ExtensionAPI) {
 					"  - mode=text_main for articles",
 					"  - mode=table_to_json for tables",
 					"  - mode=extract_cards for news/list pages",
+					blockedSourceCount > 0 ? "If the returned sources are insufficient, call market_discover again with an alternative-source query; do not retry the blocked domains." : "",
 					"Report challenge/likely_js_filled per unbrowser rules; do not bypass.",
 				].filter(Boolean).join("\n");
 				const canvas = publishDiscoverySeed(job, searchResults, challenge);
@@ -7119,6 +7183,8 @@ export default function (pi: ExtensionAPI) {
 					scope, query, symbol, researchId: job?.id,
 					context: { quote: quote ? { price: quote.price, changePercent: quote.changePercent } : undefined },
 					searchResults,
+					blockedDomains,
+					blockedSourceCount,
 					failures,
 					challenge,
 					canvas,
@@ -7144,6 +7210,8 @@ export default function (pi: ExtensionAPI) {
 				status: "search-only",
 			}));
 			const searchResults = grantExtractionCandidates(job, dedupeCandidates(raw));
+			const blockedDomains = snapshot?.blockedDomains ?? [];
+			const blockedSourceCount = snapshot?.blockedSourceCount ?? 0;
 			const board = snapshot?.quotes
 				.filter((q) => MARKET_BOARDS.some((b) => b.symbol === q.symbol))
 				.map((q) => `${q.symbol}: ${percent(q.changePercent)}`)
@@ -7159,6 +7227,7 @@ export default function (pi: ExtensionAPI) {
 				"",
 				`Candidate search results (${searchResults.length}):`,
 				...searchResults.map((r) => `  [${r.id}] ${r.title} — ${r.source}\n       ${r.url}  status=${r.status}${r.candidateId ? `  candidate_id=${r.candidateId}` : ""}`),
+				blockedSourceCount > 0 ? `Skipped ${blockedSourceCount} known bot-wall candidate(s): ${blockedDomains.join(", ")}.` : "",
 				"",
 				marketFailures.length ? `Partial failures: ${marketFailures.join(" | ")}` : "",
 				"",
@@ -7166,6 +7235,7 @@ export default function (pi: ExtensionAPI) {
 				"  - mode=text_main for articles",
 				"  - mode=table_to_json for tables",
 				"  - mode=extract_cards for news/list pages",
+				blockedSourceCount > 0 ? "If the returned sources are insufficient, call market_discover again with an alternative-source query; do not retry the blocked domains." : "",
 				"Report challenge/likely_js_filled per unbrowser rules; do not bypass.",
 			].filter(Boolean).join("\n");
 			const canvas = publishDiscoverySeed(job, searchResults, challenge);
@@ -7175,6 +7245,8 @@ export default function (pi: ExtensionAPI) {
 				researchId: job?.id,
 				context: { scoreboard: board },
 				searchResults,
+				blockedDomains,
+				blockedSourceCount,
 				failures: marketFailures,
 				challenge,
 				canvas,
