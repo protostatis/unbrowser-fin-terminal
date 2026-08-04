@@ -122,6 +122,60 @@ test("drain only accepted for ready-idle seats", () => {
   assert.ok(pool.isDraining("s6"));
 });
 
+test("five-minute eligibility is exact: drain rejected at 299999ms, accepted at 300000ms", () => {
+  const pool = createPool(6, 5 * 60_000);
+  const before = pool.requestDrain(
+    { workerId: "s1", phase: "ready-idle", generation: "g1", drainRequested: false, idleSinceMs: 299_999 },
+    "drain-before",
+  );
+  assert.equal(before.accepted, false);
+  assert.ok((before as { reason: string }).reason.includes("not idle long enough"));
+
+  const at = pool.requestDrain(
+    { workerId: "s1", phase: "ready-idle", generation: "g1", drainRequested: false, idleSinceMs: 300_000 },
+    "drain-at",
+  );
+  assert.equal(at.accepted, true);
+});
+
+test("a ready-idle seat with no tracked idle clock cannot be drained", () => {
+  const pool = createPool(6, 5 * 60_000);
+  const result = pool.requestDrain(
+    { workerId: "s1", phase: "ready-idle", generation: "g1", drainRequested: false },
+    "drain-unknown-idle",
+  );
+  // An unknown idle clock is treated as zero (conservative current-time from
+  // old Redis state) — never eligible for immediate drain.
+  assert.equal(result.accepted, false);
+  assert.ok((result as { reason: string }).reason.includes("not idle long enough"));
+});
+
+test("scale-down candidates require the exact five-minute idle threshold", () => {
+  const pool = createPool(6);
+  // 0 protected, 5 ready-idle, 1 absent → desired 2, current 5, excess 3.
+  const below = seats([
+    { workerId: "s1", phase: "ready-idle", generation: "g1", idleSinceMs: 299_999 },
+    { workerId: "s2", phase: "ready-idle", generation: "g2", idleSinceMs: 299_999 },
+    { workerId: "s3", phase: "ready-idle", generation: "g3", idleSinceMs: 299_999 },
+    { workerId: "s4", phase: "ready-idle", generation: "g4", idleSinceMs: 299_999 },
+    { workerId: "s5", phase: "ready-idle", generation: "g5", idleSinceMs: 299_999 },
+    { workerId: "s6", phase: "absent" },
+  ]);
+  const belowPlan = pool.plan(below);
+  assert.equal(belowPlan.scaleDownCandidates.length, 0);
+
+  const at = seats([
+    { workerId: "s1", phase: "ready-idle", generation: "g1", idleSinceMs: 300_000 },
+    { workerId: "s2", phase: "ready-idle", generation: "g2", idleSinceMs: 300_000 },
+    { workerId: "s3", phase: "ready-idle", generation: "g3", idleSinceMs: 300_000 },
+    { workerId: "s4", phase: "ready-idle", generation: "g4", idleSinceMs: 300_000 },
+    { workerId: "s5", phase: "ready-idle", generation: "g5", idleSinceMs: 300_000 },
+    { workerId: "s6", phase: "absent" },
+  ]);
+  const atPlan = pool.plan(at);
+  assert.equal(atPlan.scaleDownCandidates.length, 3);
+});
+
 test("drain is idempotent with same drainId and generation", () => {
   const pool = createPool(6);
   const first = pool.requestDrain(

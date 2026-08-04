@@ -245,9 +245,9 @@ test("POST /api/management/seats/:id/activate activates a drained seat", async (
   const port = await getFreePort();
   const deps = createManagementApi(port);
 
-  // Pre-drain the seat
+  // Pre-drain the seat (idle long enough to be eligible)
   deps.warmPool.requestDrain(
-    { workerId: "seat-02", phase: "ready-idle", generation: "gen-b", drainRequested: false },
+    { workerId: "seat-02", phase: "ready-idle", generation: "gen-b", drainRequested: false, idleSinceMs: 400_000 },
     "drain-test-pre",
   );
 

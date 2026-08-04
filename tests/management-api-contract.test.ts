@@ -83,6 +83,16 @@ function createDeps() {
     touched,
     mutate,
     inspect,
+    // Overlay drain flags from the warm pool, mirroring the gateway wiring.
+    drainAwareSeats: (): SeatStatus[] => seats.map((s) => ({
+      ...s,
+      drainRequested: warmPool.isDraining(s.workerId),
+      drainId: warmPool.getDrain(s.workerId)?.drainId,
+      drainGeneration: warmPool.getDrain(s.workerId)?.generation,
+      drainSinceMs: warmPool.getDrain(s.workerId)
+        ? Date.now() - (warmPool.getDrain(s.workerId)?.requestedAt ?? Date.now())
+        : undefined,
+    })),
   };
 }
 
@@ -92,7 +102,7 @@ async function startApi(t: { after(fn: () => Promise<void> | void): void }) {
   const api: ManagementApi | undefined = startManagementApi(
     { host: HOST, port, token: TOKEN, enabled: true },
     {
-      getSeatStatuses: () => deps.seats,
+      getSeatStatuses: () => deps.drainAwareSeats(),
       getWarmPool: () => deps.warmPool,
       getResearchCoordinator: () => deps.researchPermits,
       getQueueCount: () => 2,
@@ -145,6 +155,46 @@ test("reconcile-snapshot returns the versioned seat map, totals, and plan", asyn
   assert.equal(typeof plan.desiredRunning, "number");
   assert.ok(Array.isArray(plan.scaleDownCandidates));
   assert.ok(Array.isArray(plan.activateCandidates));
+});
+
+test("reconcile-snapshot reports accurate idleSeconds for ready-idle seats and zero for draining seats", async (t) => {
+  const { port, deps } = await startApi(t);
+
+  // seat-02 ready-idle at 400s idle → idleSeconds 400 (floored, monotonic).
+  const snapshot = await fetchJson(`http://${HOST}:${port}/api/management/reconcile-snapshot`, {
+    method: "POST",
+    headers: auth,
+  });
+  const seats = snapshot.body.seats as Record<string, Record<string, unknown>>;
+  assert.equal(seats["seat-02"]?.idleSeconds, 400);
+  assert.equal(seats["seat-03"]?.idleSeconds, 350);
+
+  // After a drain, the same ready-idle seat reports idleSeconds 0 (it is no
+  // longer an idle scale-down candidate).
+  deps.warmPool.requestDrain(
+    { workerId: "seat-02", phase: "ready-idle", generation: "gen-b", drainRequested: false, idleSinceMs: 400_000 },
+    "drain-idle-report",
+  );
+  const afterDrain = await fetchJson(`http://${HOST}:${port}/api/management/reconcile-snapshot`, {
+    method: "POST",
+    headers: auth,
+  });
+  const afterSeats = afterDrain.body.seats as Record<string, Record<string, unknown>>;
+  assert.equal(afterSeats["seat-02"]?.idleSeconds, 0);
+  assert.equal(afterSeats["seat-02"]?.drainRequested, true);
+});
+
+test("drain rejects a ready-idle seat before the five-minute idle threshold", async (t) => {
+  const { port, deps } = await startApi(t);
+  deps.seats[1] = { ...deps.seats[1]!, idleSinceMs: 299_999 };
+  const early = await fetchJson(`http://${HOST}:${port}/api/management/drain`, {
+    method: "POST",
+    headers: { ...auth, "content-type": "application/json" },
+    body: JSON.stringify({ workerId: "seat-02", drainId: "drain-early", expectedGeneration: "gen-b" }),
+  });
+  assert.equal(early.status, 409);
+  assert.equal(early.body.accepted, false);
+  assert.ok((early.body.reason as string).includes("not idle long enough"));
 });
 
 test("reconcile-plan returns the warm-pool plan only", async (t) => {
@@ -205,7 +255,7 @@ test("drain performs a generation CAS and rejects a stale expectedGeneration", a
 test("activate reports {accepted} and releases a drained seat only when the generation changed", async (t) => {
   const { port, deps } = await startApi(t);
   deps.warmPool.requestDrain(
-    { workerId: "seat-02", phase: "ready-idle", generation: "gen-b", drainRequested: false },
+    { workerId: "seat-02", phase: "ready-idle", generation: "gen-b", drainRequested: false, idleSinceMs: 400_000 },
     "drain-pre",
   );
 

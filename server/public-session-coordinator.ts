@@ -97,6 +97,8 @@ export interface PublicSessionCoordinatorState {
     requiresUnavailable?: boolean;
     quarantinedGeneration?: string;
     unavailableAfterQuarantine?: boolean;
+    /** Epoch ms when the slot last became healthy + unassigned (ready-idle). */
+    idleSince?: number;
   }>;
 }
 
@@ -142,6 +144,8 @@ type WorkerSlot = {
   quarantinedGeneration?: string;
   unavailableAfterQuarantine: boolean;
   probeEpoch: number;
+  /** Epoch ms when the slot last became healthy + unassigned (ready-idle). */
+  idleSince?: number;
 };
 
 const NOOP = () => {};
@@ -252,6 +256,7 @@ export class PublicSessionCoordinator {
     this.bumpWorkerProbeEpoch(worker);
     if (worker.requiresUnavailable) {
       worker.ready = false;
+      worker.idleSince = undefined;
       if (!ready || !generation) {
         if (worker.quarantinedGeneration) worker.unavailableAfterQuarantine = true;
         this.pump();
@@ -279,6 +284,7 @@ export class PublicSessionCoordinator {
     }
     if (!ready || !generation) {
       worker.ready = false;
+      worker.idleSince = undefined;
       if (worker.sessionId) {
         const session = this.sessions.get(worker.sessionId);
         if (session && session.state !== "ended") this.end(session, "worker-unavailable");
@@ -304,6 +310,7 @@ export class PublicSessionCoordinator {
         // An attachment is connected or in flight. Its authenticated upgrade
         // header decides whether this generation has received tenant state.
         worker.ready = false;
+        worker.idleSince = undefined;
       }
     } else {
       this.markIdleWorkerReady(worker, generation);
@@ -368,10 +375,20 @@ export class PublicSessionCoordinator {
       // A stale health response from the terminated tenant process must never
       // return its slot to the queue before Compose has replaced it.
       worker.ready = false;
+      worker.idleSince = undefined;
     } else {
+      const generationChanged = worker.generation !== generation;
       worker.ready = true;
       worker.generation = generation;
       worker.replacementOfGeneration = undefined;
+      if (generationChanged || worker.idleSince === undefined) {
+        // A slot enters ready-idle when it first reports healthy and unassigned,
+        // when a replacement process takes over, or when a restored gateway
+        // re-probes a slot with no persisted idle clock. Repeated probes of the
+        // same generation keep the original idle timestamp so the clock is
+        // monotonic and a restart does not restart the scale-down timer.
+        worker.idleSince = this.now();
+      }
     }
   }
 
@@ -631,6 +648,9 @@ export class PublicSessionCoordinator {
         }
       } else if (worker.ready && worker.generation) {
         phase = "ready-idle";
+        idleSinceMs = worker.idleSince !== undefined
+          ? Math.max(0, now - worker.idleSince)
+          : 0;
       } else if (worker.replacementOfGeneration) {
         phase = "recycling";
       } else if (worker.requiresUnavailable) {
@@ -663,6 +683,7 @@ export class PublicSessionCoordinator {
         requiresUnavailable,
         quarantinedGeneration,
         unavailableAfterQuarantine,
+        idleSince,
       }) => ({
         id,
         ...(sessionId ? { sessionId } : {}),
@@ -671,6 +692,7 @@ export class PublicSessionCoordinator {
         ...(requiresUnavailable ? { requiresUnavailable: true } : {}),
         ...(quarantinedGeneration ? { quarantinedGeneration } : {}),
         ...(unavailableAfterQuarantine ? { unavailableAfterQuarantine: true } : {}),
+        ...(idleSince !== undefined ? { idleSince } : {}),
       })),
     };
   }
@@ -736,6 +758,17 @@ export class PublicSessionCoordinator {
       worker.requiresUnavailable = persisted?.requiresUnavailable === true;
       worker.quarantinedGeneration = persisted?.quarantinedGeneration;
       worker.unavailableAfterQuarantine = persisted?.unavailableAfterQuarantine === true;
+      // Persisted idleSince continues a ready-idle seat's scale-down clock
+      // across a gateway restart. Old Redis state predating the field gets a
+      // conservative current-time stamp so idleSinceMs starts at zero and can
+      // never trigger an immediate unsafe drain; the worker is re-probed
+      // before it can become ready anyway. Assigned seats are never idle.
+      const persistedIdleSince = persisted?.idleSince;
+      worker.idleSince = worker.sessionId
+        ? undefined
+        : Number.isFinite(persistedIdleSince) && (persistedIdleSince ?? 0) >= 0
+          ? Math.min(persistedIdleSince!, now)
+          : now;
       worker.ready = false;
       worker.probeEpoch = 0;
     }
@@ -766,6 +799,7 @@ export class PublicSessionCoordinator {
       this.dailyReservedMicroUsd += reservation;
       worker.sessionId = session.id;
       worker.ready = false;
+      worker.idleSince = undefined;
       this.bumpWorkerProbeEpoch(worker);
     }
   }
@@ -788,16 +822,20 @@ export class PublicSessionCoordinator {
           // The worker process is terminated after a visitor reaches it. Its
           // replacement must pass a health check before this slot becomes ready.
           worker.ready = false;
+          worker.idleSince = undefined;
           worker.replacementOfGeneration = session.workerGeneration ?? worker.generation;
         } else if (reason !== "worker-unavailable") {
           // An admitted visitor never opened a browser socket, so the worker
-          // has no tenant panel or agent state to discard.
+          // has no tenant panel or agent state to discard. The slot returns to
+          // the ready-idle pool and its idle clock restarts from the session end.
           worker.ready = true;
+          worker.idleSince = this.now();
           worker.replacementOfGeneration = undefined;
         } else {
           // A failed health probe cannot return an unvisited seat to service.
           // Any later healthy generation may re-enter through setWorkerReady.
           worker.ready = false;
+          worker.idleSince = undefined;
           worker.replacementOfGeneration = undefined;
         }
       }

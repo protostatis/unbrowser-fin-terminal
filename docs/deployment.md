@@ -164,8 +164,16 @@ Infra reconciler endpoints (POST, JSON):
   (`seat-01`..`seat-06`); `status` is one of `absent|starting|healthy|draining|stopped`
   and `assigned` is derived from the phase. `plan.desiredRunning` is
   authoritative for the reconciler.
+- `idleSeconds` is the whole number of elapsed idle seconds (floored) for
+  `ready-idle` and `active` seats: ready-idle seats count from the moment the
+  slot became healthy and unassigned (persisted across gateway restarts);
+  active seats count from the last meaningful activity. Draining seats report
+  `0`. The value is monotonic and never negative.
 - `drain` performs a **generation CAS** on `expectedGeneration`: a stale
-  generation is rejected with 409 so a replaced worker is never drained.
+  generation is rejected with 409 so a replaced worker is never drained. A
+  ready-idle seat is only drainable after `TERMINAL_RUNTIME_IDLE_SCALE_DOWN`
+  seconds (default 300) of continuous idle; earlier drain requests are
+  rejected with 409.
 - `activate` releases a sticky drain only when the process generation changed;
   a non-draining seat is an accepted no-op.
 

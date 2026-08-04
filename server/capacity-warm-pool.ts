@@ -230,6 +230,15 @@ export class CapacityWarmPool {
       return { accepted: false, reason: "seat is already draining with a different drain-id" };
     }
 
+    // Five-minute eligibility is exact: a ready-idle seat may only be drained
+    // after it has been continuously idle for the configured scale-down
+    // threshold. A seat without a tracked idle clock (e.g. restored from old
+    // Redis state before the idleSince field existed) reports zero idle time
+    // and cannot be drained until the coordinator stamps a fresh idleSince.
+    if ((seat.idleSinceMs ?? 0) < this.config.idleScaleDownMs) {
+      return { accepted: false, reason: `seat ${seat.workerId} is not idle long enough for scale-down` };
+    }
+
     this.drains.set(seat.workerId, {
       drainId,
       generation: seat.generation,

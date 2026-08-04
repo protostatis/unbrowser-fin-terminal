@@ -30,6 +30,13 @@
  *   drain → 200 { accepted: true, drainId } | 409 { accepted: false, reason }
  *   activate → 200 { accepted: true } | 409 { accepted: false, reason }
  *
+ * idleSeconds is the whole number of elapsed idle seconds (floored) for
+ * ready-idle seats (since the slot became healthy and unassigned, persisted
+ * across gateway restarts) and active seats (since the last meaningful
+ * activity). It is monotonic and never negative; draining seats report 0.
+ * Drain requests for ready-idle seats are rejected with 409 until the seat has
+ * been continuously idle for the configured scale-down threshold.
+ *
  * Worker permit surface (worker→gateway private client):
  *   POST /api/management/research-permits/acquire   — { sessionId, workerGeneration }
  *   POST /api/management/research-permits/status    — { requestId }
@@ -198,7 +205,14 @@ export function seatContractRecord(seat: SeatStatus): Record<string, unknown> {
     phase: seat.phase,
     generation: seat.generation ?? null,
     assigned: ASSIGNED_PHASES.has(seat.phase),
-    idleSeconds: seat.idleSinceMs !== undefined ? Math.round(seat.idleSinceMs / 1000) : 0,
+    // Whole elapsed seconds, floored so a seat is never reported as eligible
+    // before the exact scale-down threshold (the drain gate compares the
+    // underlying ms value). Draining seats are no longer idle candidates.
+    idleSeconds: seat.drainRequested
+      ? 0
+      : seat.idleSinceMs !== undefined
+        ? Math.floor(seat.idleSinceMs / 1000)
+        : 0,
     drainRequested: seat.drainRequested,
     drainId: seat.drainId ?? null,
     // Docker authority stays host-side; the gateway never reports a container id.
