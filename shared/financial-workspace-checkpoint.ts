@@ -796,13 +796,25 @@ export function buildContinuationSummary(checkpoint: FinancialTerminalCheckpoint
 export type WorkspaceEnv = { [key: string]: string | undefined };
 
 /**
+ * Default env source for the helpers below. When called from Node (server)
+ * with no explicit env they must read the real `process.env`; in a browser
+ * bundle there is no `process` so the default is an empty object. This is
+ * what makes a bare `isWorkspaceCheckpointEnabled()` in `server/index.ts`
+ * actually see the container's `FINANCIAL_WORKSPACE_CHECKPOINTS`.
+ */
+function defaultEnv(): WorkspaceEnv {
+  const nodeEnv = (globalThis as { process?: { env?: WorkspaceEnv } }).process?.env;
+  return nodeEnv ?? {};
+}
+
+/**
  * Check if financial workspace checkpoints are enabled in this deployment.
  * Feature-gated: requires explicit opt-in via env var. Accepts the boolean
  * spellings used by Compose interpolation (`1`, `true`, `yes`) so the same
  * master flag can drive both the control plane and the gateway without a
  * separate translation layer.
  */
-export function isWorkspaceCheckpointEnabled(env: WorkspaceEnv = {}): boolean {
+export function isWorkspaceCheckpointEnabled(env: WorkspaceEnv = defaultEnv()): boolean {
   return /^(?:1|true|yes)$/i.test((env.FINANCIAL_WORKSPACE_CHECKPOINTS ?? "").trim());
 }
 
@@ -815,7 +827,7 @@ export function isWorkspaceCheckpointEnabled(env: WorkspaceEnv = {}): boolean {
  * `/fin-terminal-workspace/*`. Only set this when the two surfaces are ever
  * split across different subdomains.
  */
-export function handoffCookieDomain(env: WorkspaceEnv = {}): string | undefined {
+export function handoffCookieDomain(env: WorkspaceEnv = defaultEnv()): string | undefined {
   const domain = env.FINANCIAL_WORKSPACE_HANDOFF_COOKIE_DOMAIN?.trim();
   if (!domain) return undefined;
   return domain.startsWith(".") ? domain : `.${domain}`;
@@ -824,7 +836,7 @@ export function handoffCookieDomain(env: WorkspaceEnv = {}): string | undefined 
 /**
  * Resolve the internal workspace service URL from env (or undefined if disabled).
  */
-export function workspaceServiceUrl(env: WorkspaceEnv = {}): string | undefined {
+export function workspaceServiceUrl(env: WorkspaceEnv = defaultEnv()): string | undefined {
   const url = env.FINANCIAL_WORKSPACE_SERVICE_URL?.trim();
   if (!url) return undefined;
   try {
@@ -838,9 +850,18 @@ export function workspaceServiceUrl(env: WorkspaceEnv = {}): string | undefined 
 /**
  * Resolve the bearer control token for server-to-server communication.
  * This token NEVER reaches the browser.
+ *
+ * Canonical spelling: `FIN_WORKSPACE_CONTROL_TOKEN` (used by the control
+ * plane and the host-side runtime provider). The gateway deployment passes
+ * `FINANCIAL_WORKSPACE_CONTROL_TOKEN` (derived from the same value), which is
+ * accepted as an alias so both the private runtime and the public gateway
+ * resolve the same shared secret.
  */
-export function workspaceControlToken(env: WorkspaceEnv = {}): string | undefined {
-  const token = env.FINANCIAL_WORKSPACE_CONTROL_TOKEN?.trim();
+export function workspaceControlToken(env: WorkspaceEnv = defaultEnv()): string | undefined {
+  const token = (
+    env.FIN_WORKSPACE_CONTROL_TOKEN?.trim()
+    || env.FINANCIAL_WORKSPACE_CONTROL_TOKEN?.trim()
+  );
   if (!token || token.length < 32) return undefined;
   return token;
 }

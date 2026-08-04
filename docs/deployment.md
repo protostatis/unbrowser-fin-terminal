@@ -244,9 +244,16 @@ state; the browser only sends an explicit opt-in.
   or URL.
 - Private import boot: a fresh in-memory workspace boots from a validated
   checkpoint (`SessionManager.inMemory` + custom entry + bounded continuation
-  seed). Raw transcript/process state is never restored. In the terminal image,
-  `TERMINAL_WORKSPACE_IMPORT_FILE` can point at a validated checkpoint JSON for
-  an imported workspace boot; `NODE_ENV=production` fails closed on a bad file.
+  seed). Raw transcript/process state is never restored. In the private
+  workspace runtime image (`TERMINAL_RUNTIME_MODE=private-workspace`), the
+  host-side provider provisions `FIN_WORKSPACE_CHECKPOINT_FILE` (default
+  `/data/checkpoint.json`) on the per-account volume for an imported workspace
+  boot; `TERMINAL_WORKSPACE_IMPORT_FILE` is the legacy alias. Both require
+  `FINANCIAL_WORKSPACE_CHECKPOINTS=1` and `NODE_ENV=production` fails closed on
+  a missing or bad file. The runtime additionally requires `MARKET_PROXY_TOKEN`,
+  `FIN_WORKSPACE_CONTROL_TOKEN`, `FIN_WORKSPACE_SESSION_ID`,
+  `TERMINAL_RUNTIME_WORKER_GENERATION`, an explicit model provider/model, and
+  `UNBROWSER_MCP_URL` (fail closed at boot).
 
 The canonical cross-repo contract (wire units, headers, cookie names, env vars,
 paths) is `unchained-infra/docs/financial-terminal-cross-repo-contract.md`.

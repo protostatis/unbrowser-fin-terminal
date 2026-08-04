@@ -22,7 +22,7 @@ import {
 	readResearchWorkerConcurrency,
 	ResearchWorkerCoordinator,
 } from "../../server/research-worker-coordinator.js";
-import { createResearchPermitGateFromEnv } from "../../server/research-permit-client.js";
+import { createResearchPermitGateForRuntime } from "../../server/research-permit-client.js";
 import {
 	isParentMessage,
 	WORKER_PROTOCOL_VERSION,
@@ -6418,11 +6418,11 @@ export default function (pi: ExtensionAPI) {
 	const getResearchWorkerCoordinator = (): ResearchWorkerCoordinator => {
 		if (isResearchWorkerProcess) throw new Error("A research worker cannot coordinate child workers");
 		if (!researchWorkerCoordinator) {
-			// The gateway-owned global research permit gate. When the feature is
-			// enabled this coordinator acquires a permit from the private gateway
-			// management API immediately before every fork and releases it only
-			// after the child exits. When disabled, behavior is unchanged.
-			const permitGate = createResearchPermitGateFromEnv();
+			// The research-permit gate is runtime-mode aware: public workers
+			// acquire the gateway-owned global permit over the private seat
+			// network; private per-account workspace runtimes use a local
+			// in-process concurrency limit instead (never the public budget).
+			const permitGate = createResearchPermitGateForRuntime();
 			researchWorkerCoordinator = new ResearchWorkerCoordinator({
 				concurrency: readResearchWorkerConcurrency(),
 				workerFactory: createDefaultWorkerFactory(),

@@ -13,6 +13,7 @@
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import {
   validateCheckpoint,
+  isWorkspaceCheckpointEnabled,
   type FinancialTerminalCheckpoint,
 } from "../shared/financial-workspace-checkpoint.js";
 
@@ -34,6 +35,26 @@ export interface PrivateWorkspaceImportResult {
 
 function freshSessionId(): string {
   return `private-workspace-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/**
+ * Resolve the checkpoint file a private-workspace runtime should import, or
+ * undefined when the feature is disabled or no file was provisioned.
+ *
+ * Primary env: `FIN_WORKSPACE_CHECKPOINT_FILE` — the exact variable the
+ * host-side runtime provider writes when it provisions the per-account
+ * volume (`/data/checkpoint.json`). Legacy alias: `TERMINAL_WORKSPACE_IMPORT_FILE`.
+ * Both spellings require `FINANCIAL_WORKSPACE_CHECKPOINTS` to be enabled.
+ */
+export function resolveCheckpointImportFile(
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  if (!isWorkspaceCheckpointEnabled(env)) return undefined;
+  return (
+    env.FIN_WORKSPACE_CHECKPOINT_FILE?.trim()
+    || env.TERMINAL_WORKSPACE_IMPORT_FILE?.trim()
+    || undefined
+  );
 }
 
 /**

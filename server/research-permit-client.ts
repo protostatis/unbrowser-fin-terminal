@@ -16,6 +16,7 @@
 import type {
   ResearchPermitGate,
   ResearchPermitIdentity,
+  ResearchPermitAcquireOutcome,
 } from "./research-worker-coordinator.js";
 import { isRuntimeFeatureEnabled } from "./runtime-mode.js";
 
@@ -190,4 +191,90 @@ export function createResearchPermitGateFromEnv(
     release: (requestId) => client.release(requestId),
   };
   return { permitGate: gate, permitIdentity };
+}
+
+// ---------------------------------------------------------------------------
+// Local (in-process) research permit gate for private workspace runtimes
+// ---------------------------------------------------------------------------
+// A private per-account runtime must NOT reach the public gateway's shared
+// research-permit surface (it has no route to it, and its research budget is
+// the account's own). Instead it uses a documented local concurrency limit —
+// by default a single research run at a time per runtime, matching
+// MARKET_RESEARCH_CONCURRENCY=1. The gate is purely in-process: it never
+// touches the network and never shares state with other accounts.
+
+export function readLocalResearchConcurrency(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.FIN_WORKSPACE_LOCAL_RESEARCH_CONCURRENCY?.trim();
+  if (!raw) return 1;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 1 || value > 2) {
+    throw new Error("FIN_WORKSPACE_LOCAL_RESEARCH_CONCURRENCY must be an integer from 1 to 2");
+  }
+  return value;
+}
+
+export class LocalResearchPermitGate implements ResearchPermitGate {
+  private readonly maxConcurrent: number;
+  private running = 0;
+
+  constructor(maxConcurrent: number = readLocalResearchConcurrency()) {
+    this.maxConcurrent = maxConcurrent;
+  }
+
+  async acquire(identity: ResearchPermitIdentity): Promise<ResearchPermitAcquireOutcome> {
+    if (this.running < this.maxConcurrent) {
+      this.running += 1;
+      return {
+        accepted: true,
+        status: "acquired",
+        requestId: `local-${identity.workerGeneration}-${identity.sessionId}`,
+      };
+    }
+    // A single-user runtime is not a global queue: when the local limit is
+    // reached the second run settles as busy instead of parking a permit
+    // (researchQueue already serializes most of this).
+    return {
+      accepted: false,
+      status: "rejected",
+      reason: "local_research_busy",
+    };
+  }
+
+  async status(requestId: string): Promise<{ requestId: string; status: string }> {
+    return { requestId, status: "acquired" };
+  }
+
+  async heartbeat(requestId: string): Promise<void> {
+    return;
+  }
+
+  async release(requestId: string): Promise<void> {
+    if (this.running > 0) this.running -= 1;
+  }
+}
+
+/**
+ * Resolve the research-permit gate for the CURRENT runtime process.
+ *
+ * - ``TERMINAL_RUNTIME_MODE=private-workspace`` → a local in-process gate
+ *   (per-account concurrency limit, no public permit surface). Never shares
+ *   the global public research budget unless an operator explicitly sets
+ *   TERMINAL_RUNTIME_FEATURE_ENABLED + management URL, which is not the
+ *   private-workspace contract.
+ * - otherwise → the public gateway permit client (existing behavior).
+ */
+export function createResearchPermitGateForRuntime(
+  env: NodeJS.ProcessEnv = process.env,
+): { permitGate: ResearchPermitGate; permitIdentity: () => ResearchPermitIdentity } | undefined {
+  if (env.TERMINAL_RUNTIME_MODE === "private-workspace") {
+    const gate = new LocalResearchPermitGate(readLocalResearchConcurrency(env));
+    const permitIdentity = (): ResearchPermitIdentity => ({
+      sessionId: env.TERMINAL_RUNTIME_SESSION_ID?.trim()
+        || env.FIN_WORKSPACE_SESSION_ID?.trim()
+        || "private-workspace",
+      workerGeneration: env.TERMINAL_RUNTIME_WORKER_GENERATION?.trim() || "local",
+    });
+    return { permitGate: gate, permitIdentity };
+  }
+  return createResearchPermitGateFromEnv(env);
 }

@@ -1,10 +1,13 @@
 /**
  * Resolve the server runtime mode from PUBLIC_DEMO, with an explicit public
- * admission-gateway override for the isolated live-session pool.
+ * admission-gateway override for the isolated live-session pool and an
+ * explicit private-workspace mode for the per-account runtime containers
+ * provisioned by the host-side workspace runtime provider.
  *
  *   PUBLIC_DEMO=1 or true  → "replay"  (static-file-only kiosk, no agent)
  *   PUBLIC_DEMO=0 or false → "live"    (full agent session + websocket)
  *   TERMINAL_RUNTIME_MODE=public-gateway → public admission gateway only
+ *   TERMINAL_RUNTIME_MODE=private-workspace → per-account isolated runtime
  *
  * Production (NODE_ENV=production) requires PUBLIC_DEMO to be explicitly set
  * and fails closed on any unrecognised value. Dev / test environments default
@@ -14,7 +17,7 @@
  * evaluated before large side-effectful modules are loaded.
  */
 
-export type RuntimeMode = "replay" | "live" | "public-gateway";
+export type RuntimeMode = "replay" | "live" | "public-gateway" | "private-workspace";
 export type BuildMode = "replay" | "live" | "public-live";
 
 const VALID_REPLAY = new Set(["1", "true"]);
@@ -36,9 +39,9 @@ export function resolveRuntimeMode(
 ): RuntimeMode {
   const explicit = env.TERMINAL_RUNTIME_MODE?.trim();
   if (explicit) {
-    if (!["replay", "live", "public-gateway"].includes(explicit)) {
+    if (!["replay", "live", "public-gateway", "private-workspace"].includes(explicit)) {
       throw new Error(
-        `Invalid TERMINAL_RUNTIME_MODE value: "${explicit}". Must be live, replay, or public-gateway.`,
+        `Invalid TERMINAL_RUNTIME_MODE value: "${explicit}". Must be live, replay, public-gateway, or private-workspace.`,
       );
     }
     const legacy = env.PUBLIC_DEMO?.trim();
@@ -80,7 +83,10 @@ export function resolveRuntimeMode(
 const BUILD_MODE_RE = /<meta\s+name="x-build-mode"\s+content="(replay|live|public-live)"/i;
 
 function expectedBuildMode(runtimeMode: RuntimeMode): BuildMode {
-  return runtimeMode === "public-gateway" ? "public-live" : runtimeMode;
+  if (runtimeMode === "public-gateway") return "public-live";
+  // A private per-account workspace runtime runs the same full live client
+  // (built with PUBLIC_BASE_PATH=/fin-terminal/) as the signed-in singleton.
+  return runtimeMode === "private-workspace" ? "live" : runtimeMode;
 }
 
 /**

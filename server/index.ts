@@ -72,7 +72,7 @@ import {
   type ServerCheckpointEventLog,
   type CheckpointWorkerState,
 } from "./workspace-checkpoint-export.js";
-import { importCheckpointIntoFreshSession } from "./workspace-checkpoint-import.js";
+import { importCheckpointIntoFreshSession, resolveCheckpointImportFile } from "./workspace-checkpoint-import.js";
 
 // ==========================================================================
 // Runtime mode — must be resolved before any live-only side effects
@@ -81,6 +81,10 @@ import { importCheckpointIntoFreshSession } from "./workspace-checkpoint-import.
 const RUNTIME_MODE = resolveRuntimeMode();
 const isReplay = RUNTIME_MODE === "replay";
 const isPublicGateway = RUNTIME_MODE === "public-gateway";
+// Per-account private workspace runtime provisioned by the host-side workspace
+// runtime provider (FIN_WORKSPACE_* env). Same full live client + agent session
+// as the signed-in singleton, but owned by one account and never a public seat.
+const isPrivateWorkspace = RUNTIME_MODE === "private-workspace";
 
 // ==========================================================================
 // Common configuration
@@ -100,6 +104,37 @@ const PROXY_TOKEN_HEADER = "x-fin-terminal-proxy-token";
 // Replay mode may serve without a token if the deployer chooses.
 if (process.env.NODE_ENV === "production" && RUNTIME_MODE === "live" && !PROXY_TOKEN) {
   throw new Error("MARKET_PROXY_TOKEN is required in production");
+}
+
+// Private-workspace runtimes are provisioned exclusively by the host-side
+// workspace runtime provider. Fail closed at boot when the provider did not
+// hand the account-scoped contract to this container: the checkpoint flag,
+// the shared control token, the account session id, and the proxy token are
+// all required before the agent session (and its export surface) can start.
+if (isPrivateWorkspace && process.env.NODE_ENV === "production") {
+  const controlToken = (process.env.FIN_WORKSPACE_CONTROL_TOKEN ?? "").trim();
+  const sessionId = (process.env.FIN_WORKSPACE_SESSION_ID ?? "").trim();
+  const workerGeneration = (process.env.TERMINAL_RUNTIME_WORKER_GENERATION ?? "").trim();
+  if (!PROXY_TOKEN) {
+    throw new Error("MARKET_PROXY_TOKEN is required for a private workspace runtime");
+  }
+  if (!isWorkspaceCheckpointEnabled()) {
+    throw new Error(
+      "FINANCIAL_WORKSPACE_CHECKPOINTS must be enabled for a private workspace runtime",
+    );
+  }
+  if (controlToken.length < 32) {
+    throw new Error("FIN_WORKSPACE_CONTROL_TOKEN (>= 32 chars) is required for a private workspace runtime");
+  }
+  if (!sessionId) {
+    throw new Error("FIN_WORKSPACE_SESSION_ID is required for a private workspace runtime");
+  }
+  if (!workerGeneration) {
+    throw new Error("TERMINAL_RUNTIME_WORKER_GENERATION is required for a private workspace runtime");
+  }
+  if (process.env.PUBLIC_SESSION_WORKER === "1") {
+    throw new Error("PUBLIC_SESSION_WORKER must not be enabled in a private workspace runtime");
+  }
 }
 
 // Build and runtime mode must be paired before either server listens. This
@@ -245,6 +280,20 @@ else {
   // client and the checkpoint exporter via process env.
   if (publicWorkerInstanceId) {
     process.env.TERMINAL_RUNTIME_WORKER_GENERATION = publicWorkerInstanceId;
+  }
+
+  // A private-workspace runtime is dedicated to ONE account for its whole
+  // lifetime. The provider provisions FIN_WORKSPACE_SESSION_ID (the account
+  // slug) at container start; bind it up front so the checkpoint exporter can
+  // serve the provider's flush call before any browser ever connects (and
+  // after every browser disconnects).
+  if (isPrivateWorkspace) {
+    const accountSession = process.env.FIN_WORKSPACE_SESSION_ID?.trim();
+    if (accountSession) {
+      process.env.TERMINAL_RUNTIME_SESSION_ID = accountSession;
+      bindCheckpointSession(accountSession);
+      console.log(`[workspace] private runtime bound to account session ${accountSession}`);
+    }
   }
 
   function parseAllowedOrigins(raw: string | undefined): Set<string> | null {
@@ -508,19 +557,22 @@ else {
   let sessionBootState: "starting" | "ready" | "failed" = "starting";
   const principalLease = new PrincipalLease();
 
-  // Fresh private-workspace import: when TERMINAL_WORKSPACE_IMPORT_FILE points
-  // at a validated checkpoint, boot an in-memory session seeded from it
-  // (custom state entry + bounded continuation seed) instead of an empty one.
+  // Fresh private-workspace import: when a validated checkpoint file is
+  // provisioned (FIN_WORKSPACE_CHECKPOINT_FILE — the exact env the host-side
+  // runtime provider writes; TERMINAL_WORKSPACE_IMPORT_FILE remains a legacy
+  // alias), boot an in-memory session seeded from it (custom state entry +
+  // bounded continuation seed) instead of an empty one. Both spellings
+  // require the FINANCIAL_WORKSPACE_CHECKPOINTS feature flag.
   let workspaceImportSessionManager: ReturnType<typeof SessionManager.inMemory> | undefined;
-  if (isWorkspaceCheckpointEnabled() && process.env.TERMINAL_WORKSPACE_IMPORT_FILE?.trim()) {
+  const checkpointImportFile = resolveCheckpointImportFile();
+  if (checkpointImportFile) {
     try {
-      const importFile = process.env.TERMINAL_WORKSPACE_IMPORT_FILE.trim();
-      const raw = JSON.parse(readFileSync(importFile, "utf8"));
+      const raw = JSON.parse(readFileSync(checkpointImportFile, "utf8"));
       workspaceImportSessionManager = importCheckpointIntoFreshSession({
         checkpoint: raw,
         cwd: CWD,
       }).sessionManager;
-      console.log(`[workspace-import] booting fresh workspace from ${importFile}`);
+      console.log(`[workspace-import] booting fresh workspace from ${checkpointImportFile}`);
     } catch (error) {
       if (process.env.NODE_ENV === "production") {
         throw new Error(
@@ -543,6 +595,14 @@ else {
     if (publicSessionWorker.enabled && (!config.provider || !config.modelId)) {
       throw new Error(
         "PUBLIC_SESSION_WORKER requires an explicit MARKET_MODEL_PROVIDER/MARKET_MODEL_ID or OpenRouter model configuration",
+      );
+    }
+    if (isPrivateWorkspace && (!config.provider || !config.modelId)) {
+      // A per-account runtime exists to run research against a real model; an
+      // unconfigured provider would boot a terminal whose research always
+      // fails. Fail closed at boot instead of shipping a dead workspace.
+      throw new Error(
+        "A private workspace runtime requires an explicit MARKET_MODEL_PROVIDER/MARKET_MODEL_ID or OpenRouter model configuration",
       );
     }
     const loader = new DefaultResourceLoader({ cwd: CWD, agentDir });
@@ -592,6 +652,9 @@ else {
     res.status(ready ? 200 : 503).json({
       status: ready ? "ready" : sessionBootState,
       ...(publicWorkerInstanceId ? { publicWorker: true, instanceId: publicWorkerInstanceId } : {}),
+      ...(isPrivateWorkspace
+        ? { privateWorkspace: true, sessionId: process.env.TERMINAL_RUNTIME_SESSION_ID ?? "" }
+        : {}),
     });
   });
 
@@ -603,10 +666,15 @@ else {
   if (isWorkspaceCheckpointEnabled()) {
     mountWorkspaceCheckpointExport(app, {
       getExportContext: () => {
-        if (!publicWorkerInstanceId) return undefined;
+        // A private-workspace runtime is dedicated to ONE account: its
+        // session/generation are provisioned at container start
+        // (FIN_WORKSPACE_SESSION_ID + TERMINAL_RUNTIME_WORKER_GENERATION) and
+        // stay bound for the container's whole lifetime, so the provider's
+        // flush can export current state before/after any browser connects.
         const sessionId = process.env.TERMINAL_RUNTIME_SESSION_ID;
         const generation = process.env.TERMINAL_RUNTIME_WORKER_GENERATION;
         if (!sessionId || !generation) return undefined;
+        if (!publicWorkerInstanceId && !isPrivateWorkspace) return undefined;
         const rawState =
           typeof activePanel?.debugState === "function" ? activePanel.debugState() : undefined;
         return {
@@ -696,18 +764,35 @@ else {
     // client-supplied header (Caddy strips it from the request first).
     const clientIp = (request.headers["x-real-ip"] as string | undefined)?.trim() || socketIp;
 
-    // Bind the current public session identity for permit gating + checkpoint
+    // Bind the current session identity for permit gating + checkpoint
     // export authorization. A worker serves one tenant at a time. A different
     // principal/session resets the authoritative checkpoint event log so no
     // cross-session data bleeds into a fresh export.
+    //   public:<session>  — anonymous public-seat sessions (gateway-assigned)
+    //   account:<slug>    — private per-account workspace runtimes (the
+    //                       control plane binds this server-side from the
+    //                       authenticated user; the runtime is dedicated to
+    //                       that account for its whole lifetime)
     const connectedPrincipal = requestPrincipal(request);
-    if (connectedPrincipal && connectedPrincipal.startsWith("public:")) {
+    if (connectedPrincipal?.startsWith("public:")) {
       process.env.TERMINAL_RUNTIME_SESSION_ID = connectedPrincipal.slice("public:".length);
       bindCheckpointSession(process.env.TERMINAL_RUNTIME_SESSION_ID);
-    } else {
+    } else if (connectedPrincipal?.startsWith("account:")) {
+      const accountSession = connectedPrincipal.slice("account:".length);
+      if (!accountSession) {
+        ws.close(1008, "Invalid account principal");
+        return;
+      }
+      process.env.TERMINAL_RUNTIME_SESSION_ID = accountSession;
+      bindCheckpointSession(accountSession);
+    } else if (!isPrivateWorkspace) {
       delete process.env.TERMINAL_RUNTIME_SESSION_ID;
       bindCheckpointSession(undefined);
     }
+    // In private-workspace mode the account session id is stable for the
+    // container's whole lifetime (it was set at boot from
+    // FIN_WORKSPACE_SESSION_ID), so a later browser disconnect never clears
+    // the identity the checkpoint exporter needs.
 
     console.log("[ws] client connected");
     publicWorkerLifecycle?.connectedClient();
@@ -817,7 +902,12 @@ else {
 
     ws.on("close", () => {
       console.log("[ws] client disconnected");
-      delete process.env.TERMINAL_RUNTIME_SESSION_ID;
+      // A private-workspace runtime is dedicated to its account; the account
+      // session id stays bound so the checkpoint exporter keeps working after
+      // the browser disconnects (flush happens on sleep, not on disconnect).
+      if (!isPrivateWorkspace) {
+        delete process.env.TERMINAL_RUNTIME_SESSION_ID;
+      }
       if (activeClient !== ws) return;
       activeClient = null;
       sendToClient = () => {};
