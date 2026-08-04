@@ -16,6 +16,9 @@ import {
   isWorkspaceCheckpointEnabled,
   workspaceServiceUrl,
   workspaceControlToken,
+  parseCheckpointCreateResponse,
+  handoffCookieDomain,
+  HANDOFF_SECRET_COOKIE_NAME,
   type FinancialTerminalCheckpoint,
 } from "../shared/financial-workspace-checkpoint.js";
 
@@ -701,6 +704,82 @@ test("isWorkspaceCheckpointEnabled returns false by default", () => {
 
 test("isWorkspaceCheckpointEnabled returns true when flag is set", () => {
   assert.equal(isWorkspaceCheckpointEnabled({ FINANCIAL_WORKSPACE_CHECKPOINTS: "1" }), true);
+  // Compose interpolation may pass boolean spellings of the master flag.
+  assert.equal(isWorkspaceCheckpointEnabled({ FINANCIAL_WORKSPACE_CHECKPOINTS: "true" }), true);
+  assert.equal(isWorkspaceCheckpointEnabled({ FINANCIAL_WORKSPACE_CHECKPOINTS: "YES" }), true);
+  assert.equal(isWorkspaceCheckpointEnabled({ FINANCIAL_WORKSPACE_CHECKPOINTS: "0" }), false);
+  assert.equal(isWorkspaceCheckpointEnabled({ FINANCIAL_WORKSPACE_CHECKPOINTS: "false" }), false);
+});
+
+// ──── S2S Create-Response Wire Parser ─────────────────────────────────────────
+
+const WIRE_FIXTURE = {
+  checkpoint_id: "fcp-abc123",
+  expires_at: 1_700_003_600, // epoch SECONDS
+  handoff_id: "fh-xyz789",
+  handoff_secret: "s2s-only-secret",
+  auth_url: "https://unbrowser.unchainedsky.com/fin-terminal-workspace/auth/claim?handoff_id=fh-xyz789",
+  already_exists: false,
+  status: "ready",
+};
+
+test("parseCheckpointCreateResponse accepts the canonical snake_case wire", () => {
+  const parsed = parseCheckpointCreateResponse(WIRE_FIXTURE);
+  assert.equal(parsed.ok, true);
+  if (!parsed.ok) return;
+  assert.equal(parsed.value.checkpointId, "fcp-abc123");
+  assert.equal(parsed.value.handoffId, "fh-xyz789");
+  assert.equal(parsed.value.handoffSecret, "s2s-only-secret");
+  assert.equal(parsed.value.authUrl, WIRE_FIXTURE.auth_url);
+  // expires_at (seconds) is normalized to epoch ms.
+  assert.equal(parsed.value.expiresAt, 1_700_003_600_000);
+});
+
+test("parseCheckpointCreateResponse tolerates camelCase during rollout and normalizes identically", () => {
+  const parsed = parseCheckpointCreateResponse({
+    checkpointId: "fcp-abc123",
+    expiresAt: 1_700_003_600,
+    handoffId: "fh-xyz789",
+    handoffSecret: "s2s-only-secret",
+    authUrl: WIRE_FIXTURE.auth_url,
+  });
+  assert.equal(parsed.ok, true);
+  if (!parsed.ok) return;
+  assert.equal(parsed.value.expiresAt, 1_700_003_600_000);
+  assert.equal(parsed.value.handoffSecret, "s2s-only-secret");
+});
+
+test("parseCheckpointCreateResponse rejects a millisecond expires_at", () => {
+  const parsed = parseCheckpointCreateResponse({ ...WIRE_FIXTURE, expires_at: 1_700_003_600_000 });
+  assert.equal(parsed.ok, false);
+  if (!parsed.ok) assert.ok(parsed.reason.includes("seconds"));
+});
+
+test("parseCheckpointCreateResponse rejects missing/empty fields", () => {
+  for (const key of ["checkpoint_id", "handoff_id", "handoff_secret", "auth_url"]) {
+    const parsed = parseCheckpointCreateResponse({ ...WIRE_FIXTURE, [key]: "" });
+    assert.equal(parsed.ok, false, `missing ${key} must be rejected`);
+  }
+  const badExpiry = parseCheckpointCreateResponse({ ...WIRE_FIXTURE, expires_at: -1 });
+  assert.equal(badExpiry.ok, false);
+  assert.equal(parseCheckpointCreateResponse(null).ok, false);
+  assert.equal(parseCheckpointCreateResponse("nope").ok, false);
+});
+
+test("handoff cookie name is the exact shared constant", () => {
+  assert.equal(HANDOFF_SECRET_COOKIE_NAME, "fin-terminal-handoff-secret");
+});
+
+test("handoffCookieDomain is host-only by default and normalized with a leading dot", () => {
+  assert.equal(handoffCookieDomain({}), undefined);
+  assert.equal(
+    handoffCookieDomain({ FINANCIAL_WORKSPACE_HANDOFF_COOKIE_DOMAIN: ".unchainedsky.com" }),
+    ".unchainedsky.com",
+  );
+  assert.equal(
+    handoffCookieDomain({ FINANCIAL_WORKSPACE_HANDOFF_COOKIE_DOMAIN: "unchainedsky.com" }),
+    ".unchainedsky.com",
+  );
 });
 
 test("workspaceServiceUrl returns undefined when not set", () => {

@@ -38,6 +38,10 @@ const CONTROL_TOKEN = "test-control-token-0123456789012345678901";
 const WORKER_PROXY_TOKEN = "test-worker-proxy-token-01234567890123456";
 const GENERATION = "gen-opaque-001";
 
+// A real future moment (ms) used by the fake workspace service so cookie
+// Max-Age assertions reflect actual conversion math.
+const FIXTURE_EXPIRES_AT_MS = Date.now() + 3_600_000;
+
 function controlEnv(overrides: Record<string, string> = {}): NodeJS.ProcessEnv {
   return {
     FINANCIAL_WORKSPACE_CHECKPOINTS: "1",
@@ -95,8 +99,8 @@ async function startWorkerServer() {
   return listen(app);
 }
 
-/** A fake workspace control service. */
-async function startWorkspaceService() {
+/** A fake workspace control service speaking the canonical snake_case wire. */
+async function startWorkspaceService(overrides: Record<string, unknown> = {}) {
   const app = express();
   app.use(express.json());
   app.post(CHECKPOINT_CREATE_PATH, (request, response) => {
@@ -108,11 +112,16 @@ async function startWorkspaceService() {
     assert.equal(source?.sessionId, "public-session-123");
     assert.equal(source?.generation, workerGenerationEpoch(GENERATION));
     response.status(201).json({
-      checkpointId: "checkpoint-1",
-      expiresAt: 1_700_000_000_000 + 3_600_000,
-      handoffId: "handoff-1",
-      handoffSecret: "super-secret-handoff-0000000000000000",
-      authUrl: "https://workspace.internal/auth/handoff-1",
+      checkpoint_id: "checkpoint-1",
+      // Canonical wire: `expires_at` is Unix epoch SECONDS. `FIXTURE_EXPIRES_AT_MS`
+      // is a real future moment so cookie Max-Age assertions are meaningful.
+      expires_at: Math.floor(FIXTURE_EXPIRES_AT_MS / 1000),
+      handoff_id: "handoff-1",
+      handoff_secret: "super-secret-handoff-0000000000000000",
+      auth_url: "https://workspace.internal/auth/handoff-1",
+      already_exists: false,
+      status: "ready",
+      ...overrides,
     });
   });
   return listen(app);
@@ -210,14 +219,96 @@ test("handoff calls worker export + workspace control, sets HttpOnly cookie, nev
     assert.equal(body.checkpointId, "checkpoint-1");
     assert.equal(body.handoffId, "handoff-1");
     assert.equal(body.authUrl, "https://workspace.internal/auth/handoff-1");
+    // The browser response uses epoch ms, normalized from the wire seconds
+    // (floored to the second precision carried on the wire).
+    assert.equal(body.expiresAt, Math.floor(FIXTURE_EXPIRES_AT_MS / 1000) * 1000);
     // The handoff secret must never reach JS.
     assert.ok(!("handoffSecret" in body));
+    assert.ok(!("handoff_secret" in body));
 
     // The secret travels only in an HttpOnly cookie.
     const setCookie = response.headers.get("set-cookie") ?? "";
     assert.ok(setCookie.includes(`${HANDOFF_COOKIE_NAME}=super-secret-handoff-0000000000000000`));
     assert.ok(/HttpOnly/i.test(setCookie));
     assert.ok(/Secure/i.test(setCookie));
+    assert.ok(/SameSite=Lax/i.test(setCookie));
+    // Host-only: no Domain attribute by default (gateway and control plane
+    // share the public terminal host).
+    assert.ok(!/Domain=/i.test(setCookie));
+    // Express maxAge is ms; the wire expires_at was epoch seconds and must be
+    // converted, not divided. The fixture expires 3600s after now, so the
+    // cookie must live ~3600s (not ~3.6s, not 0).
+    const maxAgeMatch = /Max-Age=(\d+)/i.exec(setCookie);
+    assert.ok(maxAgeMatch, `cookie must carry Max-Age: ${setCookie}`);
+    const maxAgeSeconds = Number(maxAgeMatch![1]);
+    assert.ok(maxAgeSeconds > 3_000 && maxAgeSeconds <= 3_600 + 60, `Max-Age=${maxAgeSeconds}s`);
+  } finally {
+    await closeServer(worker.server);
+    await closeServer(service.server);
+    await closeServer(gateway.server);
+  }
+});
+
+test("handoff accepts the camelCase wire spelling during rollout (normalized identically)", async () => {
+  const worker = await startWorkerServer();
+  const service = await startWorkspaceService({
+    checkpoint_id: undefined,
+    expires_at: undefined,
+    handoff_id: undefined,
+    handoff_secret: undefined,
+    auth_url: undefined,
+    checkpointId: "checkpoint-2",
+    expiresAt: Math.floor(FIXTURE_EXPIRES_AT_MS / 1000),
+    handoffId: "handoff-2",
+    handoffSecret: "camel-secret-0000000000000000000000",
+    authUrl: "https://workspace.internal/auth/handoff-2",
+  });
+  const gateway = await startHandoffGateway(`http://${HOST}:${worker.port}`, `http://${HOST}:${service.port}`);
+  try {
+    const response = await fetch(`http://${HOST}:${gateway.port}/api/public/workspace-handoff`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-public-visitor-token": "visitor-1",
+        "x-public-ticket-token": "public-session-123",
+      },
+      body: "{}",
+    });
+    assert.equal(response.status, 201);
+    const body = (await response.json()) as Record<string, unknown>;
+    assert.equal(body.checkpointId, "checkpoint-2");
+    // The parser floors seconds→ms, so the exact expectation is the second
+    // precision that was on the wire.
+    assert.equal(body.expiresAt, Math.floor(FIXTURE_EXPIRES_AT_MS / 1000) * 1000);
+    assert.ok(!("handoffSecret" in body));
+  } finally {
+    await closeServer(worker.server);
+    await closeServer(service.server);
+    await closeServer(gateway.server);
+  }
+});
+
+test("handoff rejects a millisecond expires_at (units are epoch seconds on the wire)", async () => {
+  const worker = await startWorkerServer();
+  // A naive client that forwards its own ms epoch is rejected, not silently
+  // converted into a ~1000x-longer cookie.
+  const service = await startWorkspaceService({
+    expires_at: 1_700_000_000_000 + 3_600_000,
+  });
+  const gateway = await startHandoffGateway(`http://${HOST}:${worker.port}`, `http://${HOST}:${service.port}`);
+  try {
+    const response = await fetch(`http://${HOST}:${gateway.port}/api/public/workspace-handoff`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-public-visitor-token": "visitor-1",
+        "x-public-ticket-token": "public-session-123",
+      },
+      body: "{}",
+    });
+    assert.equal(response.status, 502);
+    const body = (await response.json()) as Record<string, unknown>;
+    assert.equal(body.error, "workspace_service_invalid_response");
   } finally {
     await closeServer(worker.server);
     await closeServer(service.server);

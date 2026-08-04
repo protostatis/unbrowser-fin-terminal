@@ -3,15 +3,32 @@
  * global research-permit surface.
  *
  * Listens on a separate port (default 8789, configurable via
- * `TERMINAL_RUNTIME_MANAGEMENT_PORT`) and is reached only over the private
- * network. Access is gated by a dedicated token (`X-Management-Token`).
- * The API does NOT expose Docker, secrets, or browser identity material.
+ * `TERMINAL_RUNTIME_MANAGEMENT_PORT`) and is reached only over private
+ * connectivity: the host reconciler calls it via `docker exec` on loopback,
+ * and worker permit clients reach it over internal Compose networks. Caddy
+ * never proxies this port. Access is gated by a dedicated token
+ * (`X-Management-Token`). The API does NOT expose Docker, secrets, or browser
+ * identity material.
  *
- * Infra reconciler contract (exact paths, POST only):
- *   POST /api/management/reconcile-snapshot — per-seat statuses + plan
+ * Infra reconciler contract v1 (exact paths, POST only, JSON):
+ *   POST /api/management/reconcile-snapshot — versioned seat map + totals + plan
  *   POST /api/management/reconcile-plan     — desired warm-pool plan only
- *   POST /api/management/drain              — { workerId, drainId }
+ *   POST /api/management/drain              — { workerId, drainId, expectedGeneration }
  *   POST /api/management/activate           — { workerId }
+ *
+ * v1 response shapes:
+ *   reconcile-snapshot → {
+ *     version: 1,
+ *     seats: { "<workerId>": {
+ *       workerId, status: absent|starting|healthy|draining|stopped,
+ *       phase, generation|null, assigned, idleSeconds,
+ *       drainRequested, drainId|null, containerId: ""
+ *     } },
+ *     totalAssigned, totalQueued,
+ *     plan: { desiredRunning, scaleDownCandidates[], activateCandidates[] }
+ *   }
+ *   drain → 200 { accepted: true, drainId } | 409 { accepted: false, reason }
+ *   activate → 200 { accepted: true } | 409 { accepted: false, reason }
  *
  * Worker permit surface (worker→gateway private client):
  *   POST /api/management/research-permits/acquire   — { sessionId, workerGeneration }
@@ -33,7 +50,7 @@
 
 import { createServer, type IncomingMessage, type Server as HttpServer } from "node:http";
 import type { Socket } from "node:net";
-import type { CapacityWarmPool, SeatStatus } from "./capacity-warm-pool.js";
+import type { CapacityWarmPool, SeatStatus, SeatPhase } from "./capacity-warm-pool.js";
 import type { ResearchPermitCoordinator } from "./research-permit-coordinator.js";
 
 export interface ManagementApiConfig {
@@ -128,10 +145,65 @@ interface ManagementApiDependencies {
   getSeatStatuses: () => SeatStatus[];
   getWarmPool: () => CapacityWarmPool;
   getResearchCoordinator: () => ResearchPermitCoordinator;
+  /** Number of currently queued public visitors (gateway admission queue). */
+  getQueueCount: () => number;
   /** Extend the owning public session's idle lease (used by permit heartbeat). */
   touchSession?: (sessionId: string) => void;
   mutate: <T>(operation: () => T | Promise<T>) => Promise<T>;
   inspect: <T>(operation: () => T) => Promise<T>;
+}
+
+// ── Reconciler contract v1: seat status normalization ───────────────────────
+
+export type ReconcilerSeatStatus = "absent" | "starting" | "healthy" | "draining" | "stopped";
+
+/**
+ * Map a gateway seat phase to the host reconciler's lifecycle status.
+ * The reconciler only stops seats reported as `healthy` (and never stops
+ * assigned ones); `recycling` means the process was terminated and a
+ * replacement is pending, which the reconciler treats as stopped.
+ */
+const RECONCILER_STATUS: Record<SeatPhase, ReconcilerSeatStatus> = {
+  absent: "absent",
+  starting: "starting",
+  "ready-idle": "healthy",
+  assigned: "healthy",
+  admitted: "healthy",
+  active: "healthy",
+  disconnected: "healthy",
+  draining: "draining",
+  recycling: "stopped",
+};
+
+/** Phases that count as an assigned seat (never a scale-down candidate). */
+const ASSIGNED_PHASES = new Set<SeatPhase>(["assigned", "admitted", "active", "disconnected"]);
+
+export function seatContractStatus(phase: SeatPhase): ReconcilerSeatStatus {
+  return RECONCILER_STATUS[phase];
+}
+
+export function seatContractAssigned(phase: SeatPhase): boolean {
+  return ASSIGNED_PHASES.has(phase);
+}
+
+/**
+ * One seat record in the reconciler v1 snapshot. Always includes the exact
+ * six named worker ids (absent seats included), normalized from the app's
+ * phase model.
+ */
+export function seatContractRecord(seat: SeatStatus): Record<string, unknown> {
+  return {
+    workerId: seat.workerId,
+    status: RECONCILER_STATUS[seat.phase],
+    phase: seat.phase,
+    generation: seat.generation ?? null,
+    assigned: ASSIGNED_PHASES.has(seat.phase),
+    idleSeconds: seat.idleSinceMs !== undefined ? Math.round(seat.idleSinceMs / 1000) : 0,
+    drainRequested: seat.drainRequested,
+    drainId: seat.drainId ?? null,
+    // Docker authority stays host-side; the gateway never reports a container id.
+    containerId: "",
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -194,35 +266,42 @@ export function startManagementApi(
 
     // ── Shared plan computation ──────────────────────────────────────────
     const snapshotFor = (): {
-      seats: SeatStatus[];
+      seats: Record<string, Record<string, unknown>>;
+      totalAssigned: number;
+      totalQueued: number;
       plan: ReturnType<CapacityWarmPool["plan"]>;
     } => {
       const seats = deps.getSeatStatuses();
       const plan = deps.getWarmPool().plan(seats);
-      return { seats, plan };
+      const seatMap: Record<string, Record<string, unknown>> = {};
+      for (const seat of seats) {
+        seatMap[seat.workerId] = seatContractRecord(seat);
+      }
+      return {
+        seats: seatMap,
+        totalAssigned: seats.filter((s) => ASSIGNED_PHASES.has(s.phase)).length,
+        totalQueued: deps.getQueueCount(),
+        plan,
+      };
     };
-    const seatList = (seats: SeatStatus[]) => seats.map((s) => ({
-      workerId: s.workerId,
-      phase: s.phase,
-      generation: s.generation ?? null,
-      sessionId: s.sessionId ?? null,
-      idleSinceMs: s.idleSinceMs ?? null,
-      drainRequested: s.drainRequested,
-      drainId: s.drainId ?? null,
-    }));
+    const planJson = (plan: ReturnType<CapacityWarmPool["plan"]>) => ({
+      desiredRunning: plan.desiredRunning,
+      scaleDownCandidates: plan.scaleDownCandidates,
+      activateCandidates: plan.activateCandidates,
+    });
+    const snapshotJson = (snapshot: ReturnType<typeof snapshotFor>) => ({
+      version: 1,
+      seats: snapshot.seats,
+      totalAssigned: snapshot.totalAssigned,
+      totalQueued: snapshot.totalQueued,
+      plan: planJson(snapshot.plan),
+    });
 
     // ── POST /api/management/reconcile-snapshot ──────────────────────────
     if (method === "POST" && path === "/api/management/reconcile-snapshot") {
       try {
         const snapshot = await deps.inspect(snapshotFor);
-        jsonResponse(socket, 200, {
-          seats: seatList(snapshot.seats),
-          plan: {
-            desiredRunning: snapshot.plan.desiredRunning,
-            scaleDownCandidates: snapshot.plan.scaleDownCandidates,
-            activateCandidates: snapshot.plan.activateCandidates,
-          },
-        });
+        jsonResponse(socket, 200, snapshotJson(snapshot));
       } catch {
         jsonResponse(socket, 500, { error: "internal error" });
       }
@@ -234,12 +313,9 @@ export function startManagementApi(
       try {
         const plan = await deps.inspect(() => snapshotFor().plan);
         jsonResponse(socket, 200, {
+          version: 1,
           reconciled: true,
-          plan: {
-            desiredRunning: plan.desiredRunning,
-            scaleDownCandidates: plan.scaleDownCandidates,
-            activateCandidates: plan.activateCandidates,
-          },
+          plan: planJson(plan),
         });
       } catch {
         jsonResponse(socket, 500, { error: "internal error" });
@@ -253,6 +329,7 @@ export function startManagementApi(
       if (!body) return;
       const workerId = body.workerId;
       const drainId = body.drainId;
+      const expectedGeneration = body.expectedGeneration;
       if (typeof workerId !== "string" || !SEAT_ID_PATTERN.test(workerId)) {
         textResponse(socket, 400, "Bad Request: workerId required (URL-safe, 1-64 chars)");
         return;
@@ -261,10 +338,23 @@ export function startManagementApi(
         textResponse(socket, 400, "Bad Request: drainId required (string, 1-128 chars)");
         return;
       }
+      if (
+        expectedGeneration !== undefined
+        && expectedGeneration !== null
+        && (typeof expectedGeneration !== "string" || expectedGeneration.length === 0 || expectedGeneration.length > 160)
+      ) {
+        textResponse(socket, 400, "Bad Request: expectedGeneration must be a string (1-160 chars)");
+        return;
+      }
       try {
         const result = await deps.mutate(() => {
           const seat = deps.getSeatStatuses().find((s) => s.workerId === workerId);
-          if (!seat) return { accepted: false, reason: "unknown seat" };
+          if (!seat) return { accepted: false as const, reason: "unknown seat" };
+          // Generation CAS: the reconciler may only drain the exact process
+          // generation it observed. A replaced worker invalidates the drain.
+          if (expectedGeneration && seat.generation !== expectedGeneration) {
+            return { accepted: false as const, reason: "generation mismatch" };
+          }
           return deps.getWarmPool().requestDrain(seat, drainId);
         });
         if (result.accepted) {
@@ -290,15 +380,28 @@ export function startManagementApi(
       try {
         const result = await deps.mutate(() => {
           const seat = deps.getSeatStatuses().find((s) => s.workerId === workerId);
-          if (!seat) return { released: false, reason: "unknown seat" };
-          return deps.getWarmPool().releaseDrain(workerId, seat.generation);
+          if (!seat) return { accepted: false as const, reason: "unknown seat" };
+          const drain = deps.getWarmPool().getDrain(workerId);
+          if (!drain) {
+            // Nothing to release — an explicit activate is a safe no-op.
+            return { accepted: true as const };
+          }
+          // Drain is sticky: only an explicit activation with a changed
+          // process generation (the reconciler restarted the container)
+          // releases it. A same-generation activate is rejected.
+          if (seat.generation && seat.generation === drain.generation) {
+            return { accepted: false as const, reason: "drain sticky; generation unchanged" };
+          }
+          const released = deps.getWarmPool().releaseDrain(workerId, seat.generation);
+          if (!released.released) {
+            deps.getWarmPool().forceReleaseDrain(workerId);
+          }
+          return { accepted: true as const };
         });
-        if (result.released) {
-          jsonResponse(socket, 200, { activated: true });
+        if (result.accepted) {
+          jsonResponse(socket, 200, { accepted: true });
         } else {
-          // Try force release if sticky.
-          deps.getWarmPool().forceReleaseDrain(workerId);
-          jsonResponse(socket, 200, { activated: true, note: "force-released" });
+          jsonResponse(socket, 409, { accepted: false, reason: (result as { reason: string }).reason });
         }
       } catch {
         jsonResponse(socket, 500, { error: "internal error" });
@@ -420,14 +523,7 @@ export function startManagementApi(
     if (method === "GET" && path === "/api/management/seats") {
       try {
         const snapshot = await deps.inspect(snapshotFor);
-        jsonResponse(socket, 200, {
-          seats: seatList(snapshot.seats),
-          plan: {
-            desiredRunning: snapshot.plan.desiredRunning,
-            scaleDownCandidates: snapshot.plan.scaleDownCandidates,
-            activateCandidates: snapshot.plan.activateCandidates,
-          },
-        });
+        jsonResponse(socket, 200, snapshotJson(snapshot));
       } catch {
         jsonResponse(socket, 500, { error: "internal error" });
       }
@@ -445,14 +541,26 @@ export function startManagementApi(
       const body = await requireBodyObject(socket, request);
       if (!body) return;
       const drainId = body.drainId;
+      const expectedGeneration = body.expectedGeneration;
       if (typeof drainId !== "string" || drainId.length === 0 || drainId.length > 128) {
         textResponse(socket, 400, "Bad Request: drainId required (string, 1-128 chars)");
+        return;
+      }
+      if (
+        expectedGeneration !== undefined
+        && expectedGeneration !== null
+        && (typeof expectedGeneration !== "string" || expectedGeneration.length === 0 || expectedGeneration.length > 160)
+      ) {
+        textResponse(socket, 400, "Bad Request: expectedGeneration must be a string (1-160 chars)");
         return;
       }
       try {
         const result = await deps.mutate(() => {
           const seat = deps.getSeatStatuses().find((s) => s.workerId === workerId);
-          if (!seat) return { accepted: false, reason: "unknown seat" };
+          if (!seat) return { accepted: false as const, reason: "unknown seat" };
+          if (expectedGeneration && seat.generation !== expectedGeneration) {
+            return { accepted: false as const, reason: "generation mismatch" };
+          }
           return deps.getWarmPool().requestDrain(seat, drainId);
         });
         if (result.accepted) {
@@ -477,14 +585,20 @@ export function startManagementApi(
       try {
         const result = await deps.mutate(() => {
           const seat = deps.getSeatStatuses().find((s) => s.workerId === workerId);
-          if (!seat) return { released: false, reason: "unknown seat" };
-          return deps.getWarmPool().releaseDrain(workerId, seat.generation);
+          if (!seat) return { accepted: false as const, reason: "unknown seat" };
+          const drain = deps.getWarmPool().getDrain(workerId);
+          if (!drain) return { accepted: true as const };
+          if (seat.generation && seat.generation === drain.generation) {
+            return { accepted: false as const, reason: "drain sticky; generation unchanged" };
+          }
+          const released = deps.getWarmPool().releaseDrain(workerId, seat.generation);
+          if (!released.released) deps.getWarmPool().forceReleaseDrain(workerId);
+          return { accepted: true as const };
         });
-        if (result.released) {
-          jsonResponse(socket, 200, { activated: true });
+        if (result.accepted) {
+          jsonResponse(socket, 200, { accepted: true });
         } else {
-          deps.getWarmPool().forceReleaseDrain(workerId);
-          jsonResponse(socket, 200, { activated: true, note: "force-released" });
+          jsonResponse(socket, 409, { accepted: false, reason: (result as { reason: string }).reason });
         }
       } catch {
         jsonResponse(socket, 500, { error: "internal error" });
@@ -497,12 +611,9 @@ export function startManagementApi(
       try {
         const plan = await deps.inspect(() => snapshotFor().plan);
         jsonResponse(socket, 200, {
+          version: 1,
           reconciled: true,
-          plan: {
-            desiredRunning: plan.desiredRunning,
-            scaleDownCandidates: plan.scaleDownCandidates,
-            activateCandidates: plan.activateCandidates,
-          },
+          plan: planJson(plan),
         });
       } catch {
         jsonResponse(socket, 500, { error: "internal error" });

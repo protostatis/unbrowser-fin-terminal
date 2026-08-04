@@ -140,12 +140,88 @@ export interface CheckpointCreateRequest {
   checkpoint: FinancialTerminalCheckpoint;
 }
 
+/**
+ * Internal (normalized) checkpoint-create response used by the gateway.
+ *
+ * The WIRE format (canonical, see `parseCheckpointCreateResponse`) is
+ * snake_case and carries `expires_at` as Unix epoch SECONDS. This internal
+ * type is camelCase with `expiresAt` as epoch MILLISECONDS, matching every
+ * other timestamp in this module (checkpoint `createdAt`/`expiresAt`,
+ * `CheckpointEvent.at`).
+ *
+ * Wire → internal:
+ *   checkpoint_id / checkpointId
+ *   expires_at (seconds) → expiresAt (expires_at * 1000)
+ *   handoff_id / handoffId
+ *   handoff_secret / handoffSecret  (NEVER reaches browser JS)
+ *   auth_url / authUrl
+ */
 export interface CheckpointCreateResponse {
   checkpointId: string;
-  expiresAt: number;
+  expiresAt: number; // epoch ms (normalized from wire epoch seconds)
   handoffId: string;
   handoffSecret: string; // NEVER reaches browser JS — set as HttpOnly cookie
   authUrl: string;
+}
+
+/**
+ * Exact name of the HttpOnly handoff-secret cookie.
+ *
+ * The gateway sets it host-only on the public terminal origin
+ * (`HttpOnly; Secure; SameSite=Lax; Path=/`; no `Domain` attribute unless
+ * `FINANCIAL_WORKSPACE_HANDOFF_COOKIE_DOMAIN` is explicitly configured). The
+ * workspace control plane reads it server-side during claim initiation and
+ * never from JS, the body, or the URL. The infra side mirrors this constant in
+ * `unchained/web_app/handlers/fin_workspace.py`.
+ */
+export const HANDOFF_SECRET_COOKIE_NAME = "fin-terminal-handoff-secret";
+
+/** Version of the S2S checkpoint-create wire schema. */
+export const CHECKPOINT_CREATE_WIRE_VERSION = 1;
+
+export type ParsedCheckpointCreateResponse =
+  | { ok: true; value: CheckpointCreateResponse }
+  | { ok: false; reason: string };
+
+/**
+ * Strictly parse a workspace-service checkpoint-create response.
+ *
+ * The canonical wire schema is snake_case and emits `expires_at` as Unix
+ * epoch SECONDS (the Python control plane's time base). For rollout
+ * compatibility the camelCase spelling is also accepted and normalized to the
+ * same internal type. Unknown fields are ignored; missing/ill-typed fields
+ * reject the whole response so the gateway never forwards a broken handoff.
+ */
+export function parseCheckpointCreateResponse(value: unknown): ParsedCheckpointCreateResponse {
+  if (!isRecord(value)) {
+    return { ok: false, reason: "response must be a JSON object" };
+  }
+  const pick = (snake: string, camel: string): string | undefined => {
+    const raw = typeof value[snake] === "string" ? value[snake] : value[camel];
+    return typeof raw === "string" && raw.length > 0 ? raw : undefined;
+  };
+  const checkpointId = pick("checkpoint_id", "checkpointId");
+  const handoffId = pick("handoff_id", "handoffId");
+  const handoffSecret = pick("handoff_secret", "handoffSecret");
+  const authUrl = pick("auth_url", "authUrl");
+  if (!checkpointId || !handoffId || !handoffSecret || !authUrl) {
+    return { ok: false, reason: "checkpoint create response is missing required fields" };
+  }
+  // `expires_at` is Unix epoch SECONDS on the wire. Detect a millisecond value
+  // (out of the seconds epoch range) and reject it rather than silently
+  // producing a cookie that expires ~1000x too late.
+  const rawExpires = value.expires_at ?? value.expiresAt;
+  if (typeof rawExpires !== "number" || !Number.isFinite(rawExpires) || rawExpires <= 0) {
+    return { ok: false, reason: "expires_at must be a positive epoch-seconds number" };
+  }
+  if (rawExpires > 9_000_000_000) {
+    return { ok: false, reason: "expires_at is not an epoch-seconds timestamp" };
+  }
+  const expiresAt = Math.floor(rawExpires * 1000);
+  return {
+    ok: true,
+    value: { checkpointId, expiresAt, handoffId, handoffSecret, authUrl },
+  };
 }
 
 // ──── Validation ────────────────────────────────────────────────────────────
@@ -594,10 +670,28 @@ export type WorkspaceEnv = { [key: string]: string | undefined };
 
 /**
  * Check if financial workspace checkpoints are enabled in this deployment.
- * Feature-gated: requires explicit opt-in via env var.
+ * Feature-gated: requires explicit opt-in via env var. Accepts the boolean
+ * spellings used by Compose interpolation (`1`, `true`, `yes`) so the same
+ * master flag can drive both the control plane and the gateway without a
+ * separate translation layer.
  */
 export function isWorkspaceCheckpointEnabled(env: WorkspaceEnv = {}): boolean {
-  return env.FINANCIAL_WORKSPACE_CHECKPOINTS === "1";
+  return /^(?:1|true|yes)$/i.test((env.FINANCIAL_WORKSPACE_CHECKPOINTS ?? "").trim());
+}
+
+/**
+ * Optional parent domain for the HttpOnly handoff-secret cookie.
+ *
+ * The gateway and the workspace control plane share the public terminal host
+ * (`unbrowser.unchainedsky.com`), so the default host-only cookie (no
+ * `Domain` attribute) is already sent on every path of that host — including
+ * `/fin-terminal-workspace/*`. Only set this when the two surfaces are ever
+ * split across different subdomains.
+ */
+export function handoffCookieDomain(env: WorkspaceEnv = {}): string | undefined {
+  const domain = env.FINANCIAL_WORKSPACE_HANDOFF_COOKIE_DOMAIN?.trim();
+  if (!domain) return undefined;
+  return domain.startsWith(".") ? domain : `.${domain}`;
 }
 
 /**

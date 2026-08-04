@@ -1158,6 +1158,7 @@ export async function startPublicLiveGateway(): Promise<PublicLiveGateway> {
           },
           getWarmPool: () => warmPool,
           getResearchCoordinator: () => researchPermits,
+          getQueueCount: () => coordinator.metrics().queuedVisitors,
           touchSession: (sessionId) => coordinator.touch(sessionId),
           mutate,
           inspect,

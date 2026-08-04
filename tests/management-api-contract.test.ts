@@ -95,6 +95,7 @@ async function startApi(t: { after(fn: () => Promise<void> | void): void }) {
       getSeatStatuses: () => deps.seats,
       getWarmPool: () => deps.warmPool,
       getResearchCoordinator: () => deps.researchPermits,
+      getQueueCount: () => 2,
       touchSession: (sessionId) => deps.touched.push(sessionId),
       mutate: deps.mutate,
       inspect: deps.inspect,
@@ -108,17 +109,42 @@ async function startApi(t: { after(fn: () => Promise<void> | void): void }) {
 
 const auth = { "x-management-token": TOKEN };
 
-test("reconcile-snapshot returns per-seat statuses and plan (exact contract path)", async (t) => {
+test("reconcile-snapshot returns the versioned seat map, totals, and plan", async (t) => {
   const { port } = await startApi(t);
   const result = await fetchJson(`http://${HOST}:${port}/api/management/reconcile-snapshot`, {
     method: "POST",
     headers: auth,
   });
   assert.equal(result.status, 200);
-  assert.ok(Array.isArray(result.body.seats));
-  assert.equal((result.body.seats as unknown[]).length, 6);
-  assert.ok(result.body.plan);
-  assert.equal(typeof (result.body.plan as Record<string, unknown>).desiredRunning, "number");
+  assert.equal(result.body.version, 1);
+  // Exactly six named seat records, keyed by workerId.
+  const seats = result.body.seats as Record<string, Record<string, unknown>>;
+  assert.ok(seats && typeof seats === "object" && !Array.isArray(seats));
+  assert.equal(Object.keys(seats).length, 6);
+  assert.deepEqual(Object.keys(seats).sort(), ["seat-01", "seat-02", "seat-03", "seat-04", "seat-05", "seat-06"]);
+
+  // Normalized reconciler fields.
+  const seat01 = seats["seat-01"]!;
+  assert.equal(seat01.workerId, "seat-01");
+  assert.equal(seat01.status, "healthy");
+  assert.equal(seat01.assigned, true);
+  assert.equal(seat01.generation, "gen-a");
+  assert.equal(seat01.containerId, "");
+  const seat02 = seats["seat-02"]!;
+  assert.equal(seat02.status, "healthy");
+  assert.equal(seat02.assigned, false);
+  assert.equal(seat02.idleSeconds, 400);
+  const seat04 = seats["seat-04"]!;
+  assert.equal(seat04.status, "absent");
+  assert.equal(seat04.assigned, false);
+  assert.equal(seat04.generation, null);
+
+  assert.equal(result.body.totalAssigned, 1);
+  assert.equal(result.body.totalQueued, 2);
+  const plan = result.body.plan as Record<string, unknown>;
+  assert.equal(typeof plan.desiredRunning, "number");
+  assert.ok(Array.isArray(plan.scaleDownCandidates));
+  assert.ok(Array.isArray(plan.activateCandidates));
 });
 
 test("reconcile-plan returns the warm-pool plan only", async (t) => {
@@ -128,45 +154,92 @@ test("reconcile-plan returns the warm-pool plan only", async (t) => {
     headers: auth,
   });
   assert.equal(result.status, 200);
+  assert.equal(result.body.version, 1);
   assert.equal(result.body.reconciled, true);
   const plan = result.body.plan as Record<string, unknown>;
   assert.ok(Array.isArray(plan.scaleDownCandidates));
   assert.ok(Array.isArray(plan.activateCandidates));
 });
 
-test("drain accepts a ready-idle seat and rejects a protected seat", async (t) => {
+test("drain accepts a ready-idle seat with a matching generation (CAS) and rejects a protected seat", async (t) => {
   const { port } = await startApi(t);
   const drain = await fetchJson(`http://${HOST}:${port}/api/management/drain`, {
     method: "POST",
     headers: { ...auth, "content-type": "application/json" },
-    body: JSON.stringify({ workerId: "seat-02", drainId: "drain-1" }),
+    body: JSON.stringify({ workerId: "seat-02", drainId: "drain-1", expectedGeneration: "gen-b" }),
   });
   assert.equal(drain.status, 200);
   assert.equal(drain.body.accepted, true);
+  assert.equal(drain.body.drainId, "drain-1");
 
   const protectedSeat = await fetchJson(`http://${HOST}:${port}/api/management/drain`, {
     method: "POST",
     headers: { ...auth, "content-type": "application/json" },
-    body: JSON.stringify({ workerId: "seat-01", drainId: "drain-2" }),
+    body: JSON.stringify({ workerId: "seat-01", drainId: "drain-2", expectedGeneration: "gen-a" }),
   });
   assert.equal(protectedSeat.status, 409);
+  assert.equal(protectedSeat.body.accepted, false);
 });
 
-test("activate releases a drained seat and reports force-release fallback", async (t) => {
+test("drain performs a generation CAS and rejects a stale expectedGeneration", async (t) => {
+  const { port } = await startApi(t);
+  const stale = await fetchJson(`http://${HOST}:${port}/api/management/drain`, {
+    method: "POST",
+    headers: { ...auth, "content-type": "application/json" },
+    body: JSON.stringify({ workerId: "seat-02", drainId: "drain-stale", expectedGeneration: "gen-stale" }),
+  });
+  assert.equal(stale.status, 409);
+  assert.equal(stale.body.accepted, false);
+  assert.equal(stale.body.reason, "generation mismatch");
+
+  // Without an expectedGeneration the CAS is skipped (legacy callers).
+  const noCas = await fetchJson(`http://${HOST}:${port}/api/management/drain`, {
+    method: "POST",
+    headers: { ...auth, "content-type": "application/json" },
+    body: JSON.stringify({ workerId: "seat-02", drainId: "drain-nocas" }),
+  });
+  assert.equal(noCas.status, 200);
+  assert.equal(noCas.body.accepted, true);
+});
+
+test("activate reports {accepted} and releases a drained seat only when the generation changed", async (t) => {
   const { port, deps } = await startApi(t);
   deps.warmPool.requestDrain(
     { workerId: "seat-02", phase: "ready-idle", generation: "gen-b", drainRequested: false },
     "drain-pre",
   );
-  // Same generation → sticky; the API force-releases.
-  const result = await fetchJson(`http://${HOST}:${port}/api/management/activate`, {
+
+  // Same generation → sticky; activation is rejected.
+  const sticky = await fetchJson(`http://${HOST}:${port}/api/management/activate`, {
     method: "POST",
     headers: { ...auth, "content-type": "application/json" },
     body: JSON.stringify({ workerId: "seat-02" }),
   });
-  assert.equal(result.status, 200);
-  assert.equal(result.body.activated, true);
+  assert.equal(sticky.status, 409);
+  assert.equal(sticky.body.accepted, false);
+  assert.ok(deps.warmPool.isDraining("seat-02"));
+
+  // Generation moved (the reconciler restarted the container) → accepted.
+  deps.seats[1] = { ...deps.seats[1]!, generation: "gen-b2" };
+  const released = await fetchJson(`http://${HOST}:${port}/api/management/activate`, {
+    method: "POST",
+    headers: { ...auth, "content-type": "application/json" },
+    body: JSON.stringify({ workerId: "seat-02" }),
+  });
+  assert.equal(released.status, 200);
+  assert.equal(released.body.accepted, true);
   assert.ok(!deps.warmPool.isDraining("seat-02"));
+});
+
+test("activate on a non-draining seat is an accepted no-op", async (t) => {
+  const { port } = await startApi(t);
+  const result = await fetchJson(`http://${HOST}:${port}/api/management/activate`, {
+    method: "POST",
+    headers: { ...auth, "content-type": "application/json" },
+    body: JSON.stringify({ workerId: "seat-04" }),
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.accepted, true);
 });
 
 test("management contract rejects requests without X-Management-Token", async (t) => {
@@ -277,6 +350,7 @@ test("management API disabled when feature flag / token are absent (private-only
       getSeatStatuses: () => deps.seats,
       getWarmPool: () => deps.warmPool,
       getResearchCoordinator: () => deps.researchPermits,
+      getQueueCount: () => 0,
       mutate: deps.mutate,
       inspect: deps.inspect,
     },

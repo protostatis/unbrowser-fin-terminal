@@ -19,14 +19,17 @@ import {
   isWorkspaceCheckpointEnabled,
   workspaceServiceUrl,
   workspaceControlToken,
+  handoffCookieDomain,
+  HANDOFF_SECRET_COOKIE_NAME,
   CHECKPOINT_CREATE_PATH,
   CHECKPOINT_EXPORT_PATH,
-  type CheckpointCreateResponse,
+  parseCheckpointCreateResponse,
 } from "../shared/financial-workspace-checkpoint.js";
 import { CONTROL_TOKEN_HEADER } from "./workspace-checkpoint-handler.js";
 import { workerGenerationEpoch } from "./workspace-checkpoint-export.js";
 
-export const HANDOFF_COOKIE_NAME = "fin-terminal-handoff-secret";
+// Alias kept for callers/tests that imported the old name.
+export const HANDOFF_COOKIE_NAME = HANDOFF_SECRET_COOKIE_NAME;
 const WORKER_PROXY_TOKEN_HEADER = "x-fin-terminal-proxy-token";
 const INTERNAL_SERVICE_TIMEOUT_MS = 10_000;
 
@@ -134,7 +137,7 @@ export function createWorkspaceHandoffController(
 
     // 2. Forward to the internal workspace service.
     const requestId = `${ticket.ticketId}-${Date.now().toString(36)}`;
-    let serviceResponse: CheckpointCreateResponse | undefined;
+    let serviceResponse: unknown;
     try {
       const createResponse = await fetchImpl(
         `${serviceUrl}${CHECKPOINT_CREATE_PATH}`,
@@ -165,7 +168,7 @@ export function createWorkspaceHandoffController(
         response.status(502).json({ error: "workspace_service_error" });
         return;
       }
-      serviceResponse = (await createResponse.json()) as CheckpointCreateResponse;
+      serviceResponse = await createResponse.json();
     } catch (error) {
       console.error(
         "[workspace-checkpoint] workspace service unavailable:",
@@ -175,32 +178,35 @@ export function createWorkspaceHandoffController(
       return;
     }
 
-    if (
-      !serviceResponse
-      || typeof serviceResponse.checkpointId !== "string"
-      || typeof serviceResponse.expiresAt !== "number"
-      || typeof serviceResponse.handoffId !== "string"
-      || typeof serviceResponse.handoffSecret !== "string"
-      || typeof serviceResponse.authUrl !== "string"
-    ) {
+    // Strictly normalize the S2S wire schema (snake_case, expires_at in epoch
+    // SECONDS) into the internal camelCase type with epoch ms.
+    const parsed = parseCheckpointCreateResponse(serviceResponse);
+    if (!parsed.ok) {
+      console.error(`[workspace-checkpoint] invalid create response: ${parsed.reason}`);
       response.status(502).json({ error: "workspace_service_invalid_response" });
       return;
     }
 
     // 3. Handoff secret goes ONLY into the HttpOnly cookie.
-    response.cookie(HANDOFF_COOKIE_NAME, serviceResponse.handoffSecret, {
+    // Express `maxAge` is in MILLISECONDS; the wire `expires_at` is epoch
+    // SECONDS and was already normalized to epoch ms by the parser.
+    const maxAgeMs = Math.max(0, parsed.value.expiresAt - Date.now());
+    const cookieOptions: Record<string, unknown> = {
       httpOnly: true,
       secure: true,
       sameSite: "lax",
       path: "/",
-      maxAge: Math.max(0, Math.floor((serviceResponse.expiresAt - Date.now()) / 1000)),
-    });
+      maxAge: maxAgeMs,
+    };
+    const domain = handoffCookieDomain(env);
+    if (domain) cookieOptions.domain = domain;
+    response.cookie(HANDOFF_SECRET_COOKIE_NAME, parsed.value.handoffSecret, cookieOptions);
 
     response.status(201).json({
-      checkpointId: serviceResponse.checkpointId,
-      expiresAt: serviceResponse.expiresAt,
-      handoffId: serviceResponse.handoffId,
-      authUrl: serviceResponse.authUrl,
+      checkpointId: parsed.value.checkpointId,
+      expiresAt: parsed.value.expiresAt,
+      handoffId: parsed.value.handoffId,
+      authUrl: parsed.value.authUrl,
     });
   };
 }

@@ -142,23 +142,32 @@ The authoritative infrastructure details, including production secrets and
 host safety controls, live in
 [`unchained-infra/docs/fin-terminal-route.md`](https://github.com/protostatis/unchained-infra/blob/main/docs/fin-terminal-route.md).
 
-## Private Management API Contract (warm-pool reconciler)
+## Private Management API Contract (warm-pool reconciler) — v1
 
 The gateway exposes a **private-only** management listener (default
 `TERMINAL_RUNTIME_MANAGEMENT_PORT=8789`, separate from the public port). It is
 enabled only when **both** `TERMINAL_RUNTIME_FEATURE_ENABLED=1` and
 `TERMINAL_RUNTIME_MANAGEMENT_TOKEN` (>= 32 chars) are set. Every request must
 send the `X-Management-Token` header. No management path is ever mounted on the
-public listener.
+public listener; Caddy never proxies 8789.
 
 Infra reconciler endpoints (POST, JSON):
 
 | Path                             | Body                          | Returns                                        |
 | -------------------------------- | ----------------------------- | ---------------------------------------------- |
-| `/api/management/reconcile-snapshot` | —                         | `{ seats[], plan }` per-seat statuses + plan   |
-| `/api/management/reconcile-plan` | —                             | `{ reconciled, plan }` desired warm-pool plan  |
-| `/api/management/drain`          | `{ workerId, drainId }`       | `{ accepted }` or 409                          |
-| `/api/management/activate`       | `{ workerId }`                | `{ activated }` (sticky drain force-releases)  |
+| `/api/management/reconcile-snapshot` | `{}`                      | `{ version: 1, seats: {workerId: {workerId, status, phase, generation\|null, assigned, idleSeconds, drainRequested, drainId\|null, containerId:""}}, totalAssigned, totalQueued, plan }` |
+| `/api/management/reconcile-plan` | `{}`                            | `{ version: 1, reconciled, plan }` desired warm-pool plan |
+| `/api/management/drain`          | `{ workerId, drainId, expectedGeneration }` | `{ accepted: true, drainId }` or 409 `{ accepted: false, reason }` |
+| `/api/management/activate`       | `{ workerId }`                | `{ accepted: true }` or 409 `{ accepted: false, reason }` |
+
+- `seats` always contains exactly six named records keyed by `workerId`
+  (`seat-01`..`seat-06`); `status` is one of `absent|starting|healthy|draining|stopped`
+  and `assigned` is derived from the phase. `plan.desiredRunning` is
+  authoritative for the reconciler.
+- `drain` performs a **generation CAS** on `expectedGeneration`: a stale
+  generation is rejected with 409 so a replaced worker is never drained.
+- `activate` releases a sticky drain only when the process generation changed;
+  a non-draining seat is an accepted no-op.
 
 Worker→gateway permit surface (same private listener, same header):
 
@@ -170,21 +179,25 @@ Worker→gateway permit surface (same private listener, same header):
 | `/api/management/research-permits/release`   | `{ requestId }`                                        |
 
 Workers reach the gateway's private listener via
-`TERMINAL_RUNTIME_MANAGEMENT_URL` (e.g. `http://public-gateway:8789`) and
-`TERMINAL_RUNTIME_MANAGEMENT_TOKEN`. The worker exposes its own identity to the
-permit gate through `TERMINAL_RUNTIME_WORKER_GENERATION` (set at boot) and
+`TERMINAL_RUNTIME_MANAGEMENT_URL` (e.g. `http://fin-terminal-public-gateway:8789`,
+over the private seat networks) and `TERMINAL_RUNTIME_MANAGEMENT_TOKEN`. The
+worker exposes its own identity to the permit gate through
+`TERMINAL_RUNTIME_WORKER_GENERATION` (set at boot) and
 `TERMINAL_RUNTIME_SESSION_ID` (set on public WebSocket attach).
 
 Legacy aliases (`GET /api/management/seats`, `POST /api/management/seats/:id/drain`,
 `POST /api/management/seats/:id/activate`, `POST /api/management/reconcile`,
-`GET /api/management/research`) remain for existing tooling; the reconciler
-contract paths above are canonical.
+`GET /api/management/research`) remain for existing tooling and return the same
+v1 shapes; the reconciler contract paths above are canonical.
+
+The canonical cross-repo contract (wire units, headers, cookie names, env vars,
+paths) is `unchained-infra/docs/financial-terminal-cross-repo-contract.md`.
 
 ## Workspace Checkpoint / Handoff Contract
 
-Feature-gated by `FINANCIAL_WORKSPACE_CHECKPOINTS=1`. Checkpoint content is
-always built from the assigned worker's authoritative state; the browser only
-sends an explicit opt-in.
+Feature-gated by `FINANCIAL_WORKSPACE_CHECKPOINTS` (`1`/`true`/`yes`).
+Checkpoint content is always built from the assigned worker's authoritative
+state; the browser only sends an explicit opt-in.
 
 - Worker private export: `POST /internal/financial-workspace/checkpoint-export`
   on the live worker (requires `X-Fin-Terminal-Control-Token`, plus the normal
@@ -197,8 +210,23 @@ sends an explicit opt-in.
   the workspace service at `FINANCIAL_WORKSPACE_SERVICE_URL` (Bearer
   `FINANCIAL_WORKSPACE_CONTROL_TOKEN`), and sets the handoff secret as an
   HttpOnly cookie. The handoff secret never reaches browser JS.
+- The workspace service's create response is **canonical snake_case** with
+  `expires_at` in Unix epoch **seconds**
+  (`checkpoint_id`, `expires_at`, `handoff_id`, `handoff_secret`, `auth_url`).
+  The gateway strictly parses it (`parseCheckpointCreateResponse`), normalizes
+  `expires_at` to epoch ms, and uses ms for the cookie's Express `maxAge`. The
+  camelCase spelling is tolerated for rollout. A millisecond `expires_at` is
+  rejected.
+- Handoff secret cookie: `fin-terminal-handoff-secret`, host-only
+  (`HttpOnly; Secure; SameSite=Lax; Path=/`; optional `Domain` only via
+  `FINANCIAL_WORKSPACE_HANDOFF_COOKIE_DOMAIN`). The control plane reads it
+  server-side at claim initiation and rotates it away — never from JS, body,
+  or URL.
 - Private import boot: a fresh in-memory workspace boots from a validated
   checkpoint (`SessionManager.inMemory` + custom entry + bounded continuation
   seed). Raw transcript/process state is never restored. In the terminal image,
   `TERMINAL_WORKSPACE_IMPORT_FILE` can point at a validated checkpoint JSON for
   an imported workspace boot; `NODE_ENV=production` fails closed on a bad file.
+
+The canonical cross-repo contract (wire units, headers, cookie names, env vars,
+paths) is `unchained-infra/docs/financial-terminal-cross-repo-contract.md`.

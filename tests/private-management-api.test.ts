@@ -77,6 +77,25 @@ function createManagementApi(port: number) {
     seats,
     mutate,
     inspect,
+    // v1 contract: queue count and drain-aware seat statuses.
+    getQueueCount: () => 2,
+    getSeatStatuses: () => seats.map((s) => ({
+      ...s,
+      drainRequested: warmPool.isDraining(s.workerId),
+      drainId: warmPool.getDrain(s.workerId)?.drainId,
+    })),
+  };
+}
+
+function managementDeps(port: number) {
+  const deps = createManagementApi(port);
+  return {
+    getSeatStatuses: () => deps.getSeatStatuses(),
+    getWarmPool: () => deps.warmPool,
+    getResearchCoordinator: () => deps.researchPermits,
+    getQueueCount: deps.getQueueCount,
+    mutate: deps.mutate,
+    inspect: deps.inspect,
   };
 }
 
@@ -85,13 +104,7 @@ test("management API returns 401 without auth token", async () => {
   const deps = createManagementApi(port);
   const api = startManagementApi(
     { host: HOST, port, token: TOKEN, enabled: true },
-    {
-      getSeatStatuses: () => deps.seats,
-      getWarmPool: () => deps.warmPool,
-      getResearchCoordinator: () => deps.researchPermits,
-      mutate: deps.mutate,
-      inspect: deps.inspect,
-    },
+    managementDeps(port),
   );
   assert.ok(api);
 
@@ -106,13 +119,7 @@ test("management API returns 401 with bad token", async () => {
   const deps = createManagementApi(port);
   const api = startManagementApi(
     { host: HOST, port, token: TOKEN, enabled: true },
-    {
-      getSeatStatuses: () => deps.seats,
-      getWarmPool: () => deps.warmPool,
-      getResearchCoordinator: () => deps.researchPermits,
-      mutate: deps.mutate,
-      inspect: deps.inspect,
-    },
+    managementDeps(port),
   );
   assert.ok(api);
 
@@ -129,13 +136,7 @@ test("GET /api/management/seats returns per-seat status and plan", async () => {
   const deps = createManagementApi(port);
   const api = startManagementApi(
     { host: HOST, port, token: TOKEN, enabled: true },
-    {
-      getSeatStatuses: () => deps.seats,
-      getWarmPool: () => deps.warmPool,
-      getResearchCoordinator: () => deps.researchPermits,
-      mutate: deps.mutate,
-      inspect: deps.inspect,
-    },
+    managementDeps(port),
   );
   assert.ok(api);
 
@@ -145,10 +146,13 @@ test("GET /api/management/seats returns per-seat status and plan", async () => {
 
   assert.equal(result.status, 200);
   const body = result.body as Record<string, unknown>;
-  assert.ok(Array.isArray(body.seats));
-  assert.equal((body.seats as unknown[]).length, 6);
-  assert.ok(body.plan != null);
+  // v1: seats is a map keyed by workerId with exactly six named records.
+  const seats = body.seats as Record<string, unknown>;
+  assert.ok(seats && typeof seats === "object" && !Array.isArray(seats));
+  assert.equal(Object.keys(seats).length, 6);
   assert.equal(typeof (body.plan as Record<string, unknown>).desiredRunning, "number");
+  assert.equal(typeof (body as Record<string, unknown>).totalAssigned, "number");
+  assert.equal(typeof (body as Record<string, unknown>).totalQueued, "number");
 
   await api!.close();
 });
@@ -158,13 +162,7 @@ test("POST /api/management/seats/:id/drain accepts valid drain request", async (
   const deps = createManagementApi(port);
   const api = startManagementApi(
     { host: HOST, port, token: TOKEN, enabled: true },
-    {
-      getSeatStatuses: () => deps.seats,
-      getWarmPool: () => deps.warmPool,
-      getResearchCoordinator: () => deps.researchPermits,
-      mutate: deps.mutate,
-      inspect: deps.inspect,
-    },
+    managementDeps(port),
   );
   assert.ok(api);
 
@@ -192,13 +190,7 @@ test("POST /api/management/seats/:id/drain rejects protected seat", async () => 
   const deps = createManagementApi(port);
   const api = startManagementApi(
     { host: HOST, port, token: TOKEN, enabled: true },
-    {
-      getSeatStatuses: () => deps.seats,
-      getWarmPool: () => deps.warmPool,
-      getResearchCoordinator: () => deps.researchPermits,
-      mutate: deps.mutate,
-      inspect: deps.inspect,
-    },
+    managementDeps(port),
   );
   assert.ok(api);
 
@@ -226,13 +218,7 @@ test("POST /api/management/seats/:id/drain rejects missing drainId", async () =>
   const deps = createManagementApi(port);
   const api = startManagementApi(
     { host: HOST, port, token: TOKEN, enabled: true },
-    {
-      getSeatStatuses: () => deps.seats,
-      getWarmPool: () => deps.warmPool,
-      getResearchCoordinator: () => deps.researchPermits,
-      mutate: deps.mutate,
-      inspect: deps.inspect,
-    },
+    managementDeps(port),
   );
   assert.ok(api);
 
@@ -270,13 +256,7 @@ test("POST /api/management/seats/:id/activate activates a drained seat", async (
 
   const api = startManagementApi(
     { host: HOST, port, token: TOKEN, enabled: true },
-    {
-      getSeatStatuses: () => deps.seats,
-      getWarmPool: () => deps.warmPool,
-      getResearchCoordinator: () => deps.researchPermits,
-      mutate: deps.mutate,
-      inspect: deps.inspect,
-    },
+    managementDeps(port),
   );
   assert.ok(api);
 
@@ -292,7 +272,8 @@ test("POST /api/management/seats/:id/activate activates a drained seat", async (
 
   assert.equal(result.status, 200);
   const body = result.body as Record<string, unknown>;
-  assert.equal(body.activated, true);
+  // v1: activate responds with {accepted}.
+  assert.equal(body.accepted, true);
 
   await api!.close();
 });
@@ -302,13 +283,7 @@ test("POST /api/management/reconcile returns warm-pool plan", async () => {
   const deps = createManagementApi(port);
   const api = startManagementApi(
     { host: HOST, port, token: TOKEN, enabled: true },
-    {
-      getSeatStatuses: () => deps.seats,
-      getWarmPool: () => deps.warmPool,
-      getResearchCoordinator: () => deps.researchPermits,
-      mutate: deps.mutate,
-      inspect: deps.inspect,
-    },
+    managementDeps(port),
   );
   assert.ok(api);
 
@@ -333,13 +308,7 @@ test("GET /api/management/research returns permit metrics", async () => {
   const deps = createManagementApi(port);
   const api = startManagementApi(
     { host: HOST, port, token: TOKEN, enabled: true },
-    {
-      getSeatStatuses: () => deps.seats,
-      getWarmPool: () => deps.warmPool,
-      getResearchCoordinator: () => deps.researchPermits,
-      mutate: deps.mutate,
-      inspect: deps.inspect,
-    },
+    managementDeps(port),
   );
   assert.ok(api);
 
@@ -362,13 +331,7 @@ test("management API returns 404 for unknown endpoints", async () => {
   const deps = createManagementApi(port);
   const api = startManagementApi(
     { host: HOST, port, token: TOKEN, enabled: true },
-    {
-      getSeatStatuses: () => deps.seats,
-      getWarmPool: () => deps.warmPool,
-      getResearchCoordinator: () => deps.researchPermits,
-      mutate: deps.mutate,
-      inspect: deps.inspect,
-    },
+    managementDeps(port),
   );
   assert.ok(api);
 
@@ -384,13 +347,7 @@ test("management API does not start when disabled", () => {
   const deps = createManagementApi(0);
   const api = startManagementApi(
     { host: HOST, port: 0, token: TOKEN, enabled: false },
-    {
-      getSeatStatuses: () => deps.seats,
-      getWarmPool: () => deps.warmPool,
-      getResearchCoordinator: () => deps.researchPermits,
-      mutate: deps.mutate,
-      inspect: deps.inspect,
-    },
+    managementDeps(0),
   );
   assert.equal(api, undefined);
 });
@@ -400,13 +357,7 @@ test("invalid body (not JSON) returns 400", async () => {
   const deps = createManagementApi(port);
   const api = startManagementApi(
     { host: HOST, port, token: TOKEN, enabled: true },
-    {
-      getSeatStatuses: () => deps.seats,
-      getWarmPool: () => deps.warmPool,
-      getResearchCoordinator: () => deps.researchPermits,
-      mutate: deps.mutate,
-      inspect: deps.inspect,
-    },
+    managementDeps(port),
   );
   assert.ok(api);
 
@@ -432,13 +383,7 @@ test("seat id with special characters is rejected", async () => {
   const deps = createManagementApi(port);
   const api = startManagementApi(
     { host: HOST, port, token: TOKEN, enabled: true },
-    {
-      getSeatStatuses: () => deps.seats,
-      getWarmPool: () => deps.warmPool,
-      getResearchCoordinator: () => deps.researchPermits,
-      mutate: deps.mutate,
-      inspect: deps.inspect,
-    },
+    managementDeps(port),
   );
   assert.ok(api);
 
