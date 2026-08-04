@@ -2353,7 +2353,8 @@ strong {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 8px 16px;
+  min-width: 0;
+  padding: 8px max(16px, env(safe-area-inset-left)) max(10px, calc(8px + env(safe-area-inset-bottom))) max(16px, env(safe-area-inset-right));
   background: #161b22;
   border-top: 1px solid #30363d;
   color: #c9d1d9;
@@ -2361,6 +2362,30 @@ strong {
   font-size: 12px;
   line-height: 1.4;
   transition: background 0.3s, border-color 0.3s;
+}
+
+/* Visible keyboard focus rings and active press state for every banner action. */
+.workspace-checkpoint-banner button:focus-visible,
+.workspace-checkpoint-confirm button:focus-visible {
+  outline: 2px solid #58a6ff;
+  outline-offset: 2px;
+}
+
+.workspace-checkpoint-banner button:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+/* Visually hidden live regions used for phase-transition announcements only. */
+.workspace-checkpoint-live {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 .workspace-checkpoint-warning-2m {
@@ -2382,6 +2407,7 @@ strong {
   display: flex;
   align-items: center;
   gap: 16px;
+  min-width: 0;
   flex-wrap: wrap;
 }
 
@@ -2438,7 +2464,11 @@ strong {
   display: flex;
   align-items: center;
   gap: 12px;
+  min-width: 0;
   flex-shrink: 0;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  max-width: 100%;
 }
 
 .workspace-checkpoint-convert-cta {
@@ -2462,6 +2492,32 @@ strong {
 .workspace-checkpoint-convert-cta:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/* Explicit dismiss/acknowledge — the beforeunload guard is never coercive. */
+.workspace-checkpoint-dismiss {
+  padding: 4px 8px;
+  background: transparent;
+  color: #6e7681;
+  border: 1px solid transparent;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.workspace-checkpoint-dismiss:hover {
+  color: #c9d1d9;
+  border-color: #30363d;
+}
+
+.workspace-checkpoint-dismissed-note {
+  color: #8b949e;
+  font-size: 11px;
+  font-style: italic;
+  white-space: normal;
 }
 
 .workspace-checkpoint-converting {
@@ -2492,7 +2548,7 @@ strong {
 
 .workspace-checkpoint-confirm {
   position: fixed;
-  bottom: 48px;
+  bottom: calc(56px + env(safe-area-inset-bottom));
   right: 16px;
   z-index: 101;
   max-width: 380px;
@@ -2506,19 +2562,37 @@ strong {
 .workspace-checkpoint-confirm p {
   margin: 0 0 8px;
   color: #c9d1d9;
-  font-size: 12px;
-  line-height: 1.5;
+  font-size: 13px;
+  line-height: 1.55;
 }
 
 .workspace-checkpoint-confirm p:first-child {
   color: #e6edf3;
   font-weight: 700;
-  font-size: 13px;
+  font-size: 14px;
 }
 
 .workspace-checkpoint-confirm-detail {
-  color: #8b949e !important;
+  color: #c9d1d9 !important;
   font-weight: 400 !important;
+}
+
+.workspace-checkpoint-confirm-error {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  background: rgba(248, 81, 73, 0.12);
+  border: 1px solid #f85149;
+  border-radius: 4px;
+  color: #ffb3ad;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.workspace-checkpoint-confirm-error strong {
+  display: block;
+  margin-bottom: 4px;
+  color: #ff7b72;
+  font-size: 12px;
 }
 
 .workspace-checkpoint-confirm-actions {
@@ -2599,4 +2673,61 @@ strong {
 @keyframes checkpoint-critical-flash {
   0%, 100% { opacity: 0.4; }
   50% { opacity: 1; }
+}
+
+/* ── Checkpoint banner: reduced motion ──────────────────────────────────── */
+
+@media (prefers-reduced-motion: reduce) {
+  .workspace-checkpoint-critical-30s .workspace-checkpoint-timer-value,
+  .workspace-checkpoint-warning-flash,
+  .workspace-checkpoint-flash-warning-2m,
+  .workspace-checkpoint-flash-critical-30s {
+    animation: none;
+  }
+
+  .workspace-checkpoint-banner button:active:not(:disabled) {
+    transform: none;
+  }
+}
+
+/* ── Checkpoint banner: narrow / mobile ─────────────────────────────────── */
+
+@media (max-width: 640px) {
+  .workspace-checkpoint-banner {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+    padding: 10px max(12px, env(safe-area-inset-left)) max(10px, calc(8px + env(safe-area-inset-bottom))) max(12px, env(safe-area-inset-right));
+  }
+
+  .workspace-checkpoint-info {
+    justify-content: space-between;
+  }
+
+  .workspace-checkpoint-timer {
+    min-width: 0;
+  }
+
+  .workspace-checkpoint-runs {
+    white-space: normal;
+  }
+
+  .workspace-checkpoint-actions {
+    justify-content: flex-end;
+  }
+
+  .workspace-checkpoint-confirm {
+    right: 8px;
+    left: 8px;
+    bottom: calc(96px + env(safe-area-inset-bottom));
+    max-width: none;
+  }
+
+  .workspace-checkpoint-confirm-actions {
+    flex-direction: column;
+  }
+
+  .workspace-checkpoint-confirm-actions button {
+    width: 100%;
+  }
 }
