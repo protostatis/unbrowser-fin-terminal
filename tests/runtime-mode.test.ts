@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { resolveRuntimeMode, verifyBuildModeManifest } from "../server/runtime-mode.js";
+import { resolveRuntimeMode, verifyBuildModeManifest, isRuntimeFeatureEnabled } from "../server/runtime-mode.js";
 
 // ── Dev/test defaults ────────────────────────────────────────────────────
 
@@ -131,4 +131,28 @@ test("public live gateway requires an explicit runtime mode without legacy repla
     () => resolveRuntimeMode({ TERMINAL_RUNTIME_MODE: "unknown" }),
     /Invalid TERMINAL_RUNTIME_MODE/,
   );
+});
+
+// ── TERMINAL_RUNTIME_FEATURE_ENABLED boolean spellings ──────────────────────
+
+test("TERMINAL_RUNTIME_FEATURE_ENABLED accepts every Compose boolean spelling", () => {
+  for (const value of ["1", "true", "yes", "on", "TRUE", "Yes", "ON"]) {
+    assert.equal(
+      isRuntimeFeatureEnabled({ TERMINAL_RUNTIME_FEATURE_ENABLED: value }),
+      true,
+      `"${value}" must enable the runtime feature`,
+    );
+  }
+});
+
+test("TERMINAL_RUNTIME_FEATURE_ENABLED is disabled for empty or non-truthy values", () => {
+  for (const value of [undefined, "", " ", "0", "false", "no", "off", "2", "disabled"]) {
+    assert.equal(
+      isRuntimeFeatureEnabled({ TERMINAL_RUNTIME_FEATURE_ENABLED: value }),
+      false,
+      `"${String(value)}" must not enable the runtime feature`,
+    );
+  }
+  // Unset entirely (no key) must also be disabled.
+  assert.equal(isRuntimeFeatureEnabled({}), false);
 });

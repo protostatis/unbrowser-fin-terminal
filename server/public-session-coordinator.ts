@@ -97,6 +97,15 @@ export interface PublicSessionCoordinatorState {
     requiresUnavailable?: boolean;
     quarantinedGeneration?: string;
     unavailableAfterQuarantine?: boolean;
+    /** Epoch ms when the slot last became healthy + unassigned (ready-idle). */
+    idleSince?: number;
+    /**
+     * True while an operator drain is accepted. The slot is pinned out of the
+     * assignable pool until an explicit activation clears both the warm-pool
+     * drain and this flag. Additive and backward compatible: old Redis state
+     * without the field restores as eligible.
+     */
+    drainIneligible?: boolean;
   }>;
 }
 
@@ -142,6 +151,10 @@ type WorkerSlot = {
   quarantinedGeneration?: string;
   unavailableAfterQuarantine: boolean;
   probeEpoch: number;
+  /** Epoch ms when the slot last became healthy + unassigned (ready-idle). */
+  idleSince?: number;
+  /** Pinned out of assignment while an operator drain is in effect. */
+  drainIneligible: boolean;
 };
 
 const NOOP = () => {};
@@ -194,6 +207,7 @@ export class PublicSessionCoordinator {
         ready: false,
         requiresUnavailable: false,
         unavailableAfterQuarantine: false,
+        drainIneligible: false,
         probeEpoch: 0,
       });
     }
@@ -249,9 +263,22 @@ export class PublicSessionCoordinator {
     const worker = this.workers.get(workerId);
     if (!worker) throw new Error(`unknown public worker "${workerId}"`);
     if (probeEpoch !== undefined && probeEpoch !== worker.probeEpoch) return false;
+    if (worker.drainIneligible) {
+      // An operator drain pins the slot out of the assignable pool until an
+      // explicit activation. A health probe — same or new generation — must
+      // never re-enable it. The observed generation is still recorded so the
+      // warm-pool plan can propose an activation once the container was
+      // replaced (new generation alone stays ineligible).
+      if (generation) worker.generation = generation;
+      worker.ready = false;
+      worker.idleSince = undefined;
+      this.pump();
+      return true;
+    }
     this.bumpWorkerProbeEpoch(worker);
     if (worker.requiresUnavailable) {
       worker.ready = false;
+      worker.idleSince = undefined;
       if (!ready || !generation) {
         if (worker.quarantinedGeneration) worker.unavailableAfterQuarantine = true;
         this.pump();
@@ -279,6 +306,7 @@ export class PublicSessionCoordinator {
     }
     if (!ready || !generation) {
       worker.ready = false;
+      worker.idleSince = undefined;
       if (worker.sessionId) {
         const session = this.sessions.get(worker.sessionId);
         if (session && session.state !== "ended") this.end(session, "worker-unavailable");
@@ -304,6 +332,7 @@ export class PublicSessionCoordinator {
         // An attachment is connected or in flight. Its authenticated upgrade
         // header decides whether this generation has received tenant state.
         worker.ready = false;
+        worker.idleSince = undefined;
       }
     } else {
       this.markIdleWorkerReady(worker, generation);
@@ -317,6 +346,32 @@ export class PublicSessionCoordinator {
     const worker = this.workers.get(workerId);
     if (!worker) throw new Error(`unknown public worker "${workerId}"`);
     return worker.probeEpoch;
+  }
+
+  /**
+   * Fence a worker out of (or back into) the assignable pool as part of an
+   * atomic operator drain/activate mutation. Marking ineligible immediately
+   * removes assignment eligibility and bumps the probe epoch so a health
+   * response already in flight cannot re-enable the slot. Clearing only lifts
+   * the fence: the slot becomes assignable again after a fresh probe confirms
+   * the replacement process.
+   */
+  setWorkerDrainIneligible(workerId: string, ineligible: boolean): boolean {
+    const worker = this.workers.get(workerId);
+    if (!worker) return false;
+    worker.drainIneligible = ineligible;
+    if (ineligible) {
+      worker.ready = false;
+      worker.idleSince = undefined;
+      this.bumpWorkerProbeEpoch(worker);
+    }
+    this.pump();
+    return true;
+  }
+
+  /** Whether the slot is currently fenced by an accepted operator drain. */
+  isWorkerDrainIneligible(workerId: string): boolean {
+    return this.workers.get(workerId)?.drainIneligible === true;
   }
 
   /** Confirm that the assigned internal WebSocket reached the probed process. */
@@ -368,10 +423,20 @@ export class PublicSessionCoordinator {
       // A stale health response from the terminated tenant process must never
       // return its slot to the queue before Compose has replaced it.
       worker.ready = false;
+      worker.idleSince = undefined;
     } else {
+      const generationChanged = worker.generation !== generation;
       worker.ready = true;
       worker.generation = generation;
       worker.replacementOfGeneration = undefined;
+      if (generationChanged || worker.idleSince === undefined) {
+        // A slot enters ready-idle when it first reports healthy and unassigned,
+        // when a replacement process takes over, or when a restored gateway
+        // re-probes a slot with no persisted idle clock. Repeated probes of the
+        // same generation keep the original idle timestamp so the clock is
+        // monotonic and a restart does not restart the scale-down timer.
+        worker.idleSince = this.now();
+      }
     }
   }
 
@@ -513,6 +578,19 @@ export class PublicSessionCoordinator {
     return session ? this.snapshot(session) : undefined;
   }
 
+  /**
+   * Private read: the worker identity behind an active session. Never part of
+   * the public snapshot — used only by the workspace-handoff controller to
+   * authorize a checkpoint export against the exact assigned worker/generation.
+   */
+  getAssignedWorker(sessionId: string): { workerId: string; workerGeneration: string } | undefined {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.state !== "active" || !session.workerId || !session.workerGeneration) {
+      return undefined;
+    }
+    return { workerId: session.workerId, workerGeneration: session.workerGeneration };
+  }
+
   /** Run expiry checks and assign newly healthy seats to queued visitors. */
   sweep(): void {
     const now = this.now();
@@ -562,7 +640,7 @@ export class PublicSessionCoordinator {
     let assignedWorkers = 0;
     for (const worker of this.workers.values()) {
       if (worker.sessionId) assignedWorkers += 1;
-      else if (worker.ready) readyWorkers += 1;
+      else if (worker.ready && !worker.drainIneligible) readyWorkers += 1;
     }
     return {
       readyWorkers,
@@ -571,6 +649,74 @@ export class PublicSessionCoordinator {
       dailyReservedMicroUsd: this.dailyReservedMicroUsd,
       dailyBudgetMicroUsd: this.options.dailyBudgetMicroUsd,
     };
+  }
+
+  /**
+   * Export per-seat status for the warm-pool capacity planner. This is a pure
+   * read: no mutations, no access to secrets or Docker.
+   */
+  getSeatStatuses(): Array<{
+    workerId: string;
+    phase: "absent" | "starting" | "ready-idle" | "assigned" | "admitted" | "active" | "disconnected" | "draining" | "recycling";
+    generation?: string;
+    sessionId?: string;
+    idleSinceMs?: number;
+  }> {
+    const now = this.now();
+    return [...this.workers.values()].map((worker) => {
+      let phase: ReturnType<typeof this.getSeatStatuses>[0]["phase"] = "absent";
+      let sessionId: string | undefined;
+      let idleSinceMs: number | undefined;
+
+      if (worker.sessionId) {
+        const session = this.sessions.get(worker.sessionId);
+        sessionId = session?.id;
+        if (session) {
+          switch (session.state) {
+            case "admitted":
+              phase = session.startedAt === undefined ? "admitted" : "starting";
+              break;
+            case "active":
+              if (session.disconnectedAt !== undefined) {
+                phase = "disconnected";
+              } else {
+                phase = "active";
+                if (session.lastActivityAt !== undefined) {
+                  idleSinceMs = Math.max(0, now - session.lastActivityAt);
+                }
+              }
+              break;
+            case "ended":
+              phase = "recycling";
+              break;
+            default:
+              phase = "assigned";
+              break;
+          }
+        }
+      } else if (worker.drainIneligible) {
+        // An accepted drain pins the slot here until an explicit activation.
+        // The slot is never an idle scale-down candidate while draining.
+        phase = "draining";
+      } else if (worker.ready && worker.generation) {
+        phase = "ready-idle";
+        idleSinceMs = worker.idleSince !== undefined
+          ? Math.max(0, now - worker.idleSince)
+          : 0;
+      } else if (worker.replacementOfGeneration) {
+        phase = "recycling";
+      } else if (worker.requiresUnavailable) {
+        phase = "recycling";
+      }
+
+      return {
+        workerId: worker.id,
+        phase,
+        ...(worker.generation ? { generation: worker.generation } : {}),
+        ...(sessionId ? { sessionId } : {}),
+        ...(idleSinceMs !== undefined ? { idleSinceMs } : {}),
+      };
+    });
   }
 
   /** Persist only opaque ticket state; worker health is always re-probed after restart. */
@@ -589,6 +735,8 @@ export class PublicSessionCoordinator {
         requiresUnavailable,
         quarantinedGeneration,
         unavailableAfterQuarantine,
+        idleSince,
+        drainIneligible,
       }) => ({
         id,
         ...(sessionId ? { sessionId } : {}),
@@ -597,6 +745,8 @@ export class PublicSessionCoordinator {
         ...(requiresUnavailable ? { requiresUnavailable: true } : {}),
         ...(quarantinedGeneration ? { quarantinedGeneration } : {}),
         ...(unavailableAfterQuarantine ? { unavailableAfterQuarantine: true } : {}),
+        ...(idleSince !== undefined ? { idleSince } : {}),
+        ...(drainIneligible ? { drainIneligible: true } : {}),
       })),
     };
   }
@@ -662,6 +812,22 @@ export class PublicSessionCoordinator {
       worker.requiresUnavailable = persisted?.requiresUnavailable === true;
       worker.quarantinedGeneration = persisted?.quarantinedGeneration;
       worker.unavailableAfterQuarantine = persisted?.unavailableAfterQuarantine === true;
+      // A drain accepted before a gateway restart stays in force: the fence is
+      // persisted and re-applied here so a fresh health probe cannot re-enable
+      // the seat before the operator explicitly activates it. Old Redis state
+      // predating the field restores as eligible.
+      worker.drainIneligible = persisted?.drainIneligible === true;
+      // Persisted idleSince continues a ready-idle seat's scale-down clock
+      // across a gateway restart. Old Redis state predating the field gets a
+      // conservative current-time stamp so idleSinceMs starts at zero and can
+      // never trigger an immediate unsafe drain; the worker is re-probed
+      // before it can become ready anyway. Assigned seats are never idle.
+      const persistedIdleSince = persisted?.idleSince;
+      worker.idleSince = worker.sessionId
+        ? undefined
+        : Number.isFinite(persistedIdleSince) && (persistedIdleSince ?? 0) >= 0
+          ? Math.min(persistedIdleSince!, now)
+          : now;
       worker.ready = false;
       worker.probeEpoch = 0;
     }
@@ -673,7 +839,10 @@ export class PublicSessionCoordinator {
   private pump(): void {
     this.removeEndedQueueEntries();
     for (const worker of this.workers.values()) {
-      if (!worker.ready || worker.sessionId) continue;
+      // An ineligible (drained) seat must never be assigned, even when a
+      // health probe still reports it healthy. Only an explicit activation
+      // lifts the fence.
+      if (!worker.ready || worker.sessionId || worker.drainIneligible) continue;
       const nextId = this.queue.shift();
       if (!nextId) return;
       const session = this.sessions.get(nextId);
@@ -692,6 +861,7 @@ export class PublicSessionCoordinator {
       this.dailyReservedMicroUsd += reservation;
       worker.sessionId = session.id;
       worker.ready = false;
+      worker.idleSince = undefined;
       this.bumpWorkerProbeEpoch(worker);
     }
   }
@@ -714,16 +884,20 @@ export class PublicSessionCoordinator {
           // The worker process is terminated after a visitor reaches it. Its
           // replacement must pass a health check before this slot becomes ready.
           worker.ready = false;
+          worker.idleSince = undefined;
           worker.replacementOfGeneration = session.workerGeneration ?? worker.generation;
         } else if (reason !== "worker-unavailable") {
           // An admitted visitor never opened a browser socket, so the worker
-          // has no tenant panel or agent state to discard.
+          // has no tenant panel or agent state to discard. The slot returns to
+          // the ready-idle pool and its idle clock restarts from the session end.
           worker.ready = true;
+          worker.idleSince = this.now();
           worker.replacementOfGeneration = undefined;
         } else {
           // A failed health probe cannot return an unvisited seat to service.
           // Any later healthy generation may re-enter through setWorkerReady.
           worker.ready = false;
+          worker.idleSince = undefined;
           worker.replacementOfGeneration = undefined;
         }
       }

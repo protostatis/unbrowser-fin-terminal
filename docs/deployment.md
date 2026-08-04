@@ -141,3 +141,128 @@ deployment fallback for a normal terminal release.
 The authoritative infrastructure details, including production secrets and
 host safety controls, live in
 [`unchained-infra/docs/fin-terminal-route.md`](https://github.com/protostatis/unchained-infra/blob/main/docs/fin-terminal-route.md).
+
+## Private Management API Contract (warm-pool reconciler) — v1
+
+The gateway exposes a **private-only** management listener (default
+`TERMINAL_RUNTIME_MANAGEMENT_PORT=8789`, separate from the public port). It is
+enabled only when **both** `TERMINAL_RUNTIME_FEATURE_ENABLED` (any of
+`1|true|yes|on`, case-insensitive) and `TERMINAL_RUNTIME_MANAGEMENT_TOKEN`
+(>= 32 chars) are set. Every request must send the `X-Management-Token` header.
+No management path is ever mounted on the public listener; Caddy never proxies
+8789. The listener binds `TERMINAL_RUNTIME_MANAGEMENT_HOST` (default
+`0.0.0.0`); `0.0.0.0` is safe only because the Compose service publishes no
+host port and Caddy never routes to it — the listener is container-private. A
+bind failure rejects gateway startup (fail closed when the feature is
+required).
+
+Infra reconciler endpoints (POST, JSON):
+
+| Path                             | Body                          | Returns                                        |
+| -------------------------------- | ----------------------------- | ---------------------------------------------- |
+| `/api/management/reconcile-snapshot` | `{}`                      | `{ version: 1, seats: {workerId: {workerId, status, phase, generation\|null, assigned, idleSeconds, drainRequested, drainId\|null, containerId:""}}, totalAssigned, totalQueued, plan }` |
+| `/api/management/reconcile-plan` | `{}`                            | `{ version: 1, reconciled, plan }` desired warm-pool plan |
+| `/api/management/drain`          | `{ workerId, drainId, expectedGeneration }` | `{ accepted: true, drainId }` or 409 `{ accepted: false, reason }` |
+| `/api/management/activate`       | `{ workerId }`                | `{ accepted: true }` or 409 `{ accepted: false, reason }` |
+
+- `seats` always contains exactly six named records keyed by `workerId`
+  (`seat-01`..`seat-06`); `status` is one of `absent|starting|healthy|draining|stopped`
+  and `assigned` is derived from the phase. `plan.desiredRunning` is
+  authoritative for the reconciler.
+- `idleSeconds` is the whole number of elapsed idle seconds (floored) for
+  `ready-idle` and `active` seats: ready-idle seats count from the moment the
+  slot became healthy and unassigned (persisted across gateway restarts);
+  active seats count from the last meaningful activity. Draining seats report
+  `0`. The value is monotonic and never negative.
+- `drain` is **atomic**: a ready-idle (unassigned) seat is only drainable after
+  `TERMINAL_RUNTIME_IDLE_SCALE_DOWN` seconds (default 300) of continuous idle,
+  and the **generation CAS** on `expectedGeneration` rejects a stale
+  generation with 409 so a replaced worker is never drained. Once accepted the
+  warm-pool drain AND the coordinator ineligibility fence are applied in one
+  serialized mutation and persisted before the caller sees `accepted: true`.
+  The drained seat is immediately removed from the assignable pool: health
+  probes (old or new generation) never re-enable it, the fence survives a
+  gateway restart, and no session — queued before or admitted after — is ever
+  assigned to it.
+- `activate` releases a sticky drain only when the process generation changed;
+  a same-generation activation is rejected with 409. The explicit activation
+  clears both the warm-pool drain and the coordinator ineligibility fence in
+  one serialized mutation; the slot becomes assignable again after a fresh
+  health probe confirms the replacement process. Activating a seat with no
+  drain is an accepted no-op.
+
+Worker→gateway permit surface (same private listener, same header):
+
+| Path                                     | Body                                                        |
+| ---------------------------------------- | ----------------------------------------------------------- |
+| `/api/management/research-permits/acquire`   | `{ sessionId, workerGeneration, requestId? }`           |
+| `/api/management/research-permits/status`    | `{ requestId }`                                        |
+| `/api/management/research-permits/heartbeat` | `{ requestId, sessionId? }` (extends the session idle lease) |
+| `/api/management/research-permits/release`   | `{ requestId }`                                        |
+
+Workers reach the gateway's private listener via
+`TERMINAL_RUNTIME_MANAGEMENT_URL` (e.g. `http://fin-terminal-public-gateway:8789`,
+over the private seat networks) and `TERMINAL_RUNTIME_MANAGEMENT_TOKEN`. The
+worker exposes its own identity to the permit gate through
+`TERMINAL_RUNTIME_WORKER_GENERATION` (set at boot) and
+`TERMINAL_RUNTIME_SESSION_ID` (set on public WebSocket attach).
+
+Legacy aliases (`GET /api/management/seats`, `POST /api/management/seats/:id/drain`,
+`POST /api/management/seats/:id/activate`, `POST /api/management/reconcile`,
+`GET /api/management/research`) remain for existing tooling and return the same
+v1 shapes; the reconciler contract paths above are canonical.
+
+The canonical cross-repo contract (wire units, headers, cookie names, env vars,
+paths) is `unchained-infra/docs/financial-terminal-cross-repo-contract.md`.
+
+## Workspace Checkpoint / Handoff Contract
+
+Feature-gated by `FINANCIAL_WORKSPACE_CHECKPOINTS` (`1`/`true`/`yes`).
+Checkpoint content is always built from the assigned worker's authoritative
+state; the browser only sends an explicit opt-in.
+
+- Worker private export: `POST /internal/financial-workspace/checkpoint-export`
+  on the live worker (requires `X-Fin-Terminal-Control-Token`, plus the normal
+  `X-Fin-Terminal-Proxy-Token` route auth). Body `{ sessionId, generation }`;
+  the generation is a deterministic epoch derived from the opaque worker
+  generation. The gateway calls this only for the active assigned
+  session/generation.
+- Browser opt-in: `POST /api/public/workspace-handoff` on the public listener
+  (visitor + ticket tokens). The gateway exports from the worker, forwards to
+  the workspace service at `FINANCIAL_WORKSPACE_SERVICE_URL` (Bearer
+  `FINANCIAL_WORKSPACE_CONTROL_TOKEN`), and sets the handoff secret as an
+  HttpOnly cookie. The handoff secret never reaches browser JS.
+- The workspace service's create response is **canonical snake_case** with
+  `expires_at` in Unix epoch **seconds**
+  (`checkpoint_id`, `expires_at`, `handoff_id`, `handoff_secret`, `auth_url`).
+  The gateway strictly parses it (`parseCheckpointCreateResponse`), normalizes
+  `expires_at` to epoch ms, and uses ms for the cookie's Express `maxAge`. The
+  camelCase spelling is tolerated for rollout. A millisecond `expires_at` is
+  rejected.
+- The gateway only forwards the browser redirect target when `auth_url` is
+  HTTPS and starts with the exact configured
+  `FINANCIAL_WORKSPACE_AUTH_URL_PREFIX` (origin + path prefix); a missing
+  prefix or a mismatched URL fails the handoff closed. Handoff requests are
+  rate-limited per session and re-send a deterministic per-session idempotency
+  key so a gateway/service timeout ordering race cannot create duplicate
+  checkpoints.
+- Handoff secret cookie: `fin-terminal-handoff-secret`, host-only
+  (`HttpOnly; Secure; SameSite=Lax; Path=/`; optional `Domain` only via
+  `FINANCIAL_WORKSPACE_HANDOFF_COOKIE_DOMAIN`). The control plane reads it
+  server-side at claim initiation and rotates it away — never from JS, body,
+  or URL.
+- Private import boot: a fresh in-memory workspace boots from a validated
+  checkpoint (`SessionManager.inMemory` + custom entry + bounded continuation
+  seed). Raw transcript/process state is never restored. In the private
+  workspace runtime image (`TERMINAL_RUNTIME_MODE=private-workspace`), the
+  host-side provider provisions `FIN_WORKSPACE_CHECKPOINT_FILE` (default
+  `/data/checkpoint.json`) on the per-account volume for an imported workspace
+  boot; `TERMINAL_WORKSPACE_IMPORT_FILE` is the legacy alias. Both require
+  `FINANCIAL_WORKSPACE_CHECKPOINTS=1` and `NODE_ENV=production` fails closed on
+  a missing or bad file. The runtime additionally requires `MARKET_PROXY_TOKEN`,
+  `FIN_WORKSPACE_CONTROL_TOKEN`, `FIN_WORKSPACE_SESSION_ID`,
+  `TERMINAL_RUNTIME_WORKER_GENERATION`, an explicit model provider/model, and
+  `UNBROWSER_MCP_URL` (fail closed at boot).
+
+The canonical cross-repo contract (wire units, headers, cookie names, env vars,
+paths) is `unchained-infra/docs/financial-terminal-cross-repo-contract.md`.

@@ -1,4 +1,15 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import {
+  WorkspaceCheckpointBanner,
+} from "./WorkspaceCheckpointBanner";
+import {
+  createSessionAccumulator,
+  updateFrameActivity,
+  requestWorkspaceHandoff,
+  type SessionAccumulator,
+} from "./workspace-checkpoint";
+import type { TerminalFrameState } from "./mobile-controls";
+import type { TerminalDossier } from "./dossier";
 
 type AdmissionState = "queued" | "admitted" | "active" | "ended";
 
@@ -9,6 +20,8 @@ type Admission = {
   idleExpiresAt?: number;
   reason?: string;
   ticketToken?: string;
+  /** Authoritative research balance from the gateway, when known. */
+  researchRunsRemaining?: number;
 };
 
 type PublicConfig = {
@@ -18,6 +31,8 @@ type PublicConfig = {
   ticketTtlMs: number;
   maxSessionMs: number;
   maxResearchRuns: number;
+  /** Whether the server advertises workspace handoff capability. */
+  workspaceHandoffAvailable?: boolean;
 };
 
 type TurnstileApi = {
@@ -102,7 +117,7 @@ async function readJson<T>(response: Response): Promise<T | undefined> {
 function endMessage(reason?: string): string {
   switch (reason) {
     case "daily-budget-exhausted":
-      return "Today’s public research capacity is allocated. Please return after the daily reset.";
+      return "Today's public research capacity is allocated. Please return after the daily reset.";
     case "idle-timeout":
       return "Your session ended after five minutes without terminal activity.";
     case "absolute-timeout":
@@ -119,13 +134,18 @@ function endMessage(reason?: string): string {
 }
 
 /**
- * Turnstile-gated public entrypoint. The real terminal is not mounted until
- * the gateway signs a ticket and assigns an isolated live Pi worker.
+ * Turnstile-gated public entrypoint with checkpoint/workspace conversion.
+ * The real terminal is not mounted until the gateway signs a ticket and
+ * assigns an isolated live Pi worker.
  */
 export function PublicLiveApp({
   renderTerminal,
 }: {
-  renderTerminal: (onSessionEnd: () => void, sessionProtocol: string) => ReactNode;
+  renderTerminal: (
+    onSessionEnd: () => void,
+    sessionProtocol: string,
+    onFrameUpdate?: (state: TerminalFrameState | undefined, dossier?: TerminalDossier) => void,
+  ) => ReactNode;
 }) {
   const [config, setConfig] = useState<PublicConfig>();
   const [admission, setAdmission] = useState<Admission>();
@@ -134,6 +154,20 @@ export function PublicLiveApp({
   const [joining, setJoining] = useState(false);
   const captchaRef = useRef<HTMLDivElement>(null);
   const widgetIdRef = useRef<string>();
+
+  // ── Checkpoint accumulator ────────────────────────────────────────────
+  const accumulatorRef = useRef<SessionAccumulator>(createSessionAccumulator());
+  const [hasMeaningfulActivity, setHasMeaningfulActivity] = useState(false);
+
+  const handleFrameUpdate = useCallback(
+    (state: TerminalFrameState | undefined, _dossier?: TerminalDossier) => {
+      const acc = accumulatorRef.current;
+      // Local display gating only — checkpoint content is never built here.
+      updateFrameActivity(acc, state);
+      if (acc.hasMeaningfulActivity) setHasMeaningfulActivity(true);
+    },
+    [],
+  );
 
   const checkExistingTicket = useCallback(async () => {
     const response = await fetch(apiPath("/api/public/admission/status"), {
@@ -261,20 +295,61 @@ export function PublicLiveApp({
     setAdmission(undefined);
     setChallengeToken(undefined);
     setError(undefined);
+    accumulatorRef.current = createSessionAccumulator();
+    setHasMeaningfulActivity(false);
     widgetIdRef.current && window.turnstile?.reset(widgetIdRef.current);
   };
 
+  // ── Checkpoint conversion handler ──────────────────────────────────────
+  // The browser only initiates the opt-in; the gateway exports the
+  // authoritative checkpoint from the assigned worker and sets the HttpOnly
+  // handoff cookie. Returns true only after the handoff was durably created.
+  const handleConvertToWorkspace = useCallback(async (): Promise<boolean> => {
+    const result = await requestWorkspaceHandoff(publicHeaders(true));
+    if (result.success) {
+      // The handoff secret is delivered via HttpOnly cookie server-side.
+      // Redirect to the auth URL for workspace handoff.
+      window.location.href = result.result.authUrl;
+      return true;
+    }
+    console.error("[checkpoint] handoff failed:", result.error);
+    return false;
+  }, []);
+
   const ticketToken = admission?.ticketToken ?? storedToken(TICKET_STORAGE_KEY);
   if ((admission?.status === "admitted" || admission?.status === "active") && ticketToken) {
+    const sessionExpiresAt = admission.sessionExpiresAt ?? (Date.now() + (config?.maxSessionMs ?? 900_000));
+    const maxResearchRuns = config?.maxResearchRuns ?? 5;
+    // Only render the remaining-runs count when the gateway supplies the
+    // authoritative balance; never fabricate a full-balance approximation.
+    const researchRunsRemaining = admission.researchRunsRemaining;
+    const workspaceHandoffAvailable = config?.workspaceHandoffAvailable === true;
+
     return (
       <>
-        {renderTerminal(() => {
-          storeToken(TICKET_STORAGE_KEY, undefined);
-          setAdmission({ status: "ended", reason: "session-ended" });
-        }, `fin-terminal-session.${ticketToken}`)}
+        {renderTerminal(
+          () => {
+            storeToken(TICKET_STORAGE_KEY, undefined);
+            setAdmission({ status: "ended", reason: "session-ended" });
+          },
+          `fin-terminal-session.${ticketToken}`,
+          handleFrameUpdate,
+        )}
         <div className="public-session-banner" role="status">
-          PUBLIC LIVE SESSION · UP TO {config?.maxResearchRuns ?? 5} RESEARCH RUNS · 15 MIN MAX
+          PUBLIC LIVE SESSION · UP TO {maxResearchRuns} RESEARCH RUNS · 15 MIN MAX
         </div>
+        {admission?.status === "active" && (
+          <WorkspaceCheckpointBanner
+            sessionExpiresAt={sessionExpiresAt}
+            researchRunsRemaining={researchRunsRemaining}
+            maxResearchRuns={maxResearchRuns}
+            hasMeaningfulActivity={hasMeaningfulActivity}
+            workspaceHandoffAvailable={workspaceHandoffAvailable}
+            endReason={admission?.reason}
+            onConvertToWorkspace={handleConvertToWorkspace}
+            onNewSession={reset}
+          />
+        )}
       </>
     );
   }

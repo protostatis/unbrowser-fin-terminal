@@ -25,6 +25,24 @@ import { PublicSessionPersistence } from "./public-session-persistence.js";
 import { createOpaqueId, signOpaqueId, verifyOpaqueId } from "./public-session-tokens.js";
 import { matchesProxyToken } from "./proxy-auth.js";
 import { isActiveResearchFramePayload } from "./research-activity.js";
+import { createWorkspaceHandoffController } from "./workspace-checkpoint-control.js";
+import {
+  isWorkspaceCheckpointEnabled,
+  workspaceServiceUrl,
+} from "../shared/financial-workspace-checkpoint.js";
+import { CapacityWarmPool } from "./capacity-warm-pool.js";
+import {
+  ResearchPermitCoordinator,
+  RESEARCH_PERMIT_ACQUIRE_TTL_MS,
+  type ResearchPermit,
+  type ResearchPermitState,
+} from "./research-permit-coordinator.js";
+import {
+  startManagementApi,
+  resolveManagementApiConfig,
+  type ManagementApi,
+} from "./private-management-api.js";
+import { isRuntimeFeatureEnabled } from "./runtime-mode.js";
 
 const VISITOR_TOKEN_HEADER = "x-public-visitor-token";
 const TICKET_TOKEN_HEADER = "x-public-ticket-token";
@@ -45,6 +63,12 @@ const SESSION_ENDED_CLOSE_CODE = 4408;
 const WORKER_UNAVAILABLE_CLOSE_CODE = 4410;
 const WORKER_HEALTH_INTERVAL_MS = 2_000;
 const WORKER_HEALTH_TIMEOUT_MS = 1_500;
+const WARM_POOL_SCALE_DOWN_MS = 5 * 60_000; // 5 minutes idle before scale-down
+const WARM_POOL_WARM_SPARES = 1; // keep one ready-idle spare
+const RESEARCH_PERMIT_MAX_CONCURRENT = 2;
+const RESEARCH_PERMIT_MAX_QUEUE = 24;
+const RESEARCH_PERMIT_QUEUE_TTL_MS = 30 * 60_000; // 30 minutes in queue
+const RESEARCH_PERMIT_HEARTBEAT_MS = 30_000; // 30 seconds
 
 type TurnstileVerification = { success?: unknown; hostname?: unknown; action?: unknown };
 
@@ -409,12 +433,62 @@ export async function startPublicLiveGateway(): Promise<PublicLiveGateway> {
     const restored = await persistence.load();
     if (restored) coordinator.restore(restored);
 
+    // ── Warm-pool capacity planner ──────────────────────────────────────
+    const warmPool = new CapacityWarmPool({
+      totalSeats: config.workerEndpoints.length,
+      idleScaleDownMs: WARM_POOL_SCALE_DOWN_MS,
+      warmSpares: WARM_POOL_WARM_SPARES,
+    });
+    const capacityRestored = await persistence.loadCapacityState();
+    if (capacityRestored) warmPool.restore(capacityRestored);
+
+    // A drain accepted by a previous gateway process must stay enforced after
+    // a restart even if only one half of the persisted state survived (or the
+    // state predates the coordinator ineligibility fence). Every warm-pool
+    // drain re-fences its seat in the coordinator before the first health
+    // probe could re-enable it. The gateway persists capacity before the
+    // coordinator state so a partial write always leaves the warm-pool drain
+    // present for this reconciliation to rediscover.
+    for (const seat of coordinator.getSeatStatuses()) {
+      if (warmPool.isDraining(seat.workerId)) {
+        coordinator.setWorkerDrainIneligible(seat.workerId, true);
+      }
+    }
+
+    // ── Research permit coordinator ─────────────────────────────────────
+    const researchPermits = new ResearchPermitCoordinator({
+      maxConcurrent: RESEARCH_PERMIT_MAX_CONCURRENT,
+      maxQueue: RESEARCH_PERMIT_MAX_QUEUE,
+      defaultQueueTtlMs: RESEARCH_PERMIT_QUEUE_TTL_MS,
+      heartbeatIntervalMs: RESEARCH_PERMIT_HEARTBEAT_MS,
+      acquireTtlMs: RESEARCH_PERMIT_ACQUIRE_TTL_MS,
+    });
+    const permitRestored = await persistence.loadResearchPermitState();
+    if (permitRestored) researchPermits.restore(permitRestored);
+
+    // Companion Redis keys (warm-pool drains, research permits) are only
+    // written when the runtime feature is actually enabled. When it is off,
+    // the coordinator still runs them in memory but there is no operator or
+    // worker surface that could produce durable state, so the extra writes
+    // (and their lease renewals) are skipped.
+    const runtimeFeaturesEnabled = isRuntimeFeatureEnabled(process.env);
+
     let mutations = Promise.resolve();
     let fatal: ((error: unknown) => void) | undefined;
     const mutate = <T>(operation: () => T | Promise<T>): Promise<T> => {
       const result = mutations.then(async () => {
         const value = await operation();
+        if (runtimeFeaturesEnabled) {
+          // Persist capacity FIRST: if the coordinator write fails after this
+          // point the gateway exits and the restarted gateway re-fences every
+          // warm-pool drain against the coordinator, so a drain can never be
+          // lost between the two Redis keys.
+          await persistence.saveCapacityState(warmPool.exportState());
+        }
         await persistence.save(coordinator.exportState());
+        if (runtimeFeaturesEnabled) {
+          await persistence.saveResearchPermitState(researchPermits.exportState());
+        }
         return value;
       });
       mutations = result.then(() => undefined, (error) => {
@@ -479,7 +553,28 @@ export async function startPublicLiveGateway(): Promise<PublicLiveGateway> {
     });
     app.get("/api/ready", async (_request, response) => {
       try {
-        const metrics = await inspect(() => coordinator.metrics());
+        const metrics = await inspect(() => {
+          const coordinatorMetrics = coordinator.metrics();
+          const seatStatuses = coordinator.getSeatStatuses();
+          const drainMap = new Map<string, boolean>();
+          for (const seat of seatStatuses) {
+            drainMap.set(seat.workerId, warmPool.isDraining(seat.workerId));
+          }
+          const seatsWithDrain = seatStatuses.map((s) => ({
+            ...s,
+            drainRequested: drainMap.get(s.workerId) ?? false,
+          }));
+          const plan = warmPool.plan(seatsWithDrain);
+          const permitMetrics = researchPermits.metrics();
+          return {
+            ...coordinatorMetrics,
+            desiredRunning: plan.desiredRunning,
+            totalSeats: config.workerEndpoints.length,
+            scaleDownCandidates: plan.scaleDownCandidates,
+            researchPermitsAcquired: permitMetrics.acquired,
+            researchPermitsQueued: permitMetrics.queued,
+          };
+        });
         response.json({ status: "ready", publicLive: true, ...metrics });
       } catch {
         response.status(503).json({ status: "unavailable" });
@@ -487,6 +582,8 @@ export async function startPublicLiveGateway(): Promise<PublicLiveGateway> {
     });
     app.get("/api/public/config", (request, response) => {
       const visitorId = identityFor(request, true);
+      const checkpointEnabled = isWorkspaceCheckpointEnabled()
+        && Boolean(workspaceServiceUrl());
       response.json({
         visitorToken: signOpaqueId(visitorId!, config.signingKey),
         turnstileSiteKey: config.turnstileSiteKey,
@@ -494,6 +591,7 @@ export async function startPublicLiveGateway(): Promise<PublicLiveGateway> {
         ticketTtlMs: config.ticketTtlMs,
         maxSessionMs: config.absoluteTimeoutMs,
         maxResearchRuns: config.maxResearchRuns,
+        workspaceHandoffAvailable: checkpointEnabled,
       });
     });
     app.post("/api/public/admission", async (request, response) => {
@@ -552,6 +650,31 @@ export async function startPublicLiveGateway(): Promise<PublicLiveGateway> {
         response.status(503).json({ error: "admission_unavailable" });
       }
     });
+
+    // ── Workspace handoff (browser opt-in → worker export → control) ─────
+    // The browser only initiates opt-in; checkpoint content is always built
+    // from the assigned worker's authoritative state, never from the browser.
+    const workspaceHandoff = createWorkspaceHandoffController({
+      ticketFromRequest: (request) => {
+        const visitorId = verifyOpaqueId(singleHeader(request as IncomingMessage, VISITOR_TOKEN_HEADER), config.signingKey);
+        const ticketId = verifyOpaqueId(singleHeader(request as IncomingMessage, TICKET_TOKEN_HEADER), config.signingKey);
+        return visitorId && ticketId ? { visitorId, ticketId } : undefined;
+      },
+      activeAssignmentFor: (ticketId, visitorId) => {
+        const session = coordinator.status(ticketId);
+        if (!session || session.visitorId !== visitorId || session.state !== "active") return undefined;
+        const assigned = coordinator.getAssignedWorker(ticketId);
+        if (!assigned) return undefined;
+        const endpoint = workerById.get(assigned.workerId);
+        if (!endpoint) return undefined;
+        return {
+          workerId: assigned.workerId,
+          workerUrl: endpoint.url,
+          workerGeneration: assigned.workerGeneration,
+        };
+      },
+    });
+    app.post("/api/public/workspace-handoff", workspaceHandoff);
 
     const __filename = fileURLToPath(import.meta.url);
     const cwd = path.resolve(process.env.MARKET_ROOT?.trim() || path.resolve(path.dirname(__filename), ".."));
@@ -953,6 +1076,34 @@ export async function startPublicLiveGateway(): Promise<PublicLiveGateway> {
           for (const { id, generation, probeEpoch } of results) {
             coordinator.setWorkerReady(id, Boolean(generation), generation, probeEpoch);
           }
+          // Run warm-pool planning: compute desired state and log scale-down/activate.
+          researchPermits.sweep();
+          const seatStatuses = coordinator.getSeatStatuses();
+          const drainMap = new Map<string, boolean>();
+          for (const seat of seatStatuses) {
+            drainMap.set(seat.workerId, warmPool.isDraining(seat.workerId));
+          }
+          const seatsWithDrain = seatStatuses.map((s) => ({
+            ...s,
+            drainRequested: drainMap.get(s.workerId) ?? false,
+            drainId: warmPool.getDrain(s.workerId)?.drainId,
+            drainGeneration: warmPool.getDrain(s.workerId)?.generation,
+            drainSinceMs: warmPool.getDrain(s.workerId)
+              ? Date.now() - (warmPool.getDrain(s.workerId)?.requestedAt ?? Date.now())
+              : undefined,
+          }));
+          const plan = warmPool.plan(seatsWithDrain);
+          if (plan.scaleDownCandidates.length > 0) {
+            console.log("[warm-pool] scale-down candidates:", plan.scaleDownCandidates.join(", "));
+          }
+          if (plan.activateCandidates.length > 0) {
+            console.log("[warm-pool] activate candidates:", plan.activateCandidates.join(", "));
+          }
+          console.log(
+            `[warm-pool] desired running=${plan.desiredRunning}, ` +
+            `current=${seatsWithDrain.filter((s) =>
+              s.phase !== "absent" && !s.drainRequested).length}`,
+          );
         });
       } finally {
         maintenanceRunning = false;
@@ -961,6 +1112,7 @@ export async function startPublicLiveGateway(): Promise<PublicLiveGateway> {
     let timer: ReturnType<typeof setInterval> | undefined;
     let closing = false;
     let signalHandler: (() => void) | undefined;
+    let managementApi: ManagementApi | undefined;
     const close = async () => {
       if (closing) return;
       closing = true;
@@ -971,6 +1123,7 @@ export async function startPublicLiveGateway(): Promise<PublicLiveGateway> {
       if (timer) clearInterval(timer);
       for (const bridge of bridges.values()) closeBridge(bridge, 1012, "Public gateway shutting down");
       browserWss.close();
+      if (managementApi) await managementApi.close();
       if (server.listening) {
         await new Promise<void>((resolve) => server.close(() => resolve()));
       }
@@ -996,6 +1149,46 @@ export async function startPublicLiveGateway(): Promise<PublicLiveGateway> {
     server.on("error", fatal);
     timer = setInterval(() => void maintenance().catch((error) => fatal?.(error)), WORKER_HEALTH_INTERVAL_MS);
     timer.unref();
+
+    // ── Private management API ───────────────────────────────────────────
+    // Feature-gated via TERMINAL_RUNTIME_FEATURE_ENABLED (boolean spellings
+    // 1|true|yes|on); the token must be explicit and strong. This listener is
+    // private-only (separate port, dedicated TERMINAL_RUNTIME_MANAGEMENT_HOST,
+    // default 0.0.0.0 which is safe only because no host port is published
+    // and Caddy never routes to it). A bind failure rejects gateway startup:
+    // the feature is required, so we fail closed rather than run without it.
+    const managementConfig = resolveManagementApiConfig(process.env);
+    if (managementConfig) {
+      managementApi = await startManagementApi(
+        managementConfig,
+        {
+          getSeatStatuses: () => {
+            const seatStatuses = coordinator.getSeatStatuses();
+            const drainMap = new Map<string, boolean>();
+            for (const seat of seatStatuses) {
+              drainMap.set(seat.workerId, warmPool.isDraining(seat.workerId));
+            }
+            return seatStatuses.map((s) => ({
+              ...s,
+              drainRequested: drainMap.get(s.workerId) ?? false,
+              drainId: warmPool.getDrain(s.workerId)?.drainId,
+              drainGeneration: warmPool.getDrain(s.workerId)?.generation,
+              drainSinceMs: warmPool.getDrain(s.workerId)
+                ? Date.now() - (warmPool.getDrain(s.workerId)?.requestedAt ?? Date.now())
+                : undefined,
+            }));
+          },
+          getWarmPool: () => warmPool,
+          getResearchCoordinator: () => researchPermits,
+          getQueueCount: () => coordinator.metrics().queuedVisitors,
+          touchSession: (sessionId) => coordinator.touch(sessionId),
+          setWorkerDrainIneligible: (workerId, ineligible) =>
+            coordinator.setWorkerDrainIneligible(workerId, ineligible),
+          mutate,
+          inspect,
+        },
+      );
+    }
     signalHandler = () => void close();
     process.once("SIGINT", signalHandler);
     process.once("SIGTERM", signalHandler);
@@ -1017,6 +1210,9 @@ function publicStatus(session: PublicSessionSnapshot): Record<string, unknown> {
     ...(session.queuePosition ? { queuePosition: session.queuePosition } : {}),
     ...(session.sessionExpiresAt ? { sessionExpiresAt: session.sessionExpiresAt } : {}),
     ...(session.idleExpiresAt ? { idleExpiresAt: session.idleExpiresAt } : {}),
+    // Authoritative per-session research balance from the coordinator; the UI
+    // renders it when present and never fabricates a full-balance count.
+    researchRunsRemaining: session.researchRunsRemaining,
     ...(session.endReason ? { reason: session.endReason } : {}),
   };
 }
