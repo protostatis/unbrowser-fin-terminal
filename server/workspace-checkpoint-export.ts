@@ -12,6 +12,10 @@ import {
   validateCheckpoint,
   serializeCheckpoint,
   buildContinuationSummary,
+  sanitizeCheckpoint,
+  CHECKPOINT_MAX_EVENTS,
+  CHECKPOINT_MAX_PACKETS_PER_CANVAS,
+  CHECKPOINT_MAX_WATCHLIST,
   type CheckpointEvent,
   type CheckpointCanvas,
   type CheckpointPacket,
@@ -84,6 +88,17 @@ export function createServerCheckpointEventLog(): ServerCheckpointEventLog {
 }
 
 /**
+ * Clear a server-observed event log so no session's events bleed into the next
+ * public principal/session boundary. Keeps the same object identity so the
+ * worker's export closure keeps observing the (now empty) authoritative log.
+ */
+export function resetServerCheckpointEventLog(log: ServerCheckpointEventLog): void {
+  log.events.length = 0;
+  log.researchRunCount = 0;
+  log.hasMeaningfulActivity = false;
+}
+
+/**
  * Record a semantic event observed by the worker server (from a validated
  * terminal message, not from the browser's rendering of it).
  */
@@ -93,7 +108,7 @@ export function recordServerCheckpointEvent(
   data: Record<string, unknown>,
   now: number = Date.now(),
 ): void {
-  if (log.events.length >= 1_000) return;
+  if (log.events.length >= CHECKPOINT_MAX_EVENTS) return;
   log.events.push({ at: now, type, data });
   if (type === "prompt" || type === "command" || type === "navigate" || type === "research-start") {
     log.hasMeaningfulActivity = true;
@@ -146,7 +161,7 @@ function normalizeDossier(state: CheckpointWorkerState): CheckpointCanvas[] {
       extractedAt: Number.isFinite(raw.extractedAt) ? raw.extractedAt! : Date.now(),
     };
     packets.push(packet);
-    if (packets.length >= 200) break;
+    if (packets.length >= CHECKPOINT_MAX_PACKETS_PER_CANVAS) break;
   }
   const id = bounded(dossier.title, 128, true) ?? `canvas-${Date.now().toString(36)}`;
   const canvas: CheckpointCanvas = {
@@ -156,7 +171,7 @@ function normalizeDossier(state: CheckpointWorkerState): CheckpointCanvas[] {
     stage: dossier.stage && CANVAS_STAGES.has(dossier.stage) ? dossier.stage as "partial" | "complete" : "partial",
     ...(bounded(dossier.summary, 8192, true) ? { summary: dossier.summary! } : {}),
     ...(Array.isArray(dossier.summarySourceIds)
-      ? { summarySourceIds: dossier.summarySourceIds.slice(0, 200) }
+      ? { summarySourceIds: dossier.summarySourceIds.slice(0, CHECKPOINT_MAX_PACKETS_PER_CANVAS) }
       : {}),
     evidenceStatus: dossier.evidenceStatus && EVIDENCE_STATUS_KEYS.has(dossier.evidenceStatus)
       ? dossier.evidenceStatus as CheckpointCanvas["evidenceStatus"]
@@ -178,7 +193,7 @@ function normalizeContext(state: CheckpointWorkerState): CheckpointContext {
   if (Array.isArray(state.available) && state.available.length > 0) {
     const watchlist = state.available
       .filter((s): s is string => typeof s === "string" && s.length > 0 && s.length <= 32)
-      .slice(0, 500);
+      .slice(0, CHECKPOINT_MAX_WATCHLIST);
     if (watchlist.length > 0) context.watchlist = watchlist;
   }
   return context;
@@ -206,6 +221,11 @@ function normalizeInterruptedWork(state: CheckpointWorkerState): CheckpointInter
 /**
  * Build a validated, serialized checkpoint from authoritative worker state.
  * Throws when the assembled checkpoint fails the shared codec validation.
+ *
+ * Field-level sanitization runs before validation: any packet/event/context
+ * field carrying a probable secret is dropped so one tainted excerpt cannot
+ * block a legitimate export, while identity fields (id/sessionId) and any
+ * residue that survives sanitization are still hard-rejected by the codec.
  */
 export function buildAuthoritativeCheckpoint(
   options: BuildAuthoritativeCheckpointOptions,
@@ -227,15 +247,17 @@ export function buildAuthoritativeCheckpoint(
     createdAt: now,
     // 1-hour unclaimed handoff retention.
     expiresAt: now + 60 * 60 * 1000,
-    eventLog: options.eventLog.events.slice(0, 1_000),
+    eventLog: options.eventLog.events.slice(0, CHECKPOINT_MAX_EVENTS),
     context,
     canvases,
     ...(interruptedWork ? { interruptedWork } : {}),
     continuationSummary: "",
   };
-  checkpoint.continuationSummary = buildContinuationSummary(checkpoint);
 
-  const validation = validateCheckpoint(checkpoint);
+  const sanitized = sanitizeCheckpoint(checkpoint);
+  sanitized.continuationSummary = buildContinuationSummary(sanitized);
+
+  const validation = validateCheckpoint(sanitized);
   if (!validation.valid) {
     throw new Error(`authoritative checkpoint failed validation: ${validation.reason}`);
   }

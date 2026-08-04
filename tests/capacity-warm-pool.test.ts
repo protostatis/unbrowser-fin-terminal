@@ -274,6 +274,30 @@ test("activate candidates suggest releasing drains with new generations", () => 
   assert.ok(plan.activateCandidates.includes("s3"));
 });
 
+test("never returns an activate candidate whose sticky-generation activation would reject it", () => {
+  const pool = createPool(6);
+  pool.requestDrain(
+    { workerId: "s3", phase: "ready-idle", generation: "g-same", drainRequested: false, idleSinceMs: 400_000 },
+    "drain-same",
+  );
+
+  // The seat is draining with an UNCHANGED generation. The activate endpoint
+  // would reject this as "drain sticky; generation unchanged", so the plan
+  // must not propose it — even when the plan is short of desired capacity.
+  const s = seats([
+    { workerId: "s1", phase: "active", generation: "g1", idleSinceMs: 1000 },
+    { workerId: "s2", phase: "active", generation: "g2", idleSinceMs: 1000 },
+    { workerId: "s3", phase: "ready-idle", generation: "g-same", drainRequested: true, drainId: "drain-same" },
+    { workerId: "s4", phase: "absent" },
+    { workerId: "s5", phase: "absent" },
+    { workerId: "s6", phase: "absent" },
+  ]);
+
+  const plan = pool.plan(s);
+  assert.ok(!plan.activateCandidates.includes("s3"), "same-generation draining seat must not be an activate candidate");
+  assert.equal(plan.activateCandidates.length, 0);
+});
+
 test("one warm spare: desired = protected + absent + 1", () => {
   const pool = createPool(6);
   // 2 assigned + 1 warm spare from absent

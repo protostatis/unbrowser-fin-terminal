@@ -9,7 +9,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   ResearchPermitCoordinator,
+  RESEARCH_PERMIT_ACQUIRE_TTL_MS,
 } from "../server/research-permit-coordinator.js";
+import {
+  RESEARCH_WORKER_MAX_DEADLINE_MS,
+  RESEARCH_WORKER_TERMINAL_GRACE_MS,
+} from "../server/research-worker-coordinator.js";
 
 function createCoordinator(overrides: Partial<ConstructorParameters<typeof ResearchPermitCoordinator>[0]> = {}) {
   let now = 1_700_000_000_000;
@@ -283,6 +288,47 @@ test("invalid research-permit state version throws on restore", () => {
   assert.throws(() => {
     coordinator.restore({ version: 2 as unknown as 1, permits: [] });
   }, /unsupported research-permit state version/);
+});
+
+test("acquire TTL is greater than the maximum child deadline plus cleanup grace", () => {
+  // The permit is held for the whole lifetime of a research child: the
+  // parent-enforced deadline plus the post-terminal cleanup grace. If the TTL
+  // were <= that sum, a permit could be swept — and regranted to a queued job —
+  // while its child is still running, breaking the global concurrency cap.
+  assert.ok(
+    RESEARCH_PERMIT_ACQUIRE_TTL_MS
+      > RESEARCH_WORKER_MAX_DEADLINE_MS + RESEARCH_WORKER_TERMINAL_GRACE_MS,
+    "acquire TTL must exceed the max child deadline + cleanup grace",
+  );
+});
+
+test("an acquired permit is never regranted before the child deadline + grace has elapsed", () => {
+  const { coordinator, advance } = createCoordinator({
+    acquireTtlMs: RESEARCH_PERMIT_ACQUIRE_TTL_MS,
+  });
+
+  coordinator.acquire("s1", "g1", "r1");
+  coordinator.acquire("s2", "g2", "r2");
+  const queued = coordinator.acquire("s3", "g3", "r3");
+  assert.equal(queued.status, "queued");
+  assert.equal(coordinator.metrics().acquired, 2);
+
+  // Advance just past the maximum child lifetime: a correct acquire TTL still
+  // holds both permits, so the queued job cannot be granted while the children
+  // are still running.
+  advance(RESEARCH_WORKER_MAX_DEADLINE_MS + RESEARCH_WORKER_TERMINAL_GRACE_MS + 1_000);
+  coordinator.sweep();
+  assert.equal(coordinator.metrics().acquired, 2);
+  assert.equal(coordinator.status("r1")?.status, "acquired");
+  assert.equal(coordinator.status("r2")?.status, "acquired");
+  assert.equal(coordinator.status("r3")?.status, "queued");
+
+  // Only after the full TTL does the coordinator reclaim a held slot.
+  const elapsed = RESEARCH_WORKER_MAX_DEADLINE_MS + RESEARCH_WORKER_TERMINAL_GRACE_MS + 1_000;
+  advance(RESEARCH_PERMIT_ACQUIRE_TTL_MS - elapsed + 1_000);
+  coordinator.sweep();
+  assert.equal(coordinator.metrics().acquired, 1);
+  assert.equal(coordinator.status("r3")?.status, "acquired");
 });
 
 test("idempotent acquire returns queue position for queued", () => {

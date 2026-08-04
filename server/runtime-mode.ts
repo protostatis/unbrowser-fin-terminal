@@ -21,6 +21,16 @@ const VALID_REPLAY = new Set(["1", "true"]);
 const VALID_LIVE = new Set(["0", "false"]);
 const VALID_VALUES = new Set([...VALID_REPLAY, ...VALID_LIVE]);
 
+/**
+ * Resolve the `TERMINAL_RUNTIME_FEATURE_ENABLED` master flag. Compose
+ * interpolation can render a boolean as `1`, `true`, `yes`, or `on` (in any
+ * case), so the gateway and the worker permit client must agree on all four
+ * spellings. Anything else — including an empty/unset value — is disabled.
+ */
+export function isRuntimeFeatureEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return /^(?:1|true|yes|on)$/i.test((env.TERMINAL_RUNTIME_FEATURE_ENABLED ?? "").trim());
+}
+
 export function resolveRuntimeMode(
   env: NodeJS.ProcessEnv = process.env,
 ): RuntimeMode {

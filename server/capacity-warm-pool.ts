@@ -161,28 +161,17 @@ export class CapacityWarmPool {
       }
     }
 
-    // Activate candidates: seats that are draining but whose generation
-    // has changed (operator may have replaced the process).
+    // Activate candidates: seats that are draining whose process generation
+    // has changed since the drain was requested (the operator replaced the
+    // container). This is the ONLY activate source: a same-generation
+    // draining seat would be rejected by the sticky-generation activation
+    // endpoint, so returning it as an activate candidate would make the plan
+    // and the activation contract disagree.
     const activateCandidates: string[] = [];
     for (const seat of drainingSeats) {
       if (seat.drainRequested && seat.drainId) {
         const drain = this.drains.get(seat.workerId);
         if (drain && seat.generation && seat.generation !== drain.generation) {
-          // Generation has changed since drain — activate.
-          activateCandidates.push(seat.workerId);
-        }
-      }
-    }
-
-    // Also activate any draining seat that has a newer assignment.
-    // Actually, drain is sticky until explicit activation, but if the
-    // coordinator needs the capacity and the process was replaced, it
-    // can be activated.
-    if (currentRunning < desiredRunning) {
-      const need = desiredRunning - currentRunning;
-      for (const seat of drainingSeats) {
-        if (activateCandidates.length >= need) break;
-        if (!activateCandidates.includes(seat.workerId)) {
           activateCandidates.push(seat.workerId);
         }
       }

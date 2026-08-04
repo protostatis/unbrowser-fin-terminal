@@ -366,6 +366,65 @@ test("rejects continuation summary containing API key pattern", () => {
   if (!result.valid) assert.ok(result.reason.includes("prohibited"));
 });
 
+test("benign prose mentioning password/credential keywords still exports", () => {
+  // Bare keyword mentions are NOT probable secrets: a user prompt asking about
+  // a password reset policy or an excerpt discussing credential requirements
+  // must survive the canary gate.
+  const benignPrompts = [
+    "What is my broker password reset policy?",
+    "Check the account credential requirements on the help page",
+    "The company's password manager rollout was announced",
+    "Does the portal require a password for a second user?",
+  ];
+  for (const text of benignPrompts) {
+    const checkpoint = validCheckpoint({
+      eventLog: [{ at: Date.now(), type: "prompt", data: { text } }],
+      continuationSummary: `Continue from a saved checkpoint: ${text}`,
+    });
+    const result = validateCheckpoint(checkpoint);
+    assert.equal(result.valid, true, `benign mention must export: "${text}"`);
+  }
+
+  const benignExcerpt = validCheckpoint({
+    canvases: [
+      {
+        id: "canvas-benign",
+        intent: "brief",
+        stage: "partial",
+        evidenceStatus: "partial",
+        packets: [
+          {
+            sourceId: "src-01",
+            sourceTitle: "Security guidance reference",
+            sourceDomain: "example.com",
+            excerpt: "The portal enforces a password reset after ninety days.",
+            retrievalStatus: "fetched",
+            extractedAt: Date.now(),
+          },
+        ],
+      },
+    ],
+  });
+  const result = validateCheckpoint(benignExcerpt);
+  assert.equal(result.valid, true, "benign excerpt mentioning password must export");
+});
+
+test("rejects a probable secret assignment even with the word in context", () => {
+  const checkpoint = validCheckpoint({
+    continuationSummary: "Continue: the password=correct-horse-battery is saved",
+  });
+  const result = validateCheckpoint(checkpoint);
+  assert.equal(result.valid, false);
+});
+
+test("rejects a natural-language secret assignment (my password is …)", () => {
+  const checkpoint = validCheckpoint({
+    continuationSummary: "My password is correcthorsebatterystaple for the vault",
+  });
+  const result = validateCheckpoint(checkpoint);
+  assert.equal(result.valid, false);
+});
+
 test("rejects event data containing bearer token", () => {
   const checkpoint = validCheckpoint({
     eventLog: [

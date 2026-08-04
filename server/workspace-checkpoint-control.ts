@@ -32,6 +32,8 @@ import { workerGenerationEpoch } from "./workspace-checkpoint-export.js";
 export const HANDOFF_COOKIE_NAME = HANDOFF_SECRET_COOKIE_NAME;
 const WORKER_PROXY_TOKEN_HEADER = "x-fin-terminal-proxy-token";
 const INTERNAL_SERVICE_TIMEOUT_MS = 10_000;
+const DEFAULT_HANDOFF_RATE_LIMIT = 5;
+const DEFAULT_HANDOFF_RATE_WINDOW_MS = 60_000;
 
 export interface WorkspaceHandoffAssignment {
   workerId: string;
@@ -48,6 +50,11 @@ export interface WorkspaceHandoffControllerOptions {
     ticketId: string,
     visitorId: string,
   ) => WorkspaceHandoffAssignment | undefined;
+  /** Max handoff requests per session per window (default 5 / 60 s). */
+  handoffRateLimit?: number;
+  handoffRateWindowMs?: number;
+  /** Injectable clock for deterministic rate-limit tests. */
+  now?: () => number;
   fetchImpl?: typeof fetch;
 }
 
@@ -61,11 +68,73 @@ function boundedString(value: unknown, maximum: number): string | undefined {
     : undefined;
 }
 
+/** Fixed-window rate limit keyed by session id (per-session, in-memory). */
+class PerSessionHandoffLimiter {
+  private readonly entries = new Map<string, { count: number; resetAt: number }>();
+  private readonly now: () => number;
+
+  constructor(
+    private readonly limit: number,
+    private readonly windowMs: number,
+    now: () => number = Date.now,
+  ) {
+    this.now = now;
+  }
+
+  take(key: string): boolean {
+    const now = this.now();
+    this.prune(now);
+    const entry = this.entries.get(key);
+    if (!entry || now >= entry.resetAt) {
+      this.entries.set(key, { count: 1, resetAt: now + this.windowMs });
+      return true;
+    }
+    if (entry.count >= this.limit) return false;
+    entry.count += 1;
+    return true;
+  }
+
+  private prune(now: number): void {
+    for (const [key, entry] of this.entries) {
+      if (now >= entry.resetAt) this.entries.delete(key);
+    }
+  }
+}
+
+/**
+ * The browser is redirected to `authUrl` after a successful handoff, so it
+ * must be an HTTPS URL on exactly the configured public origin/path prefix —
+ * never a scheme-relative, http, or foreign host the workspace service could
+ * be coerced into issuing.
+ */
+function isAllowedAuthUrl(authUrl: string, prefix: string): boolean {
+  if (!authUrl.startsWith(prefix)) return false;
+  let parsed: URL;
+  try {
+    parsed = new URL(authUrl);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== "https:") return false;
+  let prefixParsed: URL;
+  try {
+    prefixParsed = new URL(prefix);
+  } catch {
+    return false;
+  }
+  return parsed.origin === prefixParsed.origin;
+}
+
 export function createWorkspaceHandoffController(
   options: WorkspaceHandoffControllerOptions,
 ) {
   const env = options.env ?? process.env;
   const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  const rateLimiter = new PerSessionHandoffLimiter(
+    options.handoffRateLimit ?? DEFAULT_HANDOFF_RATE_LIMIT,
+    options.handoffRateWindowMs ?? DEFAULT_HANDOFF_RATE_WINDOW_MS,
+    options.now,
+  );
 
   return async function workspaceHandoffController(
     request: Request,
@@ -77,7 +146,8 @@ export function createWorkspaceHandoffController(
     }
     const serviceUrl = workspaceServiceUrl(env);
     const controlToken = workspaceControlToken(env);
-    if (!serviceUrl || !controlToken) {
+    const authUrlPrefix = env.FINANCIAL_WORKSPACE_AUTH_URL_PREFIX?.trim();
+    if (!serviceUrl || !controlToken || !authUrlPrefix) {
       response.status(503).json({ error: "workspace_checkpoints_not_configured" });
       return;
     }
@@ -90,6 +160,13 @@ export function createWorkspaceHandoffController(
     const assignment = options.activeAssignmentFor(ticket.ticketId, ticket.visitorId);
     if (!assignment) {
       response.status(409).json({ error: "session_not_active" });
+      return;
+    }
+
+    // Per-session rate limit: a visitor cannot drive unbounded handoff work
+    // on the worker and workspace service.
+    if (!rateLimiter.take(ticket.ticketId)) {
+      response.status(429).json({ error: "handoff_limited" });
       return;
     }
 
@@ -135,8 +212,11 @@ export function createWorkspaceHandoffController(
     }
     const checkpoint = exported.checkpoint;
 
-    // 2. Forward to the internal workspace service.
-    const requestId = `${ticket.ticketId}-${Date.now().toString(36)}`;
+    // 2. Forward to the internal workspace service. The requestId is a
+    // deterministic idempotency key for this session+generation, so a retry
+    // after a gateway/service timeout ordering race re-sends the same key and
+    // the service cannot create a duplicate checkpoint.
+    const requestId = `handoff:${ticket.ticketId}:${workerGenerationEpoch(assignment.workerGeneration)}`;
     let serviceResponse: unknown;
     try {
       const createResponse = await fetchImpl(
@@ -183,6 +263,14 @@ export function createWorkspaceHandoffController(
     const parsed = parseCheckpointCreateResponse(serviceResponse);
     if (!parsed.ok) {
       console.error(`[workspace-checkpoint] invalid create response: ${parsed.reason}`);
+      response.status(502).json({ error: "workspace_service_invalid_response" });
+      return;
+    }
+
+    // Validate the browser redirect target BEFORE touching the cookie: the
+    // authUrl must be HTTPS on exactly the configured origin/path prefix.
+    if (!isAllowedAuthUrl(parsed.value.authUrl, authUrlPrefix)) {
+      console.error("[workspace-checkpoint] workspace service returned a disallowed authUrl");
       response.status(502).json({ error: "workspace_service_invalid_response" });
       return;
     }

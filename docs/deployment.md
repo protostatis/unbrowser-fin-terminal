@@ -146,10 +146,15 @@ host safety controls, live in
 
 The gateway exposes a **private-only** management listener (default
 `TERMINAL_RUNTIME_MANAGEMENT_PORT=8789`, separate from the public port). It is
-enabled only when **both** `TERMINAL_RUNTIME_FEATURE_ENABLED=1` and
-`TERMINAL_RUNTIME_MANAGEMENT_TOKEN` (>= 32 chars) are set. Every request must
-send the `X-Management-Token` header. No management path is ever mounted on the
-public listener; Caddy never proxies 8789.
+enabled only when **both** `TERMINAL_RUNTIME_FEATURE_ENABLED` (any of
+`1|true|yes|on`, case-insensitive) and `TERMINAL_RUNTIME_MANAGEMENT_TOKEN`
+(>= 32 chars) are set. Every request must send the `X-Management-Token` header.
+No management path is ever mounted on the public listener; Caddy never proxies
+8789. The listener binds `TERMINAL_RUNTIME_MANAGEMENT_HOST` (default
+`0.0.0.0`); `0.0.0.0` is safe only because the Compose service publishes no
+host port and Caddy never routes to it — the listener is container-private. A
+bind failure rejects gateway startup (fail closed when the feature is
+required).
 
 Infra reconciler endpoints (POST, JSON):
 
@@ -225,6 +230,13 @@ state; the browser only sends an explicit opt-in.
   `expires_at` to epoch ms, and uses ms for the cookie's Express `maxAge`. The
   camelCase spelling is tolerated for rollout. A millisecond `expires_at` is
   rejected.
+- The gateway only forwards the browser redirect target when `auth_url` is
+  HTTPS and starts with the exact configured
+  `FINANCIAL_WORKSPACE_AUTH_URL_PREFIX` (origin + path prefix); a missing
+  prefix or a mismatched URL fails the handoff closed. Handoff requests are
+  rate-limited per session and re-send a deterministic per-session idempotency
+  key so a gateway/service timeout ordering race cannot create duplicate
+  checkpoints.
 - Handoff secret cookie: `fin-terminal-handoff-secret`, host-only
   (`HttpOnly; Secure; SameSite=Lax; Path=/`; optional `Domain` only via
   `FINANCIAL_WORKSPACE_HANDOFF_COOKIE_DOMAIN`). The control plane reads it

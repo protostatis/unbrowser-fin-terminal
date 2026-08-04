@@ -14,6 +14,7 @@
  */
 
 import type { Request, Response } from "express";
+import express from "express";
 import {
   isWorkspaceCheckpointEnabled,
   workspaceControlToken,
@@ -27,6 +28,17 @@ import {
 } from "./workspace-checkpoint-export.js";
 
 export const CONTROL_TOKEN_HEADER = "x-fin-terminal-control-token";
+
+/**
+ * Route-scoped bounded JSON body parser for the worker's private checkpoint
+ * export. Mounted on the export route itself (never globally), so the live
+ * worker parses this one endpoint's JSON without widening body parsing for
+ * the rest of the listener. Rejects payloads larger than 8 KB.
+ */
+export const workspaceCheckpointExportBodyParser = express.json({
+  limit: "8kb",
+  type: "application/json",
+});
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -128,6 +140,23 @@ export function createWorkspaceCheckpointExportHandler(
       });
     }
   };
+}
+
+/**
+ * Mount the worker's private checkpoint-export endpoint with its real
+ * route-scoped body parser. This is the exact composition the live worker
+ * server uses, so integration tests exercise the same parser + handler pair
+ * that production runs.
+ */
+export function mountWorkspaceCheckpointExport(
+  app: express.Express,
+  options: WorkspaceCheckpointExportHandlerOptions,
+): void {
+  app.post(
+    CHECKPOINT_EXPORT_PATH,
+    workspaceCheckpointExportBodyParser,
+    createWorkspaceCheckpointExportHandler(options),
+  );
 }
 
 export { CHECKPOINT_EXPORT_PATH };

@@ -145,6 +145,29 @@ test("research reservations make the daily public budget a hard conservative cap
   });
 });
 
+test("the status snapshot reports the authoritative research balance that decrements with each run", () => {
+  const { coordinator } = createCoordinator({ workerIds: ["seat-01"] });
+  coordinator.setWorkerReady("seat-01", true, "instance-a");
+  const admitted = coordinator.admit("visitor-a");
+  assert.equal(admitted.accepted, true);
+  if (!admitted.accepted) return;
+  const sessionId = admitted.session.id;
+
+  // Fresh session: the full balance is authoritative (0 runs used).
+  assert.equal(coordinator.status(sessionId)?.researchRunsRemaining, 5);
+  const assignment = coordinator.attach(sessionId);
+  assert.ok(assignment);
+  if (!assignment) return;
+  assert.equal(assignment.researchRunsRemaining, 5);
+
+  // Each authorized run decrements the authoritative count — the value the
+  // gateway renders is never a fabricated full balance.
+  for (let index = 1; index <= 3; index += 1) {
+    assert.equal(coordinator.authorizeResearch(sessionId).allowed, true);
+    assert.equal(coordinator.status(sessionId)?.researchRunsRemaining, 5 - index);
+  }
+});
+
 test("UTC day rollover carries active reservations into the new daily ceiling", () => {
   const { coordinator, advance } = createCoordinator({
     workerIds: ["seat-01", "seat-02"],

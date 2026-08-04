@@ -204,9 +204,15 @@ async function admit(baseUrl: string, expectedStatus = "admitted") {
     body: JSON.stringify({ turnstileToken: "" }),
   });
   assert.equal(admissionResponse.status, 200);
-  const admission = await admissionResponse.json() as { ticketToken: string; status: string };
+  const admission = await admissionResponse.json() as {
+    ticketToken: string;
+    status: string;
+    researchRunsRemaining: number;
+  };
   assert.equal(admission.status, expectedStatus);
-  assert.equal("researchRunsRemaining" in admission, false);
+  // The gateway reports the authoritative per-session research balance from
+  // the coordinator (never a fabricated full-balance count).
+  assert.equal(admission.researchRunsRemaining, 5);
   return {
     visitorToken: config.visitorToken,
     ticketToken: admission.ticketToken,
@@ -261,7 +267,12 @@ async function status(baseUrl: string, visitorToken: string, ticketToken: string
   });
   return {
     response,
-    body: await response.json() as { status?: string; reason?: string; readyWorkers?: number },
+    body: await response.json() as {
+      status?: string;
+      reason?: string;
+      readyWorkers?: number;
+      researchRunsRemaining?: number;
+    },
   };
 }
 
@@ -451,6 +462,39 @@ test("oversized worker output is rejected before reaching the browser", { timeou
     assert.equal(ended.body.reason, "worker-unavailable");
   } finally {
     browser?.terminate();
+    await harness.close();
+  }
+});
+
+test("admission status reports the authoritative research balance, never a fabricated count", { timeout: 15_000 }, async () => {
+  const harness = await startHarness();
+  let browser: WebSocket | undefined;
+  try {
+    const ticket = await admit(harness.baseUrl);
+    const connection = openBrowser(harness.baseUrl, ticket.ticketToken);
+    browser = connection.socket;
+    await connection.opened;
+    assert.match(await connection.message, /PUBLIC WORKER READY/);
+
+    const current = await status(harness.baseUrl, ticket.visitorToken, ticket.ticketToken);
+    assert.equal(current.response.status, 200);
+    // The full balance is authoritative at session start (5 configured runs).
+    assert.equal(current.body.researchRunsRemaining, 5);
+  } finally {
+    browser?.terminate();
+    await harness.close();
+  }
+});
+
+test("the gateway readiness surface uses the corrected researchPermitsAcquired spelling", { timeout: 15_000 }, async () => {
+  const harness = await startHarness();
+  try {
+    const response = await fetch(`${harness.baseUrl}/api/ready`);
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as Record<string, unknown>;
+    assert.ok("researchPermitsAcquired" in body, "ready surface must expose researchPermitsAcquired");
+    assert.ok(!("researchPermitsAquired" in body), "misspelled key must not be exposed");
+  } finally {
     await harness.close();
   }
 });

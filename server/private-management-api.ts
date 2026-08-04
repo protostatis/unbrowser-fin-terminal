@@ -56,15 +56,49 @@
  */
 
 import { createServer, type IncomingMessage, type Server as HttpServer } from "node:http";
+import { timingSafeEqual } from "node:crypto";
 import type { Socket } from "node:net";
 import type { CapacityWarmPool, SeatStatus, SeatPhase } from "./capacity-warm-pool.js";
 import type { ResearchPermitCoordinator } from "./research-permit-coordinator.js";
+import { isRuntimeFeatureEnabled } from "./runtime-mode.js";
 
 export interface ManagementApiConfig {
   host: string;
   port: number;
   token: string;
   enabled: boolean;
+}
+
+/**
+ * Resolve the private management listener from the environment, or return
+ * `undefined` when the feature is disabled or misconfigured.
+ *
+ * The listener binds `TERMINAL_RUNTIME_MANAGEMENT_HOST` (default `0.0.0.0`).
+ * `0.0.0.0` inside the container is safe ONLY because the Compose service
+ * publishes no host port and Caddy never routes to the management port — the
+ * listener is container-private. Set an explicit host when that guarantee
+ * changes.
+ */
+export function resolveManagementApiConfig(
+  env: NodeJS.ProcessEnv = process.env,
+): ManagementApiConfig | undefined {
+  if (!isRuntimeFeatureEnabled(env)) return undefined;
+  const token = env.TERMINAL_RUNTIME_MANAGEMENT_TOKEN?.trim();
+  const rawPort = env.TERMINAL_RUNTIME_MANAGEMENT_PORT?.trim() ?? "8789";
+  const port = Number(rawPort);
+  if (!token || token.length < 32) return undefined;
+  if (!Number.isInteger(port) || port <= 0 || port > 65_535) return undefined;
+  const host = env.TERMINAL_RUNTIME_MANAGEMENT_HOST?.trim() || "0.0.0.0";
+  return { host, port, token, enabled: true };
+}
+
+/** Constant-time comparison for the management control token. */
+function tokenMatches(supplied: string | undefined, expected: string): boolean {
+  if (!supplied) return false;
+  const suppliedBuffer = Buffer.from(supplied);
+  const expectedBuffer = Buffer.from(expected);
+  return suppliedBuffer.length === expectedBuffer.length
+    && timingSafeEqual(suppliedBuffer, expectedBuffer);
 }
 
 const SEAT_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
@@ -189,6 +223,15 @@ export function seatContractStatus(phase: SeatPhase): ReconcilerSeatStatus {
   return RECONCILER_STATUS[phase];
 }
 
+/**
+ * Reconciler lifecycle status for a seat record. A seat with a pending drain
+ * is reported as `draining` regardless of its underlying phase so the host
+ * reconciler never treats a drained ready-idle seat as healthy.
+ */
+export function seatContractStatusForSeat(seat: SeatStatus): ReconcilerSeatStatus {
+  return seat.drainRequested ? "draining" : RECONCILER_STATUS[seat.phase];
+}
+
 export function seatContractAssigned(phase: SeatPhase): boolean {
   return ASSIGNED_PHASES.has(phase);
 }
@@ -201,7 +244,7 @@ export function seatContractAssigned(phase: SeatPhase): boolean {
 export function seatContractRecord(seat: SeatStatus): Record<string, unknown> {
   return {
     workerId: seat.workerId,
-    status: RECONCILER_STATUS[seat.phase],
+    status: seatContractStatusForSeat(seat),
     phase: seat.phase,
     generation: seat.generation ?? null,
     assigned: ASSIGNED_PHASES.has(seat.phase),
@@ -247,10 +290,10 @@ function requireBodyObject(
   );
 }
 
-export function startManagementApi(
+export async function startManagementApi(
   config: ManagementApiConfig,
   deps: ManagementApiDependencies,
-): ManagementApi | undefined {
+): Promise<ManagementApi | undefined> {
   if (!config.enabled) {
     console.log("[management] private management API is disabled");
     return undefined;
@@ -259,9 +302,9 @@ export function startManagementApi(
   const server = createServer(async (request, response) => {
     const socket = request.socket as Socket;
 
-    // Auth: require management token header
+    // Auth: require management token header (constant-time compare).
     const suppliedToken = singleHeader(request, "x-management-token");
-    if (!suppliedToken || suppliedToken !== config.token) {
+    if (!tokenMatches(suppliedToken, config.token)) {
       textResponse(socket, 401, "Unauthorized");
       return;
     }
@@ -665,9 +708,26 @@ export function startManagementApi(
     }
   };
 
-  server.listen(config.port, config.host, () => {
-    console.log(`[management] private management API listening on http://${config.host}:${config.port}`);
+  // Fail closed: a management listener that cannot bind (port in use, bad
+  // host) rejects startup so the gateway never runs without its management
+  // surface when the feature is required.
+  await new Promise<void>((resolve, reject) => {
+    const onError = (error: Error) => {
+      server.off("listening", onListening);
+      reject(error);
+    };
+    const onListening = () => {
+      server.off("error", onError);
+      resolve();
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen(config.port, config.host);
   });
+  server.on("error", (error) => {
+    console.error("[management] private management API error:", error.message);
+  });
+  console.log(`[management] private management API listening on http://${config.host}:${config.port}`);
 
   return { server, close };
 }

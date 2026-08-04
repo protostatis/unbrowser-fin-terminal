@@ -17,6 +17,7 @@ import type {
   ResearchPermitGate,
   ResearchPermitIdentity,
 } from "./research-worker-coordinator.js";
+import { isRuntimeFeatureEnabled } from "./runtime-mode.js";
 
 export interface ResearchPermitClientConfig {
   /** Private management API base URL of the gateway (e.g. http://public-gateway:8789). */
@@ -151,14 +152,15 @@ export class ResearchPermitClient {
  * environment, or return `undefined` when the feature is disabled.
  *
  * Returns undefined when:
- *  - TERMINAL_RUNTIME_FEATURE_ENABLED is not exactly "1", or
+ *  - TERMINAL_RUNTIME_FEATURE_ENABLED is not a truthy boolean spelling
+ *    (1|true|yes|on), or
  *  - TERMINAL_RUNTIME_MANAGEMENT_TOKEN is missing/too short, or
  *  - TERMINAL_RUNTIME_MANAGEMENT_URL is unset/invalid.
  */
 export function createResearchPermitGateFromEnv(
   env: NodeJS.ProcessEnv = process.env,
 ): { permitGate: ResearchPermitGate; permitIdentity: () => ResearchPermitIdentity } | undefined {
-  if (env.TERMINAL_RUNTIME_FEATURE_ENABLED?.trim() !== "1") return undefined;
+  if (!isRuntimeFeatureEnabled(env)) return undefined;
   const token = env.TERMINAL_RUNTIME_MANAGEMENT_TOKEN?.trim();
   if (!token || token.length < 32) return undefined;
   const rawUrl = env.TERMINAL_RUNTIME_MANAGEMENT_URL?.trim();
@@ -181,7 +183,10 @@ export function createResearchPermitGateFromEnv(
   const gate: ResearchPermitGate = {
     acquire: (identity) => client.acquire(identity),
     status: (requestId) => client.status(requestId),
-    heartbeat: (requestId) => client.heartbeat(requestId),
+    // Heartbeats must name the owning public session so the gateway can extend
+    // that session's idle lease while the permit stays queued. The identity is
+    // the same env-derived session the coordinator uses for acquire.
+    heartbeat: (requestId) => client.heartbeat(requestId, permitIdentity().sessionId),
     release: (requestId) => client.release(requestId),
   };
   return { permitGate: gate, permitIdentity };

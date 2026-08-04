@@ -60,14 +60,14 @@ import { createOpaqueId } from "./public-session-tokens.js";
 import { hasActiveResearchState } from "./research-activity.js";
 import {
   isWorkspaceCheckpointEnabled,
-  CHECKPOINT_EXPORT_PATH,
 } from "../shared/financial-workspace-checkpoint.js";
 import {
-  createWorkspaceCheckpointExportHandler,
+  mountWorkspaceCheckpointExport,
 } from "./workspace-checkpoint-handler.js";
 import {
   createServerCheckpointEventLog,
   recordServerCheckpointEvent,
+  resetServerCheckpointEventLog,
   workerGenerationEpoch,
   type ServerCheckpointEventLog,
   type CheckpointWorkerState,
@@ -228,6 +228,18 @@ else {
     researchPhase?: string;
     researchOutcome?: string;
   } | undefined;
+  // The public session the current checkpoint state belongs to. A different
+  // principal/session attached to this worker resets the event log and the
+  // frame-transition cache so no session's events bleed into the next one.
+  let boundCheckpointSessionId: string | undefined;
+
+  /** Reset authoritative checkpoint state when a new public session attaches. */
+  function bindCheckpointSession(sessionId: string | undefined): void {
+    if (sessionId === boundCheckpointSessionId) return;
+    resetServerCheckpointEventLog(checkpointEventLog);
+    lastCheckpointEventState = undefined;
+    boundCheckpointSessionId = sessionId;
+  }
 
   // A public worker exposes its process generation to the research-permit
   // client and the checkpoint exporter via process env.
@@ -586,9 +598,10 @@ else {
   // ── Private workspace checkpoint export (worker-side, never public) ─────
   // The gateway calls this only for the active assigned session/generation.
   // The worker's proxy-token middleware already guards every route below;
-  // the handler additionally requires the shared control token.
+  // the handler additionally requires the shared control token. The route
+  // mounts its own bounded JSON body parser (never a global body parser).
   if (isWorkspaceCheckpointEnabled()) {
-    const workspaceCheckpointExport = createWorkspaceCheckpointExportHandler({
+    mountWorkspaceCheckpointExport(app, {
       getExportContext: () => {
         if (!publicWorkerInstanceId) return undefined;
         const sessionId = process.env.TERMINAL_RUNTIME_SESSION_ID;
@@ -605,7 +618,6 @@ else {
         };
       },
     });
-    app.post(CHECKPOINT_EXPORT_PATH, workspaceCheckpointExport);
     console.log("[workspace-checkpoint] worker export endpoint enabled");
   }
 
@@ -685,12 +697,16 @@ else {
     const clientIp = (request.headers["x-real-ip"] as string | undefined)?.trim() || socketIp;
 
     // Bind the current public session identity for permit gating + checkpoint
-    // export authorization. A worker serves one tenant at a time.
+    // export authorization. A worker serves one tenant at a time. A different
+    // principal/session resets the authoritative checkpoint event log so no
+    // cross-session data bleeds into a fresh export.
     const connectedPrincipal = requestPrincipal(request);
     if (connectedPrincipal && connectedPrincipal.startsWith("public:")) {
       process.env.TERMINAL_RUNTIME_SESSION_ID = connectedPrincipal.slice("public:".length);
+      bindCheckpointSession(process.env.TERMINAL_RUNTIME_SESSION_ID);
     } else {
       delete process.env.TERMINAL_RUNTIME_SESSION_ID;
+      bindCheckpointSession(undefined);
     }
 
     console.log("[ws] client connected");

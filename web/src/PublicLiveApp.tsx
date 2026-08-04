@@ -20,6 +20,8 @@ type Admission = {
   idleExpiresAt?: number;
   reason?: string;
   ticketToken?: string;
+  /** Authoritative research balance from the gateway, when known. */
+  researchRunsRemaining?: number;
 };
 
 type PublicConfig = {
@@ -318,7 +320,9 @@ export function PublicLiveApp({
   if ((admission?.status === "admitted" || admission?.status === "active") && ticketToken) {
     const sessionExpiresAt = admission.sessionExpiresAt ?? (Date.now() + (config?.maxSessionMs ?? 900_000));
     const maxResearchRuns = config?.maxResearchRuns ?? 5;
-    const researchRunsRemaining = maxResearchRuns; // approximate
+    // Only render the remaining-runs count when the gateway supplies the
+    // authoritative balance; never fabricate a full-balance approximation.
+    const researchRunsRemaining = admission.researchRunsRemaining;
     const workspaceHandoffAvailable = config?.workspaceHandoffAvailable === true;
 
     return (

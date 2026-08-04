@@ -57,7 +57,7 @@ test("admission-vs-drain race: drained seat is never assigned to a new visitor",
   // The drain doesn't directly affect the coordinator — it's the operator's
   // responsibility to stop the worker. But the warm pool should report the
   // seat as draining so it won't be assigned by the coordinator if we were
-  // to integrate drain awareness into the pump. 
+  // to integrate drain awareness into the pump.
 
   // Verify the coordinator can still assign drained seats (current behavior
   // — integration of drain into coordinator pump would prevent this).

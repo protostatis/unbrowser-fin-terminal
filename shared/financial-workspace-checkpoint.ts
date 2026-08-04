@@ -309,28 +309,39 @@ function isArrayOf<T>(
 // ──── Canary / Secret Exclusion ─────────────────────────────────────────────
 
 /**
- * Patterns that indicate a string may contain secrets, credentials, or internal
- * identifiers. Any checkpoint string matching these is rejected at validation.
+ * Patterns that indicate a string very probably carries a live secret or
+ * credential: an assignment of a value to a secret-like key, a natural-language
+ * "my password is …" assignment, a high-entropy bearer/JWT/signed-opaque token,
+ * a UUID-shaped worker generation, or one of our own signing/header names.
+ *
+ * Benign prose that merely mentions a keyword — a user prompt asking about a
+ * "password reset policy", an excerpt quoting a company's "credential
+ * requirements", or a headline about an "API key breach" — must export. Only
+ * probable secret material (an actual value bound to a secret key, or a token
+ * shape) is excluded.
  */
 const SECRET_CANARY_PATTERNS = [
-  /(?:api[_-]?key|apikey|secret|password|token|credential|private[_-]?key)\s*[:=]\s*\S/i,
+  // key=value / key: value assignment with a non-trivial secret value.
+  /(?:api[_-]?key|apikey|passwd|password|secret|token|credential|private[_-]?key|client[_-]?secret|auth[_-]?token|access[_-]?token|refresh[_-]?token)\s*[:=]\s*\S{4,}/i,
+  // Natural-language secret assignments ("my/your/the <kind> is <value>").
+  /\b(?:my|your|the|our|their|his|her)\s+(?:api\s*key|password|passwd|passphrase|secret|credential)s?\s+(?:is|was|are|were|==)\s+[A-Za-z0-9._~+/=-]{6,}/i,
+  // Bearer tokens and JWT / signed-opaque token shapes.
   /Bearer\s+[A-Za-z0-9._~+/=-]{20,}/,
+  /[A-Za-z0-9_-]{32,128}\.[A-Za-z0-9_-]{32,128}/,
+  // Our own signing/header names (case-insensitive).
   /x-fin-terminal-(?:edge|proxy|worker)-token/i,
   /PUBLIC_SESSION_SIGNING_KEY/i,
   /PUBLIC_WORKER_PROXY_TOKEN/i,
   /PUBLIC_EDGE_PROXY_TOKEN/i,
   /TURNSTILE_SECRET/i,
-  /[A-Za-z0-9_-]{32,128}\.[A-Za-z0-9_-]{32,128}/, // signed opaque token pattern
-  /worker(?:-|_)?[a-z0-9]{8,}[-_][a-z0-9]{8,}[-_][a-z0-9]{8,}[-_][a-z0-9]{8,}/i, // UUID-like worker IDs
+  // UUID-like worker generation strings.
+  /worker(?:-|_)?[a-z0-9]{8,}[-_][a-z0-9]{8,}[-_][a-z0-9]{8,}[-_][a-z0-9]{8,}/i,
+  // Long-lived opaque ticket/session ids.
   /ticket(?:-|_)?[a-z0-9]{8,}/i,
   /session(?:-|_)?[a-z0-9]{16,}/i,
-  /password/i,
-  /credential/i,
-  /access[_-]?token/i,
-  /refresh[_-]?token/i,
 ];
 
-function containsSecretCanary(value: string): boolean {
+export function containsSecretCanary(value: string): boolean {
   return SECRET_CANARY_PATTERNS.some((pattern) => pattern.test(value));
 }
 
@@ -595,6 +606,122 @@ export function serializeCheckpoint(checkpoint: FinancialTerminalCheckpoint): st
     continuationSummary: checkpoint.continuationSummary,
   };
   return JSON.stringify(clean);
+}
+
+// ──── Field Sanitization ─────────────────────────────────────────────────────
+
+/**
+ * Drop every checkpoint field whose value contains a probable secret, so a
+ * single tainted excerpt or event value cannot take down an otherwise valid
+ * export. Identity fields (`id`, `source.sessionId`, `source.sourceRevision`)
+ * are intentionally NOT sanitized — a secret there is a hard validation
+ * failure. The result still passes `validateCheckpoint` (which remains the
+ * final defense-in-depth gate).
+ */
+export function sanitizeCheckpoint(
+  checkpoint: FinancialTerminalCheckpoint,
+): FinancialTerminalCheckpoint {
+  const eventLog: CheckpointEvent[] = checkpoint.eventLog.map((event) => {
+    const data: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(event.data)) {
+      if (typeof value === "string" && containsSecretCanary(value)) continue;
+      data[key] = value;
+    }
+    return { ...event, data };
+  });
+
+  const context: CheckpointContext = { ...checkpoint.context };
+  if (typeof context.symbol === "string" && containsSecretCanary(context.symbol)) {
+    delete context.symbol;
+  }
+  if (typeof context.searchQuery === "string" && containsSecretCanary(context.searchQuery)) {
+    delete context.searchQuery;
+  }
+  if (context.watchlist !== undefined) {
+    const watchlist = context.watchlist.filter((symbol) => !containsSecretCanary(symbol));
+    if (watchlist.length > 0) context.watchlist = watchlist;
+    else delete context.watchlist;
+  }
+
+  const canvases: CheckpointCanvas[] = checkpoint.canvases
+    .map((canvas): CheckpointCanvas | undefined => {
+      if (containsSecretCanary(canvas.id)) return undefined;
+      const packets: CheckpointPacket[] = [];
+      for (const packet of canvas.packets) {
+        if (
+          containsSecretCanary(packet.sourceId)
+          || containsSecretCanary(packet.sourceTitle)
+          || containsSecretCanary(packet.sourceDomain)
+        ) {
+          continue; // required packet fields tainted → drop the packet
+        }
+        packets.push({
+          ...packet,
+          ...(packet.excerpt !== undefined && containsSecretCanary(packet.excerpt)
+            ? { excerpt: undefined }
+            : {}),
+        } as CheckpointPacket);
+      }
+      const clean: CheckpointCanvas = {
+        id: canvas.id,
+        intent: canvas.intent,
+        stage: canvas.stage,
+        evidenceStatus: canvas.evidenceStatus,
+        packets,
+        ...(canvas.title !== undefined && !containsSecretCanary(canvas.title)
+          ? { title: canvas.title }
+          : {}),
+        ...(canvas.summary !== undefined && !containsSecretCanary(canvas.summary)
+          ? { summary: canvas.summary }
+          : {}),
+        ...(canvas.summarySourceIds !== undefined
+          ? {
+              summarySourceIds: canvas.summarySourceIds.filter(
+                (sourceId) => !containsSecretCanary(sourceId),
+              ),
+            }
+          : {}),
+      };
+      if (clean.summarySourceIds !== undefined && clean.summarySourceIds.length === 0) {
+        delete clean.summarySourceIds;
+      }
+      return clean;
+    })
+    .filter((canvas): canvas is CheckpointCanvas => canvas !== undefined);
+
+  let interruptedWork: CheckpointInterruptedWork | undefined = checkpoint.interruptedWork;
+  if (interruptedWork?.activeResearch) {
+    const active = interruptedWork.activeResearch;
+    const cleanActive: NonNullable<CheckpointInterruptedWork["activeResearch"]> = {};
+    if (active.symbol !== undefined && !containsSecretCanary(active.symbol)) {
+      cleanActive.symbol = active.symbol;
+    }
+    if (active.contextLabel !== undefined && !containsSecretCanary(active.contextLabel)) {
+      cleanActive.contextLabel = active.contextLabel;
+    }
+    if (active.activity !== undefined && !containsSecretCanary(active.activity)) {
+      cleanActive.activity = active.activity;
+    }
+    if (active.phase !== undefined && !containsSecretCanary(active.phase)) {
+      cleanActive.phase = active.phase;
+    }
+    if (active.startedAt !== undefined) cleanActive.startedAt = active.startedAt;
+    interruptedWork = { activeResearch: cleanActive };
+  }
+
+  let continuationSummary = checkpoint.continuationSummary;
+  if (containsSecretCanary(continuationSummary)) {
+    continuationSummary = "Continue from a saved checkpoint.";
+  }
+
+  return {
+    ...checkpoint,
+    eventLog,
+    context,
+    canvases,
+    ...(interruptedWork ? { interruptedWork } : {}),
+    continuationSummary,
+  };
 }
 
 // ──── Continuation Summary Builder ──────────────────────────────────────────

@@ -33,10 +33,16 @@ import {
 import { CapacityWarmPool } from "./capacity-warm-pool.js";
 import {
   ResearchPermitCoordinator,
+  RESEARCH_PERMIT_ACQUIRE_TTL_MS,
   type ResearchPermit,
   type ResearchPermitState,
 } from "./research-permit-coordinator.js";
-import { startManagementApi } from "./private-management-api.js";
+import {
+  startManagementApi,
+  resolveManagementApiConfig,
+  type ManagementApi,
+} from "./private-management-api.js";
+import { isRuntimeFeatureEnabled } from "./runtime-mode.js";
 
 const VISITOR_TOKEN_HEADER = "x-public-visitor-token";
 const TICKET_TOKEN_HEADER = "x-public-ticket-token";
@@ -62,7 +68,6 @@ const WARM_POOL_WARM_SPARES = 1; // keep one ready-idle spare
 const RESEARCH_PERMIT_MAX_CONCURRENT = 2;
 const RESEARCH_PERMIT_MAX_QUEUE = 24;
 const RESEARCH_PERMIT_QUEUE_TTL_MS = 30 * 60_000; // 30 minutes in queue
-const RESEARCH_PERMIT_ACQUIRE_TTL_MS = 12 * 60_000; // 12 minutes max hold
 const RESEARCH_PERMIT_HEARTBEAT_MS = 30_000; // 30 seconds
 
 type TurnstileVerification = { success?: unknown; hostname?: unknown; action?: unknown };
@@ -448,14 +453,23 @@ export async function startPublicLiveGateway(): Promise<PublicLiveGateway> {
     const permitRestored = await persistence.loadResearchPermitState();
     if (permitRestored) researchPermits.restore(permitRestored);
 
+    // Companion Redis keys (warm-pool drains, research permits) are only
+    // written when the runtime feature is actually enabled. When it is off,
+    // the coordinator still runs them in memory but there is no operator or
+    // worker surface that could produce durable state, so the extra writes
+    // (and their lease renewals) are skipped.
+    const runtimeFeaturesEnabled = isRuntimeFeatureEnabled(process.env);
+
     let mutations = Promise.resolve();
     let fatal: ((error: unknown) => void) | undefined;
     const mutate = <T>(operation: () => T | Promise<T>): Promise<T> => {
       const result = mutations.then(async () => {
         const value = await operation();
         await persistence.save(coordinator.exportState());
-        await persistence.saveCapacityState(warmPool.exportState());
-        await persistence.saveResearchPermitState(researchPermits.exportState());
+        if (runtimeFeaturesEnabled) {
+          await persistence.saveCapacityState(warmPool.exportState());
+          await persistence.saveResearchPermitState(researchPermits.exportState());
+        }
         return value;
       });
       mutations = result.then(() => undefined, (error) => {
@@ -538,7 +552,7 @@ export async function startPublicLiveGateway(): Promise<PublicLiveGateway> {
             desiredRunning: plan.desiredRunning,
             totalSeats: config.workerEndpoints.length,
             scaleDownCandidates: plan.scaleDownCandidates,
-            researchPermitsAquired: permitMetrics.acquired,
+            researchPermitsAcquired: permitMetrics.acquired,
             researchPermitsQueued: permitMetrics.queued,
           };
         });
@@ -1079,7 +1093,7 @@ export async function startPublicLiveGateway(): Promise<PublicLiveGateway> {
     let timer: ReturnType<typeof setInterval> | undefined;
     let closing = false;
     let signalHandler: (() => void) | undefined;
-    let managementApi: ReturnType<typeof startManagementApi> | undefined;
+    let managementApi: ManagementApi | undefined;
     const close = async () => {
       if (closing) return;
       closing = true;
@@ -1118,27 +1132,16 @@ export async function startPublicLiveGateway(): Promise<PublicLiveGateway> {
     timer.unref();
 
     // ── Private management API ───────────────────────────────────────────
-    // Feature-gated via TERMINAL_RUNTIME_FEATURE_ENABLED; the token must be
-    // explicit and strong. This listener is private-only (separate port).
-    const runtimeFeatureEnabled = process.env.TERMINAL_RUNTIME_FEATURE_ENABLED?.trim() === "1";
-    const managementToken = process.env.TERMINAL_RUNTIME_MANAGEMENT_TOKEN?.trim();
-    const managementPort = Number(process.env.TERMINAL_RUNTIME_MANAGEMENT_PORT?.trim() ?? 8789);
-    const managementEnabled = Boolean(
-      runtimeFeatureEnabled
-      && managementToken
-      && managementToken.length >= 32
-      && Number.isInteger(managementPort)
-      && managementPort > 0
-      && managementPort <= 65_535,
-    );
-    if (managementEnabled) {
-      managementApi = startManagementApi(
-        {
-          host: config.host,
-          port: managementPort,
-          token: managementToken!,
-          enabled: managementEnabled,
-        },
+    // Feature-gated via TERMINAL_RUNTIME_FEATURE_ENABLED (boolean spellings
+    // 1|true|yes|on); the token must be explicit and strong. This listener is
+    // private-only (separate port, dedicated TERMINAL_RUNTIME_MANAGEMENT_HOST,
+    // default 0.0.0.0 which is safe only because no host port is published
+    // and Caddy never routes to it). A bind failure rejects gateway startup:
+    // the feature is required, so we fail closed rather than run without it.
+    const managementConfig = resolveManagementApiConfig(process.env);
+    if (managementConfig) {
+      managementApi = await startManagementApi(
+        managementConfig,
         {
           getSeatStatuses: () => {
             const seatStatuses = coordinator.getSeatStatuses();
@@ -1186,6 +1189,9 @@ function publicStatus(session: PublicSessionSnapshot): Record<string, unknown> {
     ...(session.queuePosition ? { queuePosition: session.queuePosition } : {}),
     ...(session.sessionExpiresAt ? { sessionExpiresAt: session.sessionExpiresAt } : {}),
     ...(session.idleExpiresAt ? { idleExpiresAt: session.idleExpiresAt } : {}),
+    // Authoritative per-session research balance from the coordinator; the UI
+    // renders it when present and never fabricates a full-balance count.
+    researchRunsRemaining: session.researchRunsRemaining,
     ...(session.endReason ? { reason: session.endReason } : {}),
   };
 }

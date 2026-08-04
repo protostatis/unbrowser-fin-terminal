@@ -18,6 +18,21 @@
  *     logical job.
  */
 
+import {
+  RESEARCH_WORKER_MAX_DEADLINE_MS,
+  RESEARCH_WORKER_TERMINAL_GRACE_MS,
+} from "./research-worker-coordinator.js";
+
+/**
+ * How long an ACQUIRED permit may be held before the gateway reclaims it.
+ * Must exceed the maximum child lifetime — the parent-enforced worker
+ * deadline plus the post-terminal cleanup grace — so a permit can never be
+ * swept and regranted while its child is still running. A 60 s safety margin
+ * absorbs scheduling jitter and keeps the global concurrency cap honest.
+ */
+export const RESEARCH_PERMIT_ACQUIRE_TTL_MS =
+  RESEARCH_WORKER_MAX_DEADLINE_MS + RESEARCH_WORKER_TERMINAL_GRACE_MS + 60_000;
+
 export type ResearchPermitStatus =
   | "queued"
   | "acquired"

@@ -31,6 +31,16 @@ import {
   type ParentMessage,
 } from "./research-worker-protocol.js";
 
+/**
+ * Maximum wall-clock lifetime of a research child: the parent-enforced
+ * deadline (default) plus the post-terminal cleanup grace the child still
+ * owns its concurrency slot for. The gateway's acquired-permit TTL MUST
+ * exceed this sum, or a permit could expire — and be regranted to another
+ * queued job — while the original child is still running.
+ */
+export const RESEARCH_WORKER_MAX_DEADLINE_MS = 12 * 60_000;
+export const RESEARCH_WORKER_TERMINAL_GRACE_MS = 5_000;
+
 // ── Worker instance abstraction ───────────────────────────────────────────
 
 /**
@@ -241,8 +251,8 @@ export class ResearchWorkerCoordinator {
     this.generateAttemptId =
       options.generateAttemptId ?? defaultAttemptIdGenerator();
     this.graceMs = Math.max(0, options.graceMs ?? 5_000);
-    this.deadlineMs = positiveTimeout(options.deadlineMs, 12 * 60_000);
-    this.terminalGraceMs = positiveTimeout(options.terminalGraceMs, 5_000);
+    this.deadlineMs = positiveTimeout(options.deadlineMs, RESEARCH_WORKER_MAX_DEADLINE_MS);
+    this.terminalGraceMs = positiveTimeout(options.terminalGraceMs, RESEARCH_WORKER_TERMINAL_GRACE_MS);
     this.permitGate = options.permitGate;
     this.permitIdentity = options.permitIdentity;
     this.permitWaitTimeoutMs = positiveTimeout(options.permitWaitTimeoutMs, 10 * 60_000);

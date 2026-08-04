@@ -25,8 +25,12 @@ export type CheckpointBannerPhase =
 export interface WorkspaceCheckpointBannerProps {
   /** Absolute session expiry timestamp (epoch ms). */
   sessionExpiresAt: number;
-  /** Research runs remaining. */
-  researchRunsRemaining: number;
+  /**
+   * Authoritative research runs remaining from the gateway. Omitted when the
+   * gateway has no authoritative balance — the banner then shows no count
+   * rather than a fabricated full-balance figure.
+   */
+  researchRunsRemaining?: number;
   /** Maximum research runs for this session. */
   maxResearchRuns: number;
   /** Whether the user has performed meaningful activity. */
@@ -209,7 +213,9 @@ export function WorkspaceCheckpointBanner({
               )}
             </span>
             <span className="workspace-checkpoint-runs">
-              Research: {researchRunsRemaining}/{maxResearchRuns} runs remaining
+              {typeof researchRunsRemaining === "number"
+                ? `Research: ${researchRunsRemaining}/${maxResearchRuns} runs remaining`
+                : `Up to ${maxResearchRuns} research runs`}
             </span>
           </>
         ) : (

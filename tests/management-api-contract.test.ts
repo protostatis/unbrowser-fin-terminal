@@ -13,10 +13,10 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { startManagementApi, type ManagementApi } from "../server/private-management-api.js";
+import { startManagementApi, resolveManagementApiConfig, type ManagementApi } from "../server/private-management-api.js";
 import { CapacityWarmPool, type SeatStatus } from "../server/capacity-warm-pool.js";
 import { ResearchPermitCoordinator } from "../server/research-permit-coordinator.js";
-import { ResearchPermitClient } from "../server/research-permit-client.js";
+import { ResearchPermitClient, createResearchPermitGateFromEnv } from "../server/research-permit-client.js";
 
 const HOST = "127.0.0.1";
 const TOKEN = "test-management-token-32chars-minimum!!";
@@ -99,7 +99,7 @@ function createDeps() {
 async function startApi(t: { after(fn: () => Promise<void> | void): void }) {
   const port = await getFreePort();
   const deps = createDeps();
-  const api: ManagementApi | undefined = startManagementApi(
+  const api: ManagementApi | undefined = await startManagementApi(
     { host: HOST, port, token: TOKEN, enabled: true },
     {
       getSeatStatuses: () => deps.drainAwareSeats(),
@@ -170,7 +170,8 @@ test("reconcile-snapshot reports accurate idleSeconds for ready-idle seats and z
   assert.equal(seats["seat-03"]?.idleSeconds, 350);
 
   // After a drain, the same ready-idle seat reports idleSeconds 0 (it is no
-  // longer an idle scale-down candidate).
+  // longer an idle scale-down candidate) and its lifecycle status becomes
+  // `draining` — the reconciler must never treat a drained seat as healthy.
   deps.warmPool.requestDrain(
     { workerId: "seat-02", phase: "ready-idle", generation: "gen-b", drainRequested: false, idleSinceMs: 400_000 },
     "drain-idle-report",
@@ -182,6 +183,7 @@ test("reconcile-snapshot reports accurate idleSeconds for ready-idle seats and z
   const afterSeats = afterDrain.body.seats as Record<string, Record<string, unknown>>;
   assert.equal(afterSeats["seat-02"]?.idleSeconds, 0);
   assert.equal(afterSeats["seat-02"]?.drainRequested, true);
+  assert.equal(afterSeats["seat-02"]?.status, "draining");
 });
 
 test("drain rejects a ready-idle seat before the five-minute idle threshold", async (t) => {
@@ -394,7 +396,7 @@ test("ResearchPermitClient queues when the global cap is reached", async (t) => 
 test("management API disabled when feature flag / token are absent (private-only gating)", async () => {
   const port = await getFreePort();
   const deps = createDeps();
-  const disabled = startManagementApi(
+  const disabled = await startManagementApi(
     { host: HOST, port, token: TOKEN, enabled: false },
     {
       getSeatStatuses: () => deps.seats,
@@ -406,4 +408,122 @@ test("management API disabled when feature flag / token are absent (private-only
     },
   );
   assert.equal(disabled, undefined);
+});
+
+test("gateway and worker client agree on the Compose-style boolean flag spellings", () => {
+  // The gateway (resolveManagementApiConfig) and the worker permit client
+  // (createResearchPermitGateFromEnv) must both treat `true` as enabled —
+  // Compose interpolation commonly renders booleans as `true`.
+  const env: NodeJS.ProcessEnv = {
+    TERMINAL_RUNTIME_FEATURE_ENABLED: "true",
+    TERMINAL_RUNTIME_MANAGEMENT_TOKEN: TOKEN,
+    TERMINAL_RUNTIME_MANAGEMENT_URL: `http://${HOST}:1`,
+    TERMINAL_RUNTIME_SESSION_ID: "session-1",
+    TERMINAL_RUNTIME_WORKER_GENERATION: "gen-1",
+  };
+  assert.ok(resolveManagementApiConfig(env), "gateway must enable with true");
+  assert.ok(createResearchPermitGateFromEnv(env), "worker client must enable with true");
+  for (const spelling of ["1", "yes", "on", "TRUE"]) {
+    assert.ok(
+      resolveManagementApiConfig({ ...env, TERMINAL_RUNTIME_FEATURE_ENABLED: spelling }),
+      `gateway must accept ${spelling}`,
+    );
+    assert.ok(
+      createResearchPermitGateFromEnv({ ...env, TERMINAL_RUNTIME_FEATURE_ENABLED: spelling }),
+      `worker client must accept ${spelling}`,
+    );
+  }
+});
+
+test("a queued permit heartbeat from the real worker gate carries the owning sessionId and touches its lease", async (t) => {
+  const { port, deps } = await startApi(t);
+  // Fill both global slots so the worker gate's acquire queues.
+  deps.researchPermits.acquire("s1", "g1", "req-1");
+  deps.researchPermits.acquire("s2", "g2", "req-2");
+
+  const gateEnv: NodeJS.ProcessEnv = {
+    TERMINAL_RUNTIME_FEATURE_ENABLED: "true",
+    TERMINAL_RUNTIME_MANAGEMENT_TOKEN: TOKEN,
+    TERMINAL_RUNTIME_MANAGEMENT_URL: `http://${HOST}:${port}`,
+    TERMINAL_RUNTIME_SESSION_ID: "session-waiting",
+    TERMINAL_RUNTIME_WORKER_GENERATION: "gen-3",
+  };
+  const gate = createResearchPermitGateFromEnv(gateEnv);
+  assert.ok(gate);
+
+  const outcome = await gate!.permitGate.acquire(gate!.permitIdentity());
+  assert.equal(outcome.status, "queued");
+  assert.ok(outcome.requestId);
+
+  // The worker gate must name the owning session on heartbeat so the gateway
+  // extends that session's idle lease instead of silently no-op'ing.
+  await gate!.permitGate.heartbeat(outcome.requestId!);
+  assert.ok(deps.touched.includes("session-waiting"), "heartbeat must touch the owning session");
+});
+
+test("management API binds a dedicated host (default container-private 0.0.0.0)", () => {
+  const config = resolveManagementApiConfig({
+    TERMINAL_RUNTIME_FEATURE_ENABLED: "1",
+    TERMINAL_RUNTIME_MANAGEMENT_TOKEN: TOKEN,
+  });
+  assert.ok(config);
+  // 0.0.0.0 is acceptable ONLY because no host port is published and Caddy
+  // never routes to the management port — the listener is container-private.
+  assert.equal(config!.host, "0.0.0.0");
+  assert.equal(config!.port, 8789);
+
+  const explicit = resolveManagementApiConfig({
+    TERMINAL_RUNTIME_FEATURE_ENABLED: "1",
+    TERMINAL_RUNTIME_MANAGEMENT_TOKEN: TOKEN,
+    TERMINAL_RUNTIME_MANAGEMENT_HOST: "127.0.0.1",
+    TERMINAL_RUNTIME_MANAGEMENT_PORT: "9000",
+  });
+  assert.equal(explicit!.host, "127.0.0.1");
+  assert.equal(explicit!.port, 9000);
+
+  assert.equal(resolveManagementApiConfig({}), undefined);
+  assert.equal(
+    resolveManagementApiConfig({
+      TERMINAL_RUNTIME_FEATURE_ENABLED: "true",
+      TERMINAL_RUNTIME_MANAGEMENT_TOKEN: TOKEN,
+      TERMINAL_RUNTIME_MANAGEMENT_PORT: "70000",
+    }),
+    undefined,
+    "an out-of-range management port disables the API",
+  );
+});
+
+test("management API fails closed when its listener cannot bind", async () => {
+  const { createServer } = await import("node:http");
+  const occupied = createServer();
+  await new Promise<void>((resolve) => occupied.listen(0, HOST, () => resolve()));
+  const port = (occupied.address() as { port: number }).port;
+  try {
+    const deps = createDeps();
+    await assert.rejects(
+      startManagementApi(
+        { host: HOST, port, token: TOKEN, enabled: true },
+        {
+          getSeatStatuses: () => deps.seats,
+          getWarmPool: () => deps.warmPool,
+          getResearchCoordinator: () => deps.researchPermits,
+          getQueueCount: () => 0,
+          mutate: deps.mutate,
+          inspect: deps.inspect,
+        },
+      ),
+      /listen EADDRINUSE/,
+    );
+  } finally {
+    await new Promise<void>((resolve) => occupied.close(() => resolve()));
+  }
+});
+
+test("management API rejects a token of a different length (constant-time gate)", async (t) => {
+  const { port } = await startApi(t);
+  const response = await fetch(`http://${HOST}:${port}/api/management/reconcile-plan`, {
+    method: "POST",
+    headers: { "x-management-token": "short" },
+  });
+  assert.equal(response.status, 401);
 });

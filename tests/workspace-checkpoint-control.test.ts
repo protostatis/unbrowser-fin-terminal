@@ -37,6 +37,8 @@ const HOST = "127.0.0.1";
 const CONTROL_TOKEN = "test-control-token-0123456789012345678901";
 const WORKER_PROXY_TOKEN = "test-worker-proxy-token-01234567890123456";
 const GENERATION = "gen-opaque-001";
+// The only auth URL the gateway may hand the browser for redirect.
+const AUTH_URL_PREFIX = "https://workspace.internal/auth/";
 
 // A real future moment (ms) used by the fake workspace service so cookie
 // Max-Age assertions reflect actual conversion math.
@@ -47,6 +49,7 @@ function controlEnv(overrides: Record<string, string> = {}): NodeJS.ProcessEnv {
     FINANCIAL_WORKSPACE_CHECKPOINTS: "1",
     FINANCIAL_WORKSPACE_CONTROL_TOKEN: CONTROL_TOKEN,
     FINANCIAL_WORKSPACE_SERVICE_URL: "http://workspace.internal:8700",
+    FINANCIAL_WORKSPACE_AUTH_URL_PREFIX: AUTH_URL_PREFIX,
     PUBLIC_WORKER_PROXY_TOKEN: WORKER_PROXY_TOKEN,
     ...overrides,
   };
@@ -100,7 +103,7 @@ async function startWorkerServer() {
 }
 
 /** A fake workspace control service speaking the canonical snake_case wire. */
-async function startWorkspaceService(overrides: Record<string, unknown> = {}) {
+async function startWorkspaceService(overrides: Record<string, unknown> = {}, requestIds: string[] = []) {
   const app = express();
   app.use(express.json());
   app.post(CHECKPOINT_CREATE_PATH, (request, response) => {
@@ -111,6 +114,7 @@ async function startWorkspaceService(overrides: Record<string, unknown> = {}) {
     const source = (request.body as { source?: unknown }).source as Record<string, unknown> | undefined;
     assert.equal(source?.sessionId, "public-session-123");
     assert.equal(source?.generation, workerGenerationEpoch(GENERATION));
+    requestIds.push((request.body as { requestId?: string }).requestId ?? "");
     response.status(201).json({
       checkpoint_id: "checkpoint-1",
       // Canonical wire: `expires_at` is Unix epoch SECONDS. `FIXTURE_EXPIRES_AT_MS`
@@ -127,7 +131,12 @@ async function startWorkspaceService(overrides: Record<string, unknown> = {}) {
   return listen(app);
 }
 
-async function startHandoffGateway(workerUrl: string, serviceUrl: string, overrides: Record<string, string> = {}) {
+async function startHandoffGateway(
+  workerUrl: string,
+  serviceUrl: string,
+  overrides: Record<string, string> = {},
+  controllerOptions: Parameters<typeof createWorkspaceHandoffController>[0] = {},
+) {
   const app = express();
   app.use(express.json());
   app.post(
@@ -151,6 +160,7 @@ async function startHandoffGateway(workerUrl: string, serviceUrl: string, overri
         };
         return assignment;
       },
+      ...controllerOptions,
     }),
   );
   return listen(app);
@@ -334,6 +344,125 @@ test("handoff surfaces a 502 when the worker export fails", async () => {
       body: "{}",
     });
     assert.equal(response.status, 502);
+  } finally {
+    await closeServer(worker.server);
+    await closeServer(service.server);
+    await closeServer(gateway.server);
+  }
+});
+
+test("handoff sends a deterministic idempotent request ID per session+generation", async () => {
+  const worker = await startWorkerServer();
+  const requestIds: string[] = [];
+  const service = await startWorkspaceService({}, requestIds);
+  const gateway = await startHandoffGateway(`http://${HOST}:${worker.port}`, `http://${HOST}:${service.port}`);
+  try {
+    const call = () => fetch(`http://${HOST}:${gateway.port}/api/public/workspace-handoff`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-public-visitor-token": "visitor-1",
+        "x-public-ticket-token": "public-session-123",
+      },
+      body: "{}",
+    });
+    // A retry after a gateway/timeout ordering race must re-send the SAME
+    // idempotency key so the workspace service cannot create a duplicate.
+    const first = await call();
+    const second = await call();
+    assert.equal(first.status, 201);
+    assert.equal(second.status, 201);
+    assert.equal(requestIds.length, 2);
+    assert.equal(requestIds[0], requestIds[1]);
+    assert.match(requestIds[0], /^handoff:public-session-123:/);
+  } finally {
+    await closeServer(worker.server);
+    await closeServer(service.server);
+    await closeServer(gateway.server);
+  }
+});
+
+test("handoff rejects an authUrl that is not HTTPS on the allowed origin/prefix", async () => {
+  for (const authUrl of [
+    "http://workspace.internal/auth/handoff-1",      // not HTTPS
+    "https://evil.example/auth/handoff-1",           // foreign origin
+    "https://workspace.internal/other/handoff-1",    // wrong path prefix
+  ]) {
+    const worker = await startWorkerServer();
+    const service = await startWorkspaceService({ auth_url: authUrl });
+    const gateway = await startHandoffGateway(`http://${HOST}:${worker.port}`, `http://${HOST}:${service.port}`);
+    try {
+      const response = await fetch(`http://${HOST}:${gateway.port}/api/public/workspace-handoff`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-public-visitor-token": "visitor-1",
+          "x-public-ticket-token": "public-session-123",
+        },
+        body: "{}",
+      });
+      assert.equal(response.status, 502, `authUrl ${authUrl} must be rejected`);
+      const body = (await response.json()) as { error?: string };
+      assert.equal(body.error, "workspace_service_invalid_response");
+    } finally {
+      await closeServer(worker.server);
+      await closeServer(service.server);
+      await closeServer(gateway.server);
+    }
+  }
+});
+
+test("handoff fails closed when the auth URL prefix is not configured", async () => {
+  const worker = await startWorkerServer();
+  const service = await startWorkspaceService();
+  const gateway = await startHandoffGateway(
+    `http://${HOST}:${worker.port}`,
+    `http://${HOST}:${service.port}`,
+    { FINANCIAL_WORKSPACE_AUTH_URL_PREFIX: "" },
+  );
+  try {
+    const response = await fetch(`http://${HOST}:${gateway.port}/api/public/workspace-handoff`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-public-visitor-token": "visitor-1",
+        "x-public-ticket-token": "public-session-123",
+      },
+      body: "{}",
+    });
+    assert.equal(response.status, 503);
+  } finally {
+    await closeServer(worker.server);
+    await closeServer(service.server);
+    await closeServer(gateway.server);
+  }
+});
+
+test("handoff rate-limits per session", async () => {
+  const worker = await startWorkerServer();
+  const service = await startWorkspaceService();
+  const gateway = await startHandoffGateway(
+    `http://${HOST}:${worker.port}`,
+    `http://${HOST}:${service.port}`,
+    {},
+    { handoffRateLimit: 2, handoffRateWindowMs: 60_000 },
+  );
+  try {
+    const call = () => fetch(`http://${HOST}:${gateway.port}/api/public/workspace-handoff`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-public-visitor-token": "visitor-1",
+        "x-public-ticket-token": "public-session-123",
+      },
+      body: "{}",
+    });
+    assert.equal((await call()).status, 201);
+    assert.equal((await call()).status, 201);
+    const limited = await call();
+    assert.equal(limited.status, 429);
+    const body = (await limited.json()) as { error?: string };
+    assert.equal(body.error, "handoff_limited");
   } finally {
     await closeServer(worker.server);
     await closeServer(service.server);

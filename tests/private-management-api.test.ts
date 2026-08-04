@@ -102,7 +102,7 @@ function managementDeps(port: number) {
 test("management API returns 401 without auth token", async () => {
   const port = await getFreePort();
   const deps = createManagementApi(port);
-  const api = startManagementApi(
+  const api = await startManagementApi(
     { host: HOST, port, token: TOKEN, enabled: true },
     managementDeps(port),
   );
@@ -117,7 +117,7 @@ test("management API returns 401 without auth token", async () => {
 test("management API returns 401 with bad token", async () => {
   const port = await getFreePort();
   const deps = createManagementApi(port);
-  const api = startManagementApi(
+  const api = await startManagementApi(
     { host: HOST, port, token: TOKEN, enabled: true },
     managementDeps(port),
   );
@@ -134,7 +134,7 @@ test("management API returns 401 with bad token", async () => {
 test("GET /api/management/seats returns per-seat status and plan", async () => {
   const port = await getFreePort();
   const deps = createManagementApi(port);
-  const api = startManagementApi(
+  const api = await startManagementApi(
     { host: HOST, port, token: TOKEN, enabled: true },
     managementDeps(port),
   );
@@ -160,7 +160,7 @@ test("GET /api/management/seats returns per-seat status and plan", async () => {
 test("POST /api/management/seats/:id/drain accepts valid drain request", async () => {
   const port = await getFreePort();
   const deps = createManagementApi(port);
-  const api = startManagementApi(
+  const api = await startManagementApi(
     { host: HOST, port, token: TOKEN, enabled: true },
     managementDeps(port),
   );
@@ -188,7 +188,7 @@ test("POST /api/management/seats/:id/drain accepts valid drain request", async (
 test("POST /api/management/seats/:id/drain rejects protected seat", async () => {
   const port = await getFreePort();
   const deps = createManagementApi(port);
-  const api = startManagementApi(
+  const api = await startManagementApi(
     { host: HOST, port, token: TOKEN, enabled: true },
     managementDeps(port),
   );
@@ -216,7 +216,7 @@ test("POST /api/management/seats/:id/drain rejects protected seat", async () => 
 test("POST /api/management/seats/:id/drain rejects missing drainId", async () => {
   const port = await getFreePort();
   const deps = createManagementApi(port);
-  const api = startManagementApi(
+  const api = await startManagementApi(
     { host: HOST, port, token: TOKEN, enabled: true },
     managementDeps(port),
   );
@@ -254,7 +254,7 @@ test("POST /api/management/seats/:id/activate activates a drained seat", async (
   // Change generation to allow release
   deps.seats[1] = { ...deps.seats[1], generation: "gen-b-new" };
 
-  const api = startManagementApi(
+  const api = await startManagementApi(
     { host: HOST, port, token: TOKEN, enabled: true },
     managementDeps(port),
   );
@@ -281,7 +281,7 @@ test("POST /api/management/seats/:id/activate activates a drained seat", async (
 test("POST /api/management/reconcile returns warm-pool plan", async () => {
   const port = await getFreePort();
   const deps = createManagementApi(port);
-  const api = startManagementApi(
+  const api = await startManagementApi(
     { host: HOST, port, token: TOKEN, enabled: true },
     managementDeps(port),
   );
@@ -306,7 +306,7 @@ test("POST /api/management/reconcile returns warm-pool plan", async () => {
 test("GET /api/management/research returns permit metrics", async () => {
   const port = await getFreePort();
   const deps = createManagementApi(port);
-  const api = startManagementApi(
+  const api = await startManagementApi(
     { host: HOST, port, token: TOKEN, enabled: true },
     managementDeps(port),
   );
@@ -329,7 +329,7 @@ test("GET /api/management/research returns permit metrics", async () => {
 test("management API returns 404 for unknown endpoints", async () => {
   const port = await getFreePort();
   const deps = createManagementApi(port);
-  const api = startManagementApi(
+  const api = await startManagementApi(
     { host: HOST, port, token: TOKEN, enabled: true },
     managementDeps(port),
   );
@@ -343,9 +343,9 @@ test("management API returns 404 for unknown endpoints", async () => {
   await api!.close();
 });
 
-test("management API does not start when disabled", () => {
+test("management API does not start when disabled", async () => {
   const deps = createManagementApi(0);
-  const api = startManagementApi(
+  const api = await startManagementApi(
     { host: HOST, port: 0, token: TOKEN, enabled: false },
     managementDeps(0),
   );
@@ -355,7 +355,7 @@ test("management API does not start when disabled", () => {
 test("invalid body (not JSON) returns 400", async () => {
   const port = await getFreePort();
   const deps = createManagementApi(port);
-  const api = startManagementApi(
+  const api = await startManagementApi(
     { host: HOST, port, token: TOKEN, enabled: true },
     managementDeps(port),
   );
@@ -381,7 +381,7 @@ test("invalid body (not JSON) returns 400", async () => {
 test("seat id with special characters is rejected", async () => {
   const port = await getFreePort();
   const deps = createManagementApi(port);
-  const api = startManagementApi(
+  const api = await startManagementApi(
     { host: HOST, port, token: TOKEN, enabled: true },
     managementDeps(port),
   );
