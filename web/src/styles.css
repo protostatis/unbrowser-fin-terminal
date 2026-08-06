@@ -2032,6 +2032,34 @@ strong {
   cursor: default;
 }
 
+/* Dismiss the corner toggle entirely. Subdued full-width footer button so it
+   reads as a low-priority "get this out of my way" action. */
+.interaction-dismiss-btn {
+  appearance: none;
+  display: block;
+  width: 100%;
+  margin-top: 8px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  border: 1px solid #30363d;
+  background: transparent;
+  color: #8b949e;
+  font: inherit;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.interaction-dismiss-btn:hover {
+  color: #c9d1d9;
+  border-color: #6e2b2b;
+}
+.interaction-dismiss-btn:focus-visible {
+  outline: 2px solid #58a6ff;
+  outline-offset: 1px;
+}
+
 .interaction-btn-key {
   color: inherit;
   opacity: 0.6;
