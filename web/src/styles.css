@@ -1059,6 +1059,155 @@ strong {
   box-shadow: 0 -10px 30px #0008;
 }
 
+/* Floating symbol-search trigger. Replaces the touch command deck: the
+   terminal is scroll- and tap-driven, and this single button opens the
+   ticker lookup sheet (the only action that needs a real keyboard).
+   Hidden by default; the coarse-pointer media query below reveals it. */
+.mobile-search-fab {
+  display: none;
+  position: absolute;
+  right: max(12px, env(safe-area-inset-right));
+  bottom: max(14px, env(safe-area-inset-bottom));
+  z-index: 60;
+  width: 52px;
+  height: 52px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid #1f6feb;
+  color: #0d1117;
+  background: linear-gradient(180deg, #79c0ff, #388bfd);
+  box-shadow: 0 6px 20px #000a;
+  font-size: 24px;
+  line-height: 1;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.mobile-search-fab:active:not(:disabled) {
+  transform: translateY(2px);
+  box-shadow: 0 3px 10px #000a;
+}
+
+.mobile-search-fab:focus-visible {
+  outline: 2px solid #58a6ff;
+  outline-offset: 2px;
+}
+
+.mobile-search-fab:disabled {
+  opacity: 0.5;
+}
+
+/* ── Contextual touch controls (Option C HUD) ────────────────────────────
+   One top-right overlay column, touch-only (a coarse-pointer query reveals
+   it). Desktop keeps keyboard shortcuts. It floats OVER the terminal without
+   displacing it. The column holds an always-visible ‹ Back (ticker only) and
+   a fading action cluster; only the buttons themselves ever capture taps, so
+   empty space passes through to the terminal beneath. Keeping everything
+   top-right avoids the ticker's top-left scope/tab controls. */
+.context-hud-anchor,
+.context-back,
+.context-hud,
+.context-hud-chip {
+  appearance: none;
+  font-family: inherit;
+  font-weight: 700;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.context-hud-anchor,
+.context-back,
+.context-hud {
+  display: none; /* shown only on touch via the media query below */
+}
+
+.context-hud-chip {
+  display: block;
+  min-height: 40px;
+  padding: 7px 12px;
+  border-radius: 8px;
+  border: 1px solid #30363d;
+  background: #0d1117f2;
+  color: #c9d1d9;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  backdrop-filter: blur(4px);
+}
+.context-hud-chip:active:not(:disabled) { transform: translateY(1px); }
+.context-hud-chip:focus-visible { outline: 2px solid #58a6ff; outline-offset: 2px; }
+.context-hud-chip:disabled { opacity: 0.5; }
+.context-hud-chip-accent { color: #79c0ff; border-color: #1f6feb; }
+.context-hud-chip-warning { color: #ffb4ae; border-color: #6e2b2b; }
+
+@media (hover: none) and (pointer: coarse) {
+  /* The top-right column. pointer-events:none on the column itself so empty
+     areas pass taps through; children opt back in. */
+  .context-hud-anchor {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 6px;
+    position: absolute;
+    top: max(8px, env(safe-area-inset-top));
+    right: max(8px, env(safe-area-inset-right));
+    z-index: 56;
+    max-width: 44vw;
+    pointer-events: none;
+  }
+
+  /* Persistent back — always visible at the top of the column (ticker only).
+     Essential navigation: a guaranteed touch path back to the market map. */
+  .context-back {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 40px;
+    height: 40px;
+    padding: 0;
+    border-radius: 8px;
+    border: 1px solid #30363d;
+    background: #0d1117f2;
+    color: #c9d1d9;
+    font-size: 22px;
+    line-height: 1;
+    pointer-events: auto;
+    backdrop-filter: blur(4px);
+  }
+  .context-back:active:not(:disabled) { transform: translateY(1px); }
+  .context-back:focus-visible { outline: 2px solid #58a6ff; outline-offset: 2px; }
+  .context-back:disabled { opacity: 0.5; }
+
+  /* Fading action cluster — sits below the back button, fades in on contact,
+     out on idle. Chips only capture taps while visible. */
+  .context-hud {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 6px;
+    opacity: 0;
+    transform: translateY(-6px);
+    pointer-events: none;
+    transition: opacity 0.18s ease, transform 0.18s ease;
+  }
+  .context-hud-visible {
+    opacity: 1;
+    transform: none;
+  }
+  .context-hud-visible .context-hud-chip {
+    pointer-events: auto;
+  }
+
+  /* Keep the top-center research beacon clear of the top-right column. */
+  .research-beacon {
+    max-width: calc(100% - 170px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .context-hud { transition: none; }
+}
+
 .mobile-console-head {
   display: grid;
   grid-template-columns: auto 1fr auto;
@@ -1470,12 +1619,24 @@ strong {
 }
 
 @media (hover: none) and (pointer: coarse) {
+  /* The touch command deck is retired in favour of scroll + tap on terminal
+     rows (rows already map to select/open/navigate/scope actions). Only the
+     floating search button remains. Research status stays visible via the top
+     beacon — the container-query rule above hides it on narrow widths, so
+     re-show it here to avoid losing agent feedback when the deck is gone. */
   .research-beacon {
-    display: none;
+    display: inline-flex;
+    max-width: calc(100% - 16px);
   }
 
   .mobile-controls {
-    display: block;
+    display: none;
+  }
+
+  .mobile-search-fab {
+    display: flex;
+    align-items: center;
+    justify-content: center;
   }
 
   .terminal-frame {
@@ -1871,6 +2032,34 @@ strong {
   cursor: default;
 }
 
+/* Dismiss the corner toggle entirely. Subdued full-width footer button so it
+   reads as a low-priority "get this out of my way" action. */
+.interaction-dismiss-btn {
+  appearance: none;
+  display: block;
+  width: 100%;
+  margin-top: 8px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  border: 1px solid #30363d;
+  background: transparent;
+  color: #8b949e;
+  font: inherit;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.interaction-dismiss-btn:hover {
+  color: #c9d1d9;
+  border-color: #6e2b2b;
+}
+.interaction-dismiss-btn:focus-visible {
+  outline: 2px solid #58a6ff;
+  outline-offset: 1px;
+}
+
 .interaction-btn-key {
   color: inherit;
   opacity: 0.6;
@@ -2062,37 +2251,38 @@ strong {
 }
 
 @media (hover: none) and (pointer: coarse) {
+  /* Float the controls toggle at bottom-left, mirroring the search FAB at
+     bottom-right (same 52px size, same baseline) so the two corner buttons
+     read as an aligned pair. The overlay is pulled out of flow so a closed
+     toggle consumes no content row. */
   .interaction-overlay {
-    position: relative;
-    right: auto;
-    left: auto;
-    bottom: auto;
-    max-width: none;
-    width: 100%;
-    z-index: 59;
-    flex-shrink: 0;
-  }
-
-  .interaction-overlay[data-overlay-open] {
     position: absolute;
     right: 0;
     left: 0;
     bottom: 0;
+    max-width: none;
+    width: 100%;
+    z-index: 59;
+  }
+
+  .interaction-overlay[data-overlay-open] {
     z-index: 60;
   }
 
   .interaction-toggle {
-    position: relative;
-    margin: 0 auto 4px 8px;
-    bottom: auto;
-    width: 26px;
-    height: 20px;
-    border-radius: 3px;
+    position: absolute;
+    left: max(12px, env(safe-area-inset-left));
+    bottom: max(14px, env(safe-area-inset-bottom));
+    margin: 0;
+    width: 52px;
+    height: 52px;
+    border-radius: 50%;
     padding: 0;
+    font-size: 13px;
   }
 
   .interaction-toggle-chevron {
-    font-size: 8px;
+    font-size: 11px;
   }
 
   .interaction-panel {

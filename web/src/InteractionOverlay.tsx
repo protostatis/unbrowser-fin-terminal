@@ -32,6 +32,9 @@ export function InteractionOverlay({
   onReturnToTerminal,
 }: InteractionOverlayProps) {
   const [open, setOpen] = useState(false);
+  /* Once dismissed, the corner toggle stays hidden until the page reloads —
+   * the contextual HUD now covers everything this panel offered on touch. */
+  const [dismissed, setDismissed] = useState(false);
 
   /* Close the overlay when the terminal becomes fully disabled (e.g. panel
    * was closed remotely), so the toggle starts collapsed for the next session. */
@@ -78,6 +81,8 @@ export function InteractionOverlay({
   );
 
   const toggleOpen = useCallback(() => setOpen((v) => !v), []);
+
+  if (dismissed) return null;
 
   /* ── Render ────────────────────────────────────────────────────────── */
 
@@ -288,6 +293,18 @@ export function InteractionOverlay({
                   : "Controls unavailable"}
             </div>
           )}
+
+          {/* ── Dismiss the corner toggle entirely ─────────────────────── */}
+          <button
+            type="button"
+            className="interaction-dismiss-btn"
+            onClick={() => {
+              setDismissed(true);
+              setOpen(false);
+            }}
+          >
+            Hide controls
+          </button>
         </div>
       )}
     </section>
