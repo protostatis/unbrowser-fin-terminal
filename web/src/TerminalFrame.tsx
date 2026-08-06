@@ -37,6 +37,13 @@ const WHEEL_ACTION_INTERVAL_MS = 520;
 const WHEEL_DELTA_LINE = 1;
 const WHEEL_DELTA_PAGE = 2;
 
+/**
+ * Horizontal swipes that begin within this many pixels of either screen edge
+ * are ignored so the OS/browser keeps its own back-gesture (iOS edge-back,
+ * Android gesture-nav). Only mid-screen drags become the screen/tab carousel.
+ */
+const SWIPE_EDGE_GUARD_PX = 28;
+
 type TouchGesture = {
   point: SwipePoint;
   pane?: TerminalPane;
@@ -276,15 +283,26 @@ export const TerminalFrame = memo(function TerminalFrame({
           !event.isPrimary
         ) return;
         const end = pointerPoint(event);
-        const input = horizontalSwipeInput(start.point, end);
-        if (input) {
-          suppressClickRef.current = true;
-          onInput?.(input);
-          requestAnimationFrame(() => {
-            suppressClickRef.current = false;
-          });
-          return;
+
+        // Horizontal swipe = move between sibling views: the screen carousel
+        // (MARKET→SIGNALS→…→WATCH) in the market map, or Quote↔Research tab in
+        // a ticker. Both answer to the left/right arrow keys. Skipped when the
+        // gesture begins in the OS back-gesture edge zone (see guard above).
+        if (
+          start.point.x > SWIPE_EDGE_GUARD_PX &&
+          start.point.x < window.innerWidth - SWIPE_EDGE_GUARD_PX
+        ) {
+          const input = horizontalSwipeInput(start.point, end);
+          if (input) {
+            suppressClickRef.current = true;
+            onInput?.(input);
+            requestAnimationFrame(() => {
+              suppressClickRef.current = false;
+            });
+            return;
+          }
         }
+
         const scroll = verticalSwipeScroll(start.point, end);
         const canScrollAtTouchStart = start.pane
           ? canUsePointerScroll(state, start.pane)

@@ -225,6 +225,24 @@ export function MobileControls({
         </div>
       </footer>
 
+      {/* Touch-only symbol-search trigger. The command deck above is hidden on
+          touch devices (see styles.css): the terminal becomes scroll- and
+          tap-driven, and this single floating button opens the ticker lookup
+          sheet — the one deck action that genuinely needs a real keyboard. */}
+      <button
+        type="button"
+        className="mobile-search-fab"
+        aria-label="Search symbol"
+        disabled={disabled}
+        onClick={() => {
+          setQuery("");
+          setSearchError("");
+          setSearchOpen(true);
+        }}
+      >
+        <span aria-hidden="true">⌕</span>
+      </button>
+
       {searchOpen && (
         <div
           className="symbol-search-overlay"

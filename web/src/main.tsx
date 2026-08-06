@@ -10,6 +10,7 @@ import { createRoot } from "react-dom/client";
 import { TerminalSocket } from "./socket";
 import { TerminalFrame } from "./TerminalFrame";
 import { MobileControls } from "./MobileControls";
+import { ContextHud } from "./ContextHud";
 import {
   recentResearchStatuses,
   researchActivityStatus,
@@ -546,6 +547,15 @@ export function App({
         disabled={cs !== "connected" || Boolean(selectReq) || evidenceOpen || isClosedRef.current}
         onInput={handleTouchInput}
         onReturnToTerminal={focusTerminal}
+      />
+
+      {/* Touch-only contextual controls: persistent ‹ Back (ticker) + a fading
+          action cluster (Why/Watch/Refresh/Cancel) overlaid on the terminal. */}
+      <ContextHud
+        state={frameStateRef.current}
+        researchStatus={cs === "connected" ? researchStatus : undefined}
+        disabled={cs !== "connected" || Boolean(selectReq) || evidenceOpen || isClosedRef.current}
+        onInput={handleTouchInput}
       />
 
       {/* Toast notification */}
