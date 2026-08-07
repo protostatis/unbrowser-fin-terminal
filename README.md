@@ -288,7 +288,75 @@ contexts are isolated as well, so an earnings WHY result cannot satisfy a macro
 BRIEF cache request. Older archives without identity metadata remain browsable
 as `LEGACY`, but are never reused for a newly keyed request.
 
-The `1`–`5` keys switch chart range/interval (DAY 5m pre/post, WEEK 15m, MONTH hourly, YEAR daily, TOTAL coarse long-term bars). Yahoo may coarsen the requested total-history interval. Non-day scopes compute last-bar return instead of same-session 1h momentum and label SMA/EMA/RSI/MACD as bar-based with the active scope.
+### Research cache pre-warming
+
+When a session starts (the `/market` flow in TUI, the live server, or a private
+workspace), the terminal bootstraps the shared research cache with the agent
+requests a fresh session is most likely to make: the Market Story BRIEF (news),
+a BRIEF for **every** watchlist ticker, and a BRIEF for the current **top-10
+movers** (discovered by a best-effort market snapshot fetch at bootstrap). These
+run as ordinary background research jobs through the same FIFO queue and
+isolated workers, so their completed canvases are written to the shared archive
+and reused by every later session. The first user request of the day for a
+pre-warmed identity then hits the cache prompt with a current-date `AS OF`
+instead of starting a cold research run.
+
+Pre-warming is date-gated, not freshness-maximal: an identity is only rebuilt
+when its newest archived canvas is not from the current UTC calendar date, so a
+weekend of inactivity costs one rebuild, not a job per session. Jobs already
+covered or already running are skipped.
+
+Pre-warm jobs never compete with interactive research: at most
+`MARKET_RESEARCH_CONCURRENCY - 1` warm jobs are in flight at once (one worker
+slot stays reserved for user requests; `MARKET_RESEARCH_CONCURRENCY=1`
+disables pre-warming), and warm submission pauses entirely while any
+user-triggered research is active, resuming as slots open. Warm jobs appear in
+the normal research queue and are cancellable with `C`. A session transition
+that cancels an in-flight warm run re-plans on the next fresh session instead
+of staying cold.
+
+Configure it with environment variables:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MARKET_PRECACHE_ENABLED` | `1` (private/live/TUI), `0` (public workers) | Master switch, `1/true/on` or `0/false/off`. Public workers spend the visitor's bounded research budget (`PUBLIC_MAX_RESEARCH_RUNS`), so they stay cold unless this is explicitly set. |
+| `MARKET_PRECACHE_TICKERS` | active watchlist | Comma-separated tickers to pre-warm (e.g. `AAPL,NVDA,TSLA`); `none` disables ticker pre-warming (Market Story + movers only). A non-empty list with no valid symbols is a configuration error. |
+| `MARKET_PRECACHE_MAX_JOBS` | `24` | Cap on the pre-warm plan per bootstrap (Market Story + watchlist + movers), `1`–`24`. In-flight warm jobs are additionally capped at `MARKET_RESEARCH_CONCURRENCY - 1`. |
+| `MARKET_PRECACHE_QUALITY_GATE` | `1` | A/B switch for the quality gates. When on (default): a pre-warm identity is fresh only when the archive holds a **usable** same-day canvas (complete, fetched-evidence, item-level sourced read, no scenarios in a BRIEF) — evidence-blocked or unsupported canvases never satisfy the cache and are re-warmed; and a missing `UNBROWSER_MCP_URL` skips the source pre-warm entirely (extraction has no local fallback, so it would only produce degraded TA-only canvases). Set to `0` to restore the baseline date-only freshness and fan-out. |
+
+Quality is enforced host-side, not by the model: `assessCanvasQuality` requires a
+complete canvas with at least one fetched packet whose read (and any evidence
+blocks) carry item-level `sourceIds` referring to fetched sources, so a search-title
+hallucination like "Q2 beat expectations" with no fetched support can never be
+served as a warm brief. Duplicate agent `sources` blocks are coalesced (fetched
+status wins; `ta-*` sources preserved), and a stale `evidenceBlocker` is cleared
+only when new fetched evidence actually arrives. The cache prompt labels degraded
+hits (`CACHED … · EVIDENCE BLOCKED · [U] USE [F] REFRESH`). If three consecutive
+pre-warm completions come back non-usable — e.g. a configured-but-broken
+extractor — the warm circuit opens for 15 minutes and the remaining plan pauses
+instead of re-fanning out on every session.
+
+The ledger (typed quality telemetry persisted on every archived record, plus the
+generation's prompt variant and origin) drives a bounded **identity cooldown**:
+after two consecutive attempts that all failed with infrastructure-class codes
+(evidence blocked/none/no-fetched), an identity is skipped until the cooldown
+expires (default 2h), then probed again — so a fixed extractor or un-blocked
+source is recovered, while structural violations (missing read, scenarios in a
+BRIEF) never trigger a cooldown because those are prompt/cohort problems, not
+per-identity ones. The first dispatched warm job is an **extraction canary**: the
+rest of the plan waits for its verdict, and the circuit opens immediately only if
+a completed canary reaches zero sources end-to-end (challenged/limited pages
+prove the extractor was reachable).
+
+The shared archive assumes one parent terminal process writes per archive path;
+use a single `MARKET_DATA_DIR` writer (or exclusive mounts) when multiple
+processes share storage.
+
+The `1`–`5` keys switch chart range/interval (DAY 5m pre/post, WEEK 15m, MONTH
+hourly, YEAR daily, TOTAL coarse long-term bars). Yahoo may coarsen the
+requested total-history interval. Non-day scopes compute last-bar return
+instead of same-session 1h momentum and label SMA/EMA/RSI/MACD as bar-based
+with the active scope.
 
 ## Data notice
 

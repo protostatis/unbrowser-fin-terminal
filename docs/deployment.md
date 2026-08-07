@@ -103,6 +103,35 @@ deployment fallback for a normal terminal release.
   persistent research archive and should coordinate ownership of the active
   WebSocket session.
 
+## Research Cache Pre-Warming Configuration
+
+The research-cache pre-warm runs at session bootstrap in the authenticated live
+server and private-workspace runtimes (public workers stay cold by default —
+their research budget belongs to the visitor). It is quality-gated and
+fail-closed:
+
+| Env | Default | Production guidance |
+|---|---|---|
+| `MARKET_PRECACHE_ENABLED` | on (non-public) | Leave on; `0` disables pre-warming entirely |
+| `MARKET_PRECACHE_QUALITY_GATE` | `1` | Leave on. Prevents evidence-blocked canvases from being cached as warm and runs the extraction canary + identity cooldown |
+| `MARKET_PRECACHE_MAX_JOBS` | `24` | Cap the warm plan (Market Story + watchlist + top-10 movers) |
+| `MARKET_PRECACHE_TICKERS` | active watchlist | Override the pre-warmed ticker set; `none` disables ticker warming |
+| `MARKET_RESEARCH_PROMPT` | `legacy` | **Recommended: `compact`** — hard output contract, ~36% less job-instruction context, and eliminates the search-title hallucination observed under `legacy` (benchmarked; see the branch's benchmark script `scripts/benchmark-prompts.ts`) |
+
+Behavior to expect in production:
+
+- The first dispatched warm job is an **extraction canary**: the rest of the
+  plan waits for its verdict, and the warm circuit opens immediately only if a
+  completed canary reaches zero sources end-to-end (challenged/limited pages
+  prove the extractor is reachable).
+- Identities whose recent attempts all failed with infrastructure-class codes
+  enter a bounded cooldown (default 2h) and are then re-probed, so a fixed
+  extractor or un-blocked source recovers without wasting workers.
+- Completed canvases are archived to `$MARKET_DATA_DIR/market-research-archive.json`
+  with typed quality telemetry (`quality`, `generation`), and are shared across
+  sessions. One parent process writes per archive path (the deployment is a
+  singleton; public workers do not warm).
+
 ## Post-Deployment Verification
 
 - Confirm the GitHub Actions production job succeeded.
