@@ -29,6 +29,21 @@ test("mobile actions adapt to market, ticker, research, and cache states", () =>
   assert.equal(ticker[0]?.id, "back");
   assert.equal(ticker.find((action) => action.id === "watch")?.label, "Unwatch");
 
+  const archivedTicker = mobileActions({
+    mode: "ticker",
+    screen: "RESEARCH",
+    archive: { position: 1, count: 3 },
+  });
+  assert.deepEqual(archivedTicker.map((action) => action.id), [
+    "back",
+    "why",
+    "older",
+    "newer",
+    "sync",
+    "search",
+  ]);
+  assert.equal(archivedTicker.find((action) => action.id === "older")?.disabled, false);
+
   const researching = mobileActions({
     mode: "market",
     research: { active: true },

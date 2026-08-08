@@ -240,7 +240,7 @@ the singleton session and preserves its current state.
 |---|---|
 | `1`–`5` | Change chart scope (DAY / WEEK / MONTH / YEAR / TOTAL) |
 | `←` / `→` or `A` / `D` | Switch top-level screens or ticker tabs |
-| `↑` / `↓` or `W` / `S` | Select in lists, or scroll the focused research pane |
+| `↑` / `↓` or `W` / `S` | Select in lists; in a Quote opened from MOVERS or WATCH, cycle that source list; otherwise scroll the focused research pane |
 | `Tab` | Switch pane focus in SIGNALS and EVENTS. In terminal keyboard mode it stays in the app instead of tabbing through browser controls. |
 | `Enter` (or `J`) | Primary action: open a ticker, or build a source-verified factual BRIEF |
 | `K` | Secondary WHY analysis with causal channels, scenarios, and disconfirming evidence |
@@ -249,6 +249,12 @@ the singleton session and preserves its current state.
 | `C` | Cancel research for the currently selected lane, headline, or ticker context |
 | `B` / `Esc` | Return from a ticker to the Market Map |
 | `Q` | Close the UI without cancelling research |
+
+When a ticker is opened from MOVERS or WATCH, its source order is retained for
+that detail session. Press `A` to enter Quote, then `W` / `↑` for the previous
+ticker or `S` / `↓` for the next; the list wraps at either end. Research and
+wide Split keep those keys for their reading/scroll behavior, so the control
+does not change while a canvas loads.
 
 ## Movers and watchlists
 

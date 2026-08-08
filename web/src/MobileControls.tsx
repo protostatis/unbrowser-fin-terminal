@@ -46,6 +46,12 @@ export function MobileControls({
   const actions = mobileActions(state);
   const primaryLabel = primaryActionLabel(state);
   const researchSubject = researchStatus?.contextLabel ?? researchStatus?.symbol;
+  const tickerCycle = state?.mode === "ticker"
+    && state.tickerLayout === "quote"
+    && (state.tickerNavigation?.count ?? 0) > 1
+    ? state.tickerNavigation
+    : undefined;
+  const tickerCycleSource = tickerCycle?.source === "watch" ? "watchlist" : "movers";
 
   const closeSearch = () => {
     setSearchOpen(false);
@@ -151,12 +157,12 @@ export function MobileControls({
           <button
             type="button"
             className="mobile-key mobile-key-nav"
-            aria-label="Move selection or research up"
+            aria-label={tickerCycle ? `Previous ${tickerCycleSource} ticker` : "Move selection or research up"}
             disabled={disabled || cacheLocked}
             onClick={() => onInput(TERMINAL_INPUTS.up)}
           >
             <span aria-hidden="true">↑</span>
-            <small>MOVE</small>
+            <small>{tickerCycle ? "CYCLE" : "MOVE"}</small>
           </button>
           <button
             type="button"
@@ -171,12 +177,12 @@ export function MobileControls({
           <button
             type="button"
             className="mobile-key mobile-key-nav"
-            aria-label="Move selection or research down"
+            aria-label={tickerCycle ? `Next ${tickerCycleSource} ticker` : "Move selection or research down"}
             disabled={disabled || cacheLocked}
             onClick={() => onInput(TERMINAL_INPUTS.down)}
           >
             <span aria-hidden="true">↓</span>
-            <small>MOVE</small>
+            <small>{tickerCycle ? "CYCLE" : "MOVE"}</small>
           </button>
           <button
             type="button"
