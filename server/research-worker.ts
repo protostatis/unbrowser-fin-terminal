@@ -327,13 +327,13 @@ export async function dispatchAndWaitForSettlement(
   activeSession: AgentSession,
   command: string,
   options: ResearchSettlementOptions = {},
-  onCommandAccepted: () => void = () => {},
+  onCommandDispatched: () => void = () => {},
 ): Promise<void> {
   const settlement = waitForSettlement(activeSession, options);
   // Subscribe before dispatch: a queued follow-up may start and settle before
   // the command prompt's promise continuation runs.
+  onCommandDispatched();
   await activeSession.prompt(command);
-  onCommandAccepted();
   await settlement;
 }
 

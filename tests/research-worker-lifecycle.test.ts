@@ -52,6 +52,39 @@ test("research worker ignores settlement until the model turn starts", async () 
   ));
 });
 
+test("research worker marks dispatch before prompt rejection after progress", async () => {
+  let listener: ((event: SessionEvent) => void) | undefined;
+  let dispatched = false;
+  const session = {
+    subscribe(next: (event: SessionEvent) => void) {
+      listener = next;
+      return () => { listener = undefined; };
+    },
+    extensionRunner: {
+      onError() {
+        return () => {};
+      },
+    },
+    async prompt() {
+      assert.equal(dispatched, true);
+      listener?.({ type: "agent_start" });
+      listener?.({ type: "agent_settled" });
+      throw new Error("prompt rejected after progress");
+    },
+  } as unknown as AgentSession;
+
+  await assert.rejects(
+    () => dispatchAndWaitForSettlement(
+      session,
+      "/market-worker-run test",
+      { dispatchTimeoutMs: 50, runTimeoutMs: 100 },
+      () => { dispatched = true; },
+    ),
+    /prompt rejected after progress/,
+  );
+  assert.equal(dispatched, true);
+});
+
 test("runtime fatal events supersede progress sequences without leaking sensitive error text", () => {
   const run: WorkerRunMessage = {
     version: 1,
