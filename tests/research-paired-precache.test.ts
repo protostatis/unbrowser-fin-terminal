@@ -263,6 +263,48 @@ test("splitPairedCanvas rejects duplicate post-prefix IDs and partial canvases",
   assert.ok("error" in splitPairedCanvas({ ...pairedCanvas(), stage: "partial" }, BRIEF_ID, WHY_ID));
 });
 
+test("splitPairedCanvas rejects shared-only and one-sided complete canvases", () => {
+  const complete = pairedCanvas();
+  const sharedOnly = { ...complete, blocks: complete.blocks.filter((block) => block.id?.startsWith("shared-")) };
+  assert.ok("error" in splitPairedCanvas(sharedOnly, BRIEF_ID, WHY_ID));
+
+  const oneSided = { ...complete, blocks: complete.blocks.filter((block) => !block.id?.startsWith("why-")) };
+  assert.ok("error" in splitPairedCanvas(oneSided, BRIEF_ID, WHY_ID));
+});
+
+test("splitPairedCanvas enforces sourced reads and the paired block schema", () => {
+  const complete = pairedCanvas();
+  const unsourced = {
+    ...complete,
+    blocks: complete.blocks.map((block) => block.id === "brief-read" ? { ...block, sourceIds: undefined } : block),
+  };
+  assert.ok("error" in splitPairedCanvas(unsourced, BRIEF_ID, WHY_ID));
+
+  const briefScenario = {
+    ...complete,
+    blocks: [...complete.blocks, { id: "brief-scenarios", kind: "bullets" as const, items: [{ text: "bull" }], dossierHint: "scenarios" as const }],
+  };
+  assert.ok("error" in splitPairedCanvas(briefScenario, BRIEF_ID, WHY_ID));
+
+  const unexpected = {
+    ...complete,
+    blocks: [...complete.blocks, { id: "why-extra", kind: "text" as const, text: "extra" }],
+  };
+  assert.ok("error" in splitPairedCanvas(unexpected, BRIEF_ID, WHY_ID));
+});
+
+test("splitPairedCanvas rejects duplicate shared source blocks before coalescing", () => {
+  const complete = pairedCanvas();
+  const duplicateSources = {
+    ...complete,
+    blocks: [
+      ...complete.blocks,
+      { id: "shared-sources", kind: "sources" as const, items: [{ id: "S2", label: "two", url: "https://two.example", status: "fetched" as const }] },
+    ],
+  };
+  assert.ok("error" in splitPairedCanvas(duplicateSources, BRIEF_ID, WHY_ID));
+});
+
 // ── Durable budget primitives ─────────────────────────────────────────────
 
 test("pairedPairKey includes symbol and chart scope", () => {
