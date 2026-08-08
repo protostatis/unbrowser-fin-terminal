@@ -11,6 +11,7 @@ A keyboard-first market terminal for the [Pi coding agent](https://github.com/ea
 - Automatic MOVERS watch ranks up to 100 liquid US names by price movement and dollar volume
 - Agent research through `unbrowser`, rendered as structured charts, metrics, tables, news, risks, and sources
 - On-demand EVENTS catalyst monitor for earnings, macro, and global handoff research (not a live calendar feed)
+- Opt-in shadow event scouting across official public feeds, with deterministic market/ticker association and no model dispatch
 - Independently keyed background research jobs with a visible FIFO queue, contextual cancellation, and honest status labels
 - Up to two isolated Pi research workers run concurrently while the Market Map remains responsive
 - Scope-aware snapshot age, quote coverage, stale/sync state, mover eligibility, and watchlist coverage
@@ -24,7 +25,7 @@ A keyboard-first market terminal for the [Pi coding agent](https://github.com/ea
 - [Pi coding agent](https://github.com/earendil-works/pi-coding-agent)
 - An OpenRouter key or another model configured in Pi for agent research
 - An isolated `unbrowser` MCP endpoint for source extraction; local `unbrowser`
-  on `PATH` remains a development fallback for discovery only
+  on `PATH` remains a development fallback for discovery and shadow feed scouting
 
 ## Run
 
@@ -43,6 +44,8 @@ Then use:
 /market                 Open the Market Map
 /market AAPL            Open a ticker panel
 /market-history AAPL    Browse archived research
+/market-scout status    Inspect shadow event-source health and decisions
+/market-scout sync      Poll event sources that are currently due
 /market-debug market    Open deterministic debug fixtures
 ```
 
@@ -288,6 +291,39 @@ contexts are isolated as well, so an earnings WHY result cannot satisfy a macro
 BRIEF cache request. Older archives without identity metadata remain browsable
 as `LEGACY`, but are never reused for a newly keyed request.
 
+### Shadow public-feed event scout
+
+Set `MARKET_SCOUT_ENABLED=1` to poll a bounded graph of primary public RSS/Atom
+sources through Unbrowser: Nasdaq trade halts and corporate actions, SEC current
+filings, Federal Reserve monetary-policy releases, BEA releases, FTC press
+releases, and DOJ news. Production uses `UNBROWSER_MCP_URL`; local development
+can use a short-lived `unbrowser` CLI session only when explicitly enabled with
+`MARKET_SCOUT_LOCAL_CLI=1` and no MCP endpoint is set.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MARKET_SCOUT_ENABLED` | `0` | Enable the singleton background scheduler with `1/true/on`. Public and research workers remain hard-disabled. |
+| `MARKET_SCOUT_LOCAL_CLI` | `0` | Explicit development-only fallback when `UNBROWSER_MCP_URL` is absent. Ignored in production. |
+
+The first successful poll of each source establishes a baseline and emits no
+events. Later unseen items are classified and associated deterministically:
+exchange-provided symbols are strongest, explicit exchange/ticker notation is
+next, and intentionally market-wide macro sources map to the macro lane.
+High-confidence items are labeled `admit-shadow`; ambiguous items are retained
+as `watch`; unsupported or stale items are counted as `suppress` but not stored
+in the recent-decision list.
+
+This is intentionally observation-only. It never starts agent research, reserves
+tokens, writes research canvases, or scrapes unattended search-result pages.
+Use `/market-scout status` to inspect source health and recent decisions, and
+`/market-scout sync` to poll only sources whose configured interval is due. The
+bounded atomic journal is
+`$MARKET_DATA_DIR/market-event-scout.json` (or `.pi/market-event-scout.json`).
+The scheduler is off by default and is always disabled in disposable public
+workers and the public gateway, even if the environment variable is set.
+Truncated, incomplete, or over-limit feeds fail the source poll without
+advancing its baseline or dedupe state.
+
 ### Research cache pre-warming
 
 When a session starts (the `/market` flow in TUI, the live server, or a private
@@ -360,9 +396,9 @@ rest of the plan waits for its verdict, and the circuit opens immediately only i
 a completed canary reaches zero sources end-to-end (challenged/limited pages
 prove the extractor was reachable).
 
-The shared archive and pre-cache budget ledger assume one parent terminal
-process writes per `MARKET_DATA_DIR`; use a single writer (or exclusive mounts)
-when multiple processes share storage.
+The shared archive, pre-cache budget ledger, and event-scout journal assume one
+parent terminal process writes per `MARKET_DATA_DIR`; use a single writer (or
+exclusive mounts) when multiple processes share storage.
 
 The `1`–`5` keys switch chart range/interval (DAY 5m pre/post, WEEK 15m, MONTH
 hourly, YEAR daily, TOTAL coarse long-term bars). Yahoo may coarsen the

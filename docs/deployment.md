@@ -155,6 +155,40 @@ Behavior to expect in production:
   sessions. One parent process writes both archive and pre-cache ledger per data
   directory (the deployment is a singleton; public workers do not warm).
 
+## Shadow Market-Event Scout
+
+The event scout is a separate, opt-in observation loop. It polls official public
+RSS/Atom sources through Unbrowser, records deterministic `admit-shadow`, `watch`,
+and suppression counters, and does **not** dispatch a model, reserve pre-cache
+budget, or mutate research canvases.
+
+| Env | Default | Production guidance |
+|---|---|---|
+| `MARKET_SCOUT_ENABLED` | `0` | Enable only on the authenticated singleton parent while collecting shadow evidence. `1/true/on` enables; `0/false/off` disables |
+| `UNBROWSER_MCP_URL` | required in production | Use the private Docker-internal MCP endpoint. The local CLI fallback is development-only |
+| `MARKET_SCOUT_LOCAL_CLI` | `0` | Keep disabled in every deployed runtime. It is an explicit local-development fallback and cannot replace MCP in production |
+| `MARKET_DATA_DIR` | project `.pi/` | The scout journal is `market-event-scout.json`; mount the same exclusive parent-writer data volume used by the archive |
+
+Operational contract:
+
+- The first successful fetch per source is baseline-only, preventing startup
+  replay from being mistaken for new events. Subsequent item IDs are bounded and
+  persisted atomically for restart deduplication. Truncated, incomplete, and
+  over-limit feeds fail without advancing baseline or seen-item state.
+- Source cadence is fixed in code: Nasdaq halts every minute; Nasdaq corporate
+  actions and SEC current filings every five minutes; Fed, BEA, FTC, and DOJ
+  every ten minutes. The scheduler arms from the earliest persisted due time and
+  `/market-scout sync` respects those due times. Do not shorten intervals without
+  reviewing the source owner's access policy.
+- Source failures are isolated and back off; a malformed journal fails closed so
+  a restart cannot silently re-admit an unknown backlog.
+- `PUBLIC_SESSION_WORKER=1`, `MARKET_RESEARCH_WORKER=1`, and
+  `TERMINAL_RUNTIME_MODE=public-gateway` hard-disable scheduling. Do not enable
+  the scout in disposable workers.
+- Use `/market-scout status` to inspect source health and recent actionable
+  observations. Keep all decisions shadow-only until observed precision, recall,
+  daily volume, and ticker-association quality justify a separate trigger design.
+
 ## Post-Deployment Verification
 
 - Confirm the GitHub Actions production job succeeded.
@@ -187,6 +221,9 @@ Behavior to expect in production:
 - Confirm the daily reservation ceiling rejects new seats before configured
   spend can be exceeded, including while an active reservation crosses UTC
   midnight.
+- When shadow scouting is enabled on the authenticated parent, confirm
+  `/market-scout status` shows one baseline per reachable source, no model jobs or
+  token reservations, and a durable journal under `MARKET_DATA_DIR`.
 - If replay fallback is deployed separately, confirm it serves immutable replay
   artifacts and rejects WebSocket upgrades.
 

@@ -226,3 +226,99 @@ test("MCP extraction stops after navigation reports a challenge", async () => {
     .filter((payload) => payload?.method === "tools/call");
   assert.deepEqual(toolCalls.map((payload) => payload.params.name), ["navigate"]);
 });
+
+test("MCP document reads bounded RSS bodies despite thin-shell density signals", async () => {
+  const calls: RequestInit[] = [];
+  const responses: Response[] = [
+    jsonResponse({ jsonrpc: "2.0", id: 1, result: { protocolVersion: "2025-03-26" } }, {
+      headers: { "mcp-session-id": "session-feed" },
+    }),
+    new Response(null, { status: 202 }),
+    jsonResponse({
+      jsonrpc: "2.0",
+      id: 2,
+      result: {
+        content: [{ type: "text", text: JSON.stringify({
+          url: "https://example.gov/news.xml",
+          status: 200,
+          challenge: null,
+          headers: {
+            "Content-Type": "application/rss+xml; charset=utf-8",
+            ETag: "feed-v1",
+            Invalid: { nested: true },
+          },
+          blockmap: { density: { likely_js_filled: false, thin_shell: true } },
+        }) }],
+        isError: false,
+      },
+    }),
+    jsonResponse({
+      jsonrpc: "2.0",
+      id: 3,
+      result: { content: [{ type: "text", text: JSON.stringify("<rss>0123456789</rss>") }], isError: false },
+    }),
+    new Response(null, { status: 200 }),
+  ];
+  const fakeFetch: typeof fetch = async (_input, init) => {
+    calls.push(init ?? {});
+    return responses.shift()!;
+  };
+
+  const client = new UnbrowserMcpClient("http://unbrowser-mcp:8767/mcp", {
+    fetch: fakeFetch,
+    maxDocumentChars: 12,
+  });
+  const result = await client.readDocument("https://example.gov/news.xml");
+
+  assert.equal(result.retrievalStatus, "fetched");
+  assert.equal(result.contentType, "application/rss+xml; charset=utf-8");
+  assert.deepEqual(result.headers, {
+    "content-type": "application/rss+xml; charset=utf-8",
+    etag: "feed-v1",
+  });
+  assert.equal(result.body, "<rss>0123456");
+  assert.equal(result.truncated, true);
+
+  const toolCalls = calls
+    .map((call) => typeof call.body === "string" ? JSON.parse(call.body) : undefined)
+    .filter((payload) => payload?.method === "tools/call");
+  assert.deepEqual(toolCalls.map((payload) => payload.params.name), ["navigate", "body"]);
+});
+
+test("MCP document does not request a body after an HTTP failure", async () => {
+  const calls: RequestInit[] = [];
+  const responses: Response[] = [
+    jsonResponse({ jsonrpc: "2.0", id: 1, result: { protocolVersion: "2025-03-26" } }, {
+      headers: { "mcp-session-id": "session-failed-feed" },
+    }),
+    new Response(null, { status: 202 }),
+    jsonResponse({
+      jsonrpc: "2.0",
+      id: 2,
+      result: {
+        content: [{ type: "text", text: JSON.stringify({
+          url: "https://example.gov/missing.xml",
+          status: 404,
+          headers: { "Content-Type": "text/html" },
+        }) }],
+        isError: false,
+      },
+    }),
+    new Response(null, { status: 200 }),
+  ];
+  const fakeFetch: typeof fetch = async (_input, init) => {
+    calls.push(init ?? {});
+    return responses.shift()!;
+  };
+
+  const client = new UnbrowserMcpClient("http://unbrowser-mcp:8767/mcp", { fetch: fakeFetch });
+  const result = await client.readDocument("https://example.gov/missing.xml");
+  assert.equal(result.retrievalStatus, "failed");
+  assert.equal(result.httpStatus, 404);
+  assert.equal(result.body, "");
+
+  const toolCalls = calls
+    .map((call) => typeof call.body === "string" ? JSON.parse(call.body) : undefined)
+    .filter((payload) => payload?.method === "tools/call");
+  assert.deepEqual(toolCalls.map((payload) => payload.params.name), ["navigate"]);
+});

@@ -16,6 +16,8 @@ venv/
 .pi/market-research-archive.json.tmp-*
 .pi/market-precache-ledger.json
 .pi/market-precache-ledger.json.tmp-*
+.pi/market-event-scout.json
+.pi/market-event-scout.json.tmp-*
 node_modules/
 dist-web/
 dist-server/
