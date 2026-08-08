@@ -1,14 +1,19 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
   DEFAULT_MARKET_EVENT_SOURCES,
+  DEFAULT_MARKET_EVENT_TRIGGER_POLICY,
   evaluateMarketEvent,
+  evaluateMarketEventTriggerCandidate,
   MarketEventScout,
+  type MarketEventDecision,
   type MarketEventSource,
+  type MarketEventTriggerPolicy,
   parsePublicFeed,
+  proposeMarketEventTriggerRoute,
   readMarketEventScoutState,
 } from "../shared/market-event-scout.js";
 import type { UnbrowserDocument } from "../shared/unbrowser-mcp.js";
@@ -279,6 +284,130 @@ test("deterministic evaluation admits strong associations and suppresses weak cl
   assert.deepEqual(routine.reasonCodes, ["unsupported-event-class"]);
 });
 
+test("trigger dry run maps validated ticker, macro EVENT, and story routes without dispatching", () => {
+  const now = Date.parse("2026-08-07T12:05:00Z");
+  const ticker = evaluateMarketEvent(HALT_SOURCE, {
+    id: "halt-route",
+    title: "Trading halt",
+    summary: "",
+    publishedAt: now,
+    categories: [],
+    structuredSymbols: ["NVDA"],
+  }, now, ["NVDA"]);
+  const macroSource: MarketEventSource = {
+    id: "test-macro-route",
+    label: "Test Macro Route",
+    url: "https://central-bank.example/feed.xml",
+    family: "macro",
+    format: "rss",
+    pollIntervalMs: 600_000,
+    marketLane: "macro",
+  };
+  const macro = evaluateMarketEvent(macroSource, {
+    id: "macro-route",
+    title: "FOMC issues monetary policy statement",
+    summary: "",
+    publishedAt: now,
+    categories: [],
+    structuredSymbols: [],
+  }, now);
+  const storySource: MarketEventSource = {
+    id: "test-story-route",
+    label: "Test Story Route",
+    url: "https://regulator.example/feed.xml",
+    family: "regulatory",
+    format: "rss",
+    pollIntervalMs: 600_000,
+    marketLane: "story",
+  };
+  const story = evaluateMarketEvent(storySource, {
+    id: "story-route",
+    title: "Agency files antitrust lawsuit",
+    summary: "",
+    publishedAt: now,
+    categories: [],
+    structuredSymbols: [],
+  }, now);
+
+  assert.deepEqual(proposeMarketEventTriggerRoute(ticker), { kind: "ticker-brief", symbol: "NVDA" });
+  assert.deepEqual(proposeMarketEventTriggerRoute(macro), { kind: "macro-event-brief" });
+  assert.deepEqual(proposeMarketEventTriggerRoute(story), { kind: "market-story-brief" });
+
+  const tickerCandidate = evaluateMarketEventTriggerCandidate(ticker, { evaluatedAt: now });
+  const macroCandidate = evaluateMarketEventTriggerCandidate(macro, { evaluatedAt: now });
+  const storyCandidate = evaluateMarketEventTriggerCandidate(story, { evaluatedAt: now });
+  assert.equal(tickerCandidate.outcome, "would-trigger");
+  assert.equal(tickerCandidate.targetKey, "ticker:NVDA");
+  assert.equal(macroCandidate.outcome, "would-trigger");
+  assert.equal(macroCandidate.targetKey, "event:macro");
+  assert.equal(storyCandidate.outcome, "gated", "current story decisions remain watch-only");
+  assert.equal(storyCandidate.targetKey, "market-story");
+  assert.deepEqual(storyCandidate.gateReasonCodes, ["not-admitted", "below-priority"]);
+  assert.deepEqual(tickerCandidate.policy, DEFAULT_MARKET_EVENT_TRIGGER_POLICY);
+});
+
+test("trigger dry-run gates have explicit TTL, cooldown, cap, and stateless precedence", () => {
+  const observedAt = Date.parse("2026-08-07T12:00:00Z");
+  const policy: MarketEventTriggerPolicy = {
+    version: 1,
+    minPriority: 80,
+    ttlMs: 2 * 60_000,
+    targetCooldownMs: 60_000,
+    dailyCap: 1,
+  };
+  const admitted = evaluateMarketEvent(HALT_SOURCE, {
+    id: "halt-gates",
+    title: "Trading halt",
+    summary: "",
+    publishedAt: observedAt,
+    categories: [],
+    structuredSymbols: ["NVDA"],
+  }, observedAt, ["NVDA"]);
+
+  const cooldown = evaluateMarketEventTriggerCandidate(admitted, {
+    evaluatedAt: observedAt + 30_000,
+    policy,
+    lastWouldTriggerAt: observedAt,
+  });
+  assert.deepEqual(cooldown.gateReasonCodes, ["target-cooldown"]);
+
+  const cooldownBoundary = evaluateMarketEventTriggerCandidate(admitted, {
+    evaluatedAt: observedAt + 60_000,
+    policy,
+    lastWouldTriggerAt: observedAt,
+  });
+  assert.equal(cooldownBoundary.outcome, "would-trigger", "cooldown ends exactly at its boundary");
+
+  const capped = evaluateMarketEventTriggerCandidate(admitted, {
+    evaluatedAt: observedAt + 60_000,
+    policy,
+    wouldTriggerToday: 1,
+  });
+  assert.deepEqual(capped.gateReasonCodes, ["daily-cap"]);
+
+  const expired = evaluateMarketEventTriggerCandidate(admitted, {
+    evaluatedAt: observedAt + policy.ttlMs,
+    policy,
+    lastWouldTriggerAt: observedAt + policy.ttlMs - 1,
+    wouldTriggerToday: 1,
+  });
+  assert.deepEqual(expired.gateReasonCodes, ["expired"], "stateless failures do not add cooldown or cap noise");
+
+  const lowPriority = evaluateMarketEventTriggerCandidate({ ...admitted, priority: 79 }, {
+    evaluatedAt: observedAt,
+    policy,
+    lastWouldTriggerAt: observedAt,
+    wouldTriggerToday: 1,
+  });
+  assert.deepEqual(lowPriority.gateReasonCodes, ["below-priority"]);
+
+  const missingPublication = evaluateMarketEventTriggerCandidate({ ...admitted, publishedAt: undefined }, {
+    evaluatedAt: observedAt,
+    policy,
+  });
+  assert.equal(missingPublication.expiresAt, admitted.observedAt + policy.ttlMs);
+});
+
 test("shadow scout baselines first, records only unseen actionable events, and persists dedupe", async () => {
   const directory = await mkdtemp(join(tmpdir(), "market-scout-test-"));
   const statePath = join(directory, "scout.json");
@@ -316,18 +445,41 @@ test("shadow scout baselines first, records only unseen actionable events, and p
     assert.equal(observed.admitted, 1);
     assert.equal(observed.decisions[0]?.title, "Trading Halt");
     assert.deepEqual(observed.decisions[0]?.symbols, ["AAPL"]);
+    assert.equal(observed.candidateEvaluated, 1);
+    assert.equal(observed.wouldTrigger, 1);
+    assert.equal(observed.gated, 0);
+    assert.deepEqual(observed.triggerCandidates[0]?.route, { kind: "ticker-brief", symbol: "AAPL" });
 
     now += 2 * 60_000;
     const duplicate = await scout.run({ force: true });
     assert.equal(duplicate.newItems, 0);
     assert.equal(duplicate.admitted, 0);
+    assert.equal(duplicate.candidateEvaluated, 0);
+
+    const incompatiblePolicy = new MarketEventScout({
+      client,
+      statePath,
+      sources: [HALT_SOURCE],
+      getTrackedSymbols: () => ["NVDA", "AAPL"],
+      now: () => now,
+      triggerPolicy: { ...DEFAULT_MARKET_EVENT_TRIGGER_POLICY, dailyCap: 9 },
+    });
+    await assert.rejects(
+      incompatiblePolicy.run({ force: true }),
+      /policy changed without a versioned migration/,
+    );
 
     const state = await readMarketEventScoutState(statePath, now);
+    assert.equal(state.version, 2);
     assert.equal(state.sources[0]?.baselineComplete, true);
     assert.equal(state.sources[0]?.newItems, 1);
     assert.equal(state.sources[0]?.admitted, 1);
     assert.equal(state.decisions.length, 1);
-    assert.equal(client.calls, 3);
+    assert.equal(state.triggerDryRun.candidates.length, 1);
+    assert.equal(state.triggerDryRun.totals.evaluated, 1);
+    assert.equal(state.triggerDryRun.totals.wouldTrigger, 1);
+    assert.equal(state.triggerDryRun.days[0]?.aggregate.wouldTrigger, 1);
+    assert.equal(client.calls, 4);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -352,6 +504,7 @@ test("bounded seen/decision retention remains restart-safe for the retained wind
     now: () => now,
     maxSeenPerSource: 2,
     maxStoredDecisions: 1,
+    maxStoredTriggerCandidates: 1,
   };
 
   try {
@@ -366,10 +519,157 @@ test("bounded seen/decision retention remains restart-safe for the retained wind
     assert.equal(state.sources[0]?.seenEventIds.length, 2);
     assert.equal(state.decisions.length, 1);
     assert.deepEqual(state.decisions[0]?.symbols, ["AMZN"]);
+    assert.equal(state.triggerDryRun.candidates.length, 1);
+    assert.equal(state.triggerDryRun.totals.evaluated, 2, "aggregate evidence survives candidate eviction");
 
     const restarted = new MarketEventScout(options);
     now += 60_000;
     assert.equal((await restarted.run({ force: true })).newItems, 0);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("v1 journals migrate without replaying retained decisions as trigger candidates", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "market-scout-migration-test-"));
+  const statePath = join(directory, "scout.json");
+  const now = Date.parse("2026-08-07T12:05:00Z");
+  const retainedDecision: MarketEventDecision = evaluateMarketEvent(HALT_SOURCE, {
+    id: "migration-retained",
+    title: "Trading halt",
+    summary: "",
+    publishedAt: now,
+    categories: [],
+    structuredSymbols: ["NVDA"],
+  }, now, ["NVDA"]);
+
+  try {
+    await writeFile(statePath, JSON.stringify({
+      version: 1,
+      updatedAt: now,
+      sources: [],
+      decisions: [retainedDecision],
+    }), "utf8");
+    const migrated = await readMarketEventScoutState(statePath, now);
+    assert.equal(migrated.version, 2);
+    assert.equal(migrated.decisions.length, 1);
+    assert.equal(migrated.triggerDryRun.candidates.length, 0);
+    assert.equal(migrated.triggerDryRun.totals.evaluated, 0);
+
+    const scout = new MarketEventScout({
+      client: { async readDocument() { return document(rss(rssItem({ guid: "migration-baseline", symbol: "NVDA" }))); } },
+      statePath,
+      sources: [HALT_SOURCE],
+      now: () => now,
+    });
+    const baseline = await scout.run({ force: true });
+    assert.equal(baseline.candidateEvaluated, 0);
+    const raw = JSON.parse(await readFile(statePath, "utf8")) as { version: number };
+    assert.equal(raw.version, 2, "the next atomic scout write persists v2");
+    assert.equal((await scout.getState()).triggerDryRun.candidates.length, 0);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("dry-run target cooldown survives restart and opens exactly at the boundary", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "market-scout-cooldown-test-"));
+  const statePath = join(directory, "scout.json");
+  let now = Date.parse("2026-08-07T12:00:00Z");
+  const policy: MarketEventTriggerPolicy = {
+    version: 1,
+    minPriority: 80,
+    ttlMs: 10 * 60_000,
+    targetCooldownMs: 60_000,
+    dailyCap: 8,
+  };
+  const bodies = [
+    rss(rssItem({ guid: "cooldown-baseline", symbol: "NVDA", published: "Fri, 07 Aug 2026 12:00:00 GMT" })),
+    rss(
+      rssItem({ guid: "cooldown-1", symbol: "NVDA", published: "Fri, 07 Aug 2026 12:01:00 GMT" }),
+      rssItem({ guid: "cooldown-2", symbol: "NVDA", published: "Fri, 07 Aug 2026 12:01:00 GMT" }),
+    ),
+    rss(rssItem({ guid: "cooldown-3", symbol: "NVDA", published: "Fri, 07 Aug 2026 12:02:00 GMT" })),
+  ];
+  const client = { async readDocument() { return document(bodies.shift()!); } };
+  const options = {
+    client,
+    statePath,
+    sources: [HALT_SOURCE],
+    getTrackedSymbols: () => ["NVDA"],
+    now: () => now,
+    triggerPolicy: policy,
+  };
+
+  try {
+    await new MarketEventScout(options).run({ force: true });
+    now += 60_000;
+    const sameTarget = await new MarketEventScout(options).run({ force: true });
+    assert.equal(sameTarget.candidateEvaluated, 2);
+    assert.equal(sameTarget.wouldTrigger, 1);
+    assert.equal(sameTarget.gated, 1);
+    assert.deepEqual(
+      sameTarget.triggerCandidates.find((candidate) => candidate.outcome === "gated")?.gateReasonCodes,
+      ["target-cooldown"],
+    );
+
+    now += 60_000;
+    const restarted = await new MarketEventScout(options).run({ force: true });
+    assert.equal(restarted.wouldTrigger, 1, "the persisted cooldown permits the exact boundary");
+    assert.equal((await readMarketEventScoutState(statePath, now)).triggerDryRun.totals.wouldTrigger, 2);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("dry-run daily cap survives restart and resets on the UTC day boundary", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "market-scout-daily-cap-test-"));
+  const statePath = join(directory, "scout.json");
+  let now = Date.parse("2026-08-07T23:58:00Z");
+  const policy: MarketEventTriggerPolicy = {
+    version: 1,
+    minPriority: 80,
+    ttlMs: 10 * 60_000,
+    targetCooldownMs: 60_000,
+    dailyCap: 1,
+  };
+  const bodies = [
+    rss(rssItem({ guid: "cap-baseline", symbol: "NVDA", published: "Fri, 07 Aug 2026 23:58:00 GMT" })),
+    rss(
+      rssItem({ guid: "cap-1", symbol: "AAPL", published: "Fri, 07 Aug 2026 23:59:00 GMT" }),
+      rssItem({ guid: "cap-2", symbol: "MSFT", published: "Fri, 07 Aug 2026 23:59:00 GMT" }),
+    ),
+    rss(rssItem({ guid: "cap-3", symbol: "TSLA", published: "Sat, 08 Aug 2026 00:00:00 GMT" })),
+  ];
+  const client = { async readDocument() { return document(bodies.shift()!); } };
+  const options = {
+    client,
+    statePath,
+    sources: [HALT_SOURCE],
+    getTrackedSymbols: () => ["NVDA", "AAPL", "MSFT", "TSLA"],
+    now: () => now,
+    triggerPolicy: policy,
+  };
+
+  try {
+    await new MarketEventScout(options).run({ force: true });
+    now = Date.parse("2026-08-07T23:59:00Z");
+    const capped = await new MarketEventScout(options).run({ force: true });
+    assert.equal(capped.wouldTrigger, 1);
+    assert.equal(capped.gated, 1);
+    assert.deepEqual(
+      capped.triggerCandidates.find((candidate) => candidate.outcome === "gated")?.gateReasonCodes,
+      ["daily-cap"],
+    );
+
+    now = Date.parse("2026-08-08T00:00:00Z");
+    const nextDay = await new MarketEventScout(options).run({ force: true });
+    assert.equal(nextDay.wouldTrigger, 1);
+    const state = await readMarketEventScoutState(statePath, now);
+    assert.deepEqual(state.triggerDryRun.days.map((day) => day.day), ["2026-08-08", "2026-08-07"]);
+    assert.deepEqual(state.triggerDryRun.days.map((day) => day.aggregate.wouldTrigger), [1, 1]);
+    assert.equal(state.triggerDryRun.totals.evaluated, 3);
+    assert.equal(state.triggerDryRun.totals.wouldTrigger, 2);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -598,6 +898,12 @@ test("persisted state rejects missing timestamps and inconsistent admitted targe
       sources: [],
       decisions: [{ ...admitted, target: undefined }],
     }), "utf8");
+    await assert.rejects(readMarketEventScoutState(statePath), /invalid record/);
+
+    await rm(statePath, { force: true });
+    const invalidV2 = await readMarketEventScoutState(statePath, now);
+    invalidV2.triggerDryRun.policy.dailyCap = 0;
+    await writeFile(statePath, JSON.stringify(invalidV2), "utf8");
     await assert.rejects(readMarketEventScoutState(statePath), /invalid record/);
   } finally {
     await rm(directory, { recursive: true, force: true });
