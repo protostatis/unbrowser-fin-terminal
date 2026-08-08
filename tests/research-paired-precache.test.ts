@@ -3,10 +3,15 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import type { AgentSession } from "@earendil-works/pi-coding-agent";
+import type { AgentSession, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   buildPairedPrecachePlan,
   isArchivedResearchCacheEligible,
+  localMarketEventDocumentClient,
+  marketScoutScheduleDelay,
+  marketScoutTransportMode,
+  readMarketScoutLocalCliEnabled,
+  readMarketScoutEnabled,
   readPrecacheEnabled,
   splitPairedCanvas,
 } from "../.pi/extensions/market-terminal.js";
@@ -151,6 +156,54 @@ test("disposable public workers stay cold even when pre-cache is explicitly enab
     if (previousEnabled === undefined) delete process.env.MARKET_PRECACHE_ENABLED;
     else process.env.MARKET_PRECACHE_ENABLED = previousEnabled;
   }
+});
+
+test("shadow event scouting is opt-in and hard-disabled in public workers", () => {
+  assert.equal(readMarketScoutEnabled({}), false);
+  assert.equal(readMarketScoutEnabled({ MARKET_SCOUT_ENABLED: "on" }), true);
+  assert.equal(readMarketScoutEnabled({ MARKET_SCOUT_ENABLED: "1", PUBLIC_SESSION_WORKER: "1" }), false);
+  assert.equal(readMarketScoutEnabled({ MARKET_SCOUT_ENABLED: "1", MARKET_RESEARCH_WORKER: "1" }), false);
+  assert.equal(readMarketScoutEnabled({ MARKET_SCOUT_ENABLED: "1", TERMINAL_RUNTIME_MODE: "public-gateway" }), false);
+  assert.throws(() => readMarketScoutEnabled({ MARKET_SCOUT_ENABLED: "maybe" }), /MARKET_SCOUT_ENABLED/);
+});
+
+test("market scout CLI transport requires explicit development opt-in", () => {
+  assert.equal(readMarketScoutLocalCliEnabled({}), false);
+  assert.equal(readMarketScoutLocalCliEnabled({ MARKET_SCOUT_LOCAL_CLI: "on" }), true);
+  assert.throws(() => readMarketScoutLocalCliEnabled({ MARKET_SCOUT_LOCAL_CLI: "maybe" }), /MARKET_SCOUT_LOCAL_CLI/);
+  assert.throws(() => marketScoutTransportMode({}), /UNBROWSER_MCP_URL/);
+  assert.equal(marketScoutTransportMode({ MARKET_SCOUT_LOCAL_CLI: "1" }), "local-cli");
+  assert.throws(
+    () => marketScoutTransportMode({ MARKET_SCOUT_LOCAL_CLI: "1", NODE_ENV: "production" }),
+    /UNBROWSER_MCP_URL/,
+  );
+  assert.throws(
+    () => marketScoutTransportMode({ MARKET_SCOUT_LOCAL_CLI: "1", TERMINAL_RUNTIME_MODE: "private-workspace" }),
+    /UNBROWSER_MCP_URL/,
+  );
+  assert.equal(marketScoutTransportMode({ NODE_ENV: "production", UNBROWSER_MCP_URL: "https://mcp.example/mcp" }), "mcp");
+});
+
+test("market scout scheduler arms for the exact persisted due time", () => {
+  assert.equal(marketScoutScheduleDelay(1_000, 61_000), 60_000);
+  assert.equal(marketScoutScheduleDelay(61_001, 61_000), 0);
+  assert.equal(marketScoutScheduleDelay(Number.NaN, 61_000), 60_000);
+});
+
+test("local scout transport attempts cleanup when CLI startup aborts", async () => {
+  const calls: string[][] = [];
+  const pi = {
+    async exec(_command: string, args: string[]) {
+      calls.push(args);
+      if (args[1] === "start") throw new Error("startup aborted");
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  } as unknown as ExtensionAPI;
+  const client = localMarketEventDocumentClient(pi);
+
+  await assert.rejects(client.readDocument("https://example.com/feed.xml"), /startup aborted/);
+  assert.equal(calls.some((args) => args[1] === "start"), true);
+  assert.equal(calls.some((args) => args[1] === "stop"), true);
 });
 
 test("quality-gated degraded pre-cache attempts remain archive-only", () => {

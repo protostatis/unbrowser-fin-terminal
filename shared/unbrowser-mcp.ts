@@ -2,8 +2,9 @@ import { randomUUID } from "node:crypto";
 
 const MCP_PROTOCOL_VERSION = "2025-03-26";
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
-const DEFAULT_MAX_RESPONSE_BYTES = 512 * 1024;
+const DEFAULT_MAX_RESPONSE_BYTES = 1024 * 1024;
 const DEFAULT_MAX_EXTRACT_CHARS = 8_000;
+const DEFAULT_MAX_DOCUMENT_CHARS = 512 * 1024;
 
 type FetchLike = typeof fetch;
 
@@ -25,6 +26,7 @@ export type UnbrowserNavigation = {
   url?: string;
   status?: number;
   challenge?: unknown;
+  headers?: Record<string, unknown>;
   blockmap?: { density?: { likely_js_filled?: boolean; thin_shell?: boolean } };
   [key: string]: unknown;
 };
@@ -40,11 +42,25 @@ export type UnbrowserExtraction = {
   truncated: boolean;
 };
 
+/** Raw public document acquired through one stateful Unbrowser session. */
+export type UnbrowserDocument = {
+  requestedUrl: string;
+  finalUrl: string;
+  httpStatus?: number;
+  contentType?: string;
+  headers: Record<string, string>;
+  retrievalStatus: "fetched" | "challenged" | "failed";
+  challenge?: unknown;
+  body: string;
+  truncated: boolean;
+};
+
 export type UnbrowserMcpClientOptions = {
   fetch?: FetchLike;
   requestTimeoutMs?: number;
   maxResponseBytes?: number;
   maxExtractChars?: number;
+  maxDocumentChars?: number;
 };
 
 function positiveInteger(value: number | undefined, fallback: number): number {
@@ -179,6 +195,28 @@ function parseToolJson(text: string, toolName: string): unknown {
   }
 }
 
+function normalizeToolString(text: string): string {
+  try {
+    const parsed = JSON.parse(text);
+    return typeof parsed === "string" ? parsed : text;
+  } catch {
+    return text;
+  }
+}
+
+function normalizeNavigationHeaders(raw: unknown): Record<string, string> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const headers: Record<string, string> = {};
+  for (const [rawName, rawValue] of Object.entries(raw as Record<string, unknown>)) {
+    const name = rawName.trim().toLowerCase();
+    if (!/^[a-z0-9!#$%&'*+.^_`|~-]{1,80}$/.test(name)) continue;
+    if (typeof rawValue !== "string" && typeof rawValue !== "number") continue;
+    const value = String(rawValue).replace(/[\r\n]+/g, " ").trim().slice(0, 1_000);
+    if (value) headers[name] = value;
+  }
+  return headers;
+}
+
 class McpSession {
   private sessionId: string | undefined;
   private requestId = 0;
@@ -280,6 +318,7 @@ export class UnbrowserMcpClient {
   private readonly requestTimeoutMs: number;
   private readonly maxResponseBytes: number;
   private readonly maxExtractChars: number;
+  private readonly maxDocumentChars: number;
 
   constructor(endpoint: string, options: UnbrowserMcpClientOptions = {}) {
     this.endpoint = normalizeUnbrowserMcpUrl(endpoint);
@@ -287,6 +326,7 @@ export class UnbrowserMcpClient {
     this.requestTimeoutMs = positiveInteger(options.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS);
     this.maxResponseBytes = positiveInteger(options.maxResponseBytes, DEFAULT_MAX_RESPONSE_BYTES);
     this.maxExtractChars = positiveInteger(options.maxExtractChars, DEFAULT_MAX_EXTRACT_CHARS);
+    this.maxDocumentChars = positiveInteger(options.maxDocumentChars, DEFAULT_MAX_DOCUMENT_CHARS);
   }
 
   async navigate(url: string, signal?: AbortSignal): Promise<UnbrowserNavigation> {
@@ -345,12 +385,14 @@ export class UnbrowserMcpClient {
 
       const args = mode === "extract_cards" ? { limit: 12 } : {};
       const extractionText = await session.callTool(mode, args, signal);
-      let normalized = extractionText;
-      try {
-        const parsed = JSON.parse(extractionText);
-        normalized = typeof parsed === "string" ? parsed : JSON.stringify(parsed, null, 2);
-      } catch {
-        // Some MCP tools return plain text rather than JSON-encoded content.
+      let normalized = normalizeToolString(extractionText);
+      if (normalized === extractionText) {
+        try {
+          const parsed = JSON.parse(extractionText);
+          if (typeof parsed !== "string") normalized = JSON.stringify(parsed, null, 2);
+        } catch {
+          // Some MCP tools return plain text rather than JSON-encoded content.
+        }
       }
       const truncated = normalized.length > this.maxExtractChars;
       return {
@@ -360,6 +402,69 @@ export class UnbrowserMcpClient {
         httpStatus: typeof navigation.status === "number" ? navigation.status : undefined,
         retrievalStatus: "fetched",
         content: normalized.slice(0, this.maxExtractChars),
+        truncated,
+      };
+    }, signal));
+  }
+
+  /**
+   * Fetch a raw public document through Unbrowser. Unlike `extract`, this is
+   * content-type aware: XML/RSS/Atom documents are returned even when their DOM
+   * density resembles a thin HTML shell. Callers remain responsible for a
+   * bounded parser and source-specific polling policy.
+   */
+  async readDocument(url: string, signal?: AbortSignal): Promise<UnbrowserDocument> {
+    return this.withUserFacingErrors(() => this.withSession(async (session) => {
+      const navigationText = await session.callTool(
+        "navigate",
+        { url, exec_scripts: false, include_ascii: false },
+        signal,
+      );
+      const rawNavigation = parseToolJson(navigationText, "navigate");
+      if (!rawNavigation || typeof rawNavigation !== "object" || Array.isArray(rawNavigation)) {
+        throw new Error("unbrowser navigate returned an invalid result");
+      }
+      const navigation = rawNavigation as UnbrowserNavigation;
+      const finalUrl = typeof navigation.url === "string" ? navigation.url : url;
+      const httpStatus = typeof navigation.status === "number" ? navigation.status : undefined;
+      const headers = normalizeNavigationHeaders(navigation.headers);
+      const contentType = headers["content-type"];
+      if (navigation.challenge) {
+        return {
+          requestedUrl: url,
+          finalUrl,
+          httpStatus,
+          contentType,
+          headers,
+          retrievalStatus: "challenged",
+          challenge: navigation.challenge,
+          body: "",
+          truncated: false,
+        };
+      }
+      if (httpStatus !== undefined && (httpStatus < 200 || httpStatus >= 400)) {
+        return {
+          requestedUrl: url,
+          finalUrl,
+          httpStatus,
+          contentType,
+          headers,
+          retrievalStatus: "failed",
+          body: "",
+          truncated: false,
+        };
+      }
+
+      const bodyText = normalizeToolString(await session.callTool("body", {}, signal));
+      const truncated = bodyText.length > this.maxDocumentChars;
+      return {
+        requestedUrl: url,
+        finalUrl,
+        httpStatus,
+        contentType,
+        headers,
+        retrievalStatus: "fetched",
+        body: bodyText.slice(0, this.maxDocumentChars),
         truncated,
       };
     }, signal));

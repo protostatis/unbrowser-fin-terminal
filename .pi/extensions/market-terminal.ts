@@ -9,6 +9,7 @@ import {
 	ResearchCandidateRegistry,
 	UnbrowserMcpClient,
 	type GrantedResearchCandidate,
+	type UnbrowserDocument,
 	type UnbrowserExtraction,
 	type UnbrowserExtractionMode,
 	userFacingUnbrowserError,
@@ -41,6 +42,14 @@ import {
 	writeLedger as writePrecacheLedger,
 } from "../../shared/research-precache-ledger.js";
 import { collectResearchWorkerUsage } from "../../shared/research-worker-usage.js";
+import {
+	DEFAULT_MARKET_EVENT_SOURCES,
+	MarketEventScout,
+	marketEventScoutFilePath,
+	readMarketEventScoutState,
+	type MarketEventDocumentClient,
+	type MarketEventScoutRunResult,
+} from "../../shared/market-event-scout.js";
 
 type ChartScope = "day" | "week" | "month" | "year" | "max";
 type ResearchIntent = "brief" | "why";
@@ -1038,6 +1047,40 @@ export function readPrecacheEnabled(): boolean {
 	throw new Error("MARKET_PRECACHE_ENABLED must be 1/true/on or 0/false/off");
 }
 
+/** Shadow scouting is opt-in and never runs in disposable/public workers. */
+export function readMarketScoutEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+	if (env.MARKET_RESEARCH_WORKER === "1" || env.PUBLIC_SESSION_WORKER === "1" || env.TERMINAL_RUNTIME_MODE === "public-gateway") return false;
+	const raw = env.MARKET_SCOUT_ENABLED?.trim();
+	if (raw === undefined || raw === "") return false;
+	const value = raw.toLowerCase();
+	if (value === "1" || value === "true" || value === "on") return true;
+	if (value === "0" || value === "false" || value === "off") return false;
+	throw new Error("MARKET_SCOUT_ENABLED must be 1/true/on or 0/false/off");
+}
+
+/** Development-only opt-in; production never silently falls back from MCP. */
+export function readMarketScoutLocalCliEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+	const raw = env.MARKET_SCOUT_LOCAL_CLI?.trim();
+	if (raw === undefined || raw === "") return false;
+	const value = raw.toLowerCase();
+	if (value === "1" || value === "true" || value === "on") return true;
+	if (value === "0" || value === "false" || value === "off") return false;
+	throw new Error("MARKET_SCOUT_LOCAL_CLI must be 1/true/on or 0/false/off");
+}
+
+export function marketScoutScheduleDelay(now: number, dueAt: number): number {
+	if (!Number.isFinite(now) || !Number.isFinite(dueAt)) return 60_000;
+	return Math.max(0, Math.min(24 * 60 * 60_000, Math.ceil(dueAt - now)));
+}
+
+export function marketScoutTransportMode(env: NodeJS.ProcessEnv = process.env): "mcp" | "local-cli" {
+	if (env.UNBROWSER_MCP_URL?.trim()) return "mcp";
+	if (env.NODE_ENV === "production" || env.UNBROWSER_MCP_REQUIRED === "1" || env.TERMINAL_RUNTIME_MODE?.trim() || !readMarketScoutLocalCliEnabled(env)) {
+		throw new Error("UNBROWSER_MCP_URL is required for market scouting (or explicitly enable MARKET_SCOUT_LOCAL_CLI in development)");
+	}
+	return "local-cli";
+}
+
 function readPrecacheMaxJobs(): number {
 	const raw = process.env.MARKET_PRECACHE_MAX_JOBS?.trim();
 	if (!raw) return 24;
@@ -1652,6 +1695,89 @@ function requireUnbrowserMcpClient(): UnbrowserMcpClient {
 		throw new Error("UNBROWSER_MCP_URL is required for source extraction");
 	}
 	return new UnbrowserMcpClient(endpoint);
+}
+
+const MARKET_SCOUT_MAX_CLI_BODY_CHARS = 512 * 1024;
+let marketScoutCliSequence = 0;
+
+function normalizedUnbrowserHeaders(raw: unknown): Record<string, string> {
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+	const headers: Record<string, string> = {};
+	for (const [name, value] of Object.entries(raw as Record<string, unknown>)) {
+		if (typeof value !== "string" && typeof value !== "number") continue;
+		const key = name.trim().toLowerCase();
+		if (/^[a-z0-9!#$%&'*+.^_`|~-]{1,80}$/.test(key)) headers[key] = String(value).replace(/[\r\n]+/g, " ").slice(0, 1_000);
+	}
+	return headers;
+}
+
+function parseUnbrowserCliOutput(raw: string, label: string): unknown {
+	if (!raw || raw.length > 2 * 1024 * 1024) throw new Error(`unbrowser ${label} returned an invalid response`);
+	try {
+		return JSON.parse(raw);
+	} catch {
+		throw new Error(`unbrowser ${label} returned malformed JSON`);
+	}
+}
+
+/** Local-development fallback using one short-lived, stateful Unbrowser CLI session. */
+export function localMarketEventDocumentClient(pi: ExtensionAPI): MarketEventDocumentClient {
+	return {
+		async readDocument(url: string, signal?: AbortSignal): Promise<UnbrowserDocument> {
+			const sessionId = `market-scout-${process.pid}-${++marketScoutCliSequence}`;
+			let startAttempted = false;
+			try {
+				startAttempted = true;
+				const start = await pi.exec("unbrowser", ["session", "start", "--id", sessionId], { signal, timeout: 30_000 });
+				if (start.code !== 0) throw new Error("unbrowser session could not start");
+				const navigationCall = await pi.exec("unbrowser", [
+					"session", "exec", sessionId, "navigate",
+					JSON.stringify({ url, exec_scripts: false, include_ascii: false }),
+				], { signal, timeout: 30_000 });
+				if (navigationCall.code !== 0) throw new Error("unbrowser source navigation failed");
+				const parsed = parseUnbrowserCliOutput(navigationCall.stdout, "navigate");
+				if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("unbrowser navigate returned an invalid result");
+				const navigation = parsed as Record<string, unknown>;
+				const finalUrl = typeof navigation.url === "string" ? navigation.url : url;
+				const httpStatus = typeof navigation.status === "number" ? navigation.status : undefined;
+				const headers = normalizedUnbrowserHeaders(navigation.headers);
+				const base = {
+					requestedUrl: url,
+					finalUrl,
+					httpStatus,
+					contentType: headers["content-type"],
+					headers,
+				};
+				if (navigation.challenge) {
+					return { ...base, retrievalStatus: "challenged", challenge: navigation.challenge, body: "", truncated: false };
+				}
+				if (httpStatus !== undefined && (httpStatus < 200 || httpStatus >= 400)) {
+					return { ...base, retrievalStatus: "failed", body: "", truncated: false };
+				}
+				const bodyCall = await pi.exec("unbrowser", ["session", "exec", sessionId, "body", "{}"], { signal, timeout: 30_000 });
+				if (bodyCall.code !== 0) throw new Error("unbrowser source body retrieval failed");
+				const rawBody = parseUnbrowserCliOutput(bodyCall.stdout, "body");
+				if (typeof rawBody !== "string") throw new Error("unbrowser body returned an invalid result");
+				return {
+					...base,
+					retrievalStatus: "fetched",
+					body: rawBody.slice(0, MARKET_SCOUT_MAX_CLI_BODY_CHARS),
+					truncated: rawBody.length > MARKET_SCOUT_MAX_CLI_BODY_CHARS,
+				};
+			} finally {
+				if (startAttempted) {
+					await pi.exec("unbrowser", ["session", "stop", sessionId], { timeout: 10_000 }).catch(() => undefined);
+				}
+			}
+		},
+	};
+}
+
+function marketEventDocumentClient(pi: ExtensionAPI): MarketEventDocumentClient {
+	const mode = marketScoutTransportMode();
+	const endpoint = configuredUnbrowserMcpUrl();
+	if (mode === "mcp") return new UnbrowserMcpClient(endpoint!);
+	return localMarketEventDocumentClient(pi);
 }
 
 async function navigatePublicPage(pi: ExtensionAPI, url: string, signal?: AbortSignal): Promise<any> {
@@ -7949,10 +8075,158 @@ export default function (pi: ExtensionAPI) {
 		return undefined;
 	};
 
+	let marketScout: MarketEventScout | undefined;
+	let marketScoutCwd: string | undefined;
+	let marketScoutTimer: ReturnType<typeof setTimeout> | undefined;
+	let marketScoutAbort: AbortController | undefined;
+	let marketScoutInFlight: Promise<MarketEventScoutRunResult> | undefined;
+	let marketScoutDrain: Promise<void> | undefined;
+	let marketScoutSchedulerActive = false;
+	let marketScoutGeneration = 0;
+	let marketScoutLastError: string | undefined;
+	let marketScoutLastNotifiedError: string | undefined;
+
+	const stopMarketScout = (): Promise<void> => {
+		if (marketScoutDrain) return marketScoutDrain;
+		let operation: Promise<void>;
+		operation = (async () => {
+			marketScoutSchedulerActive = false;
+			marketScoutGeneration += 1;
+			if (marketScoutTimer) clearTimeout(marketScoutTimer);
+			marketScoutTimer = undefined;
+			const controller = marketScoutAbort;
+			controller?.abort(new Error("Market event scout stopped"));
+			const pending = marketScoutInFlight;
+			if (pending) await pending.catch(() => undefined);
+			if (marketScoutAbort === controller) marketScoutAbort = undefined;
+			if (marketScoutInFlight === pending) marketScoutInFlight = undefined;
+			marketScout = undefined;
+			marketScoutCwd = undefined;
+		})().finally(() => {
+			if (marketScoutDrain === operation) marketScoutDrain = undefined;
+		});
+		marketScoutDrain = operation;
+		return operation;
+	};
+
+	const getMarketScout = (): MarketEventScout => {
+		if (isResearchWorkerProcess || process.env.PUBLIC_SESSION_WORKER === "1" || process.env.TERMINAL_RUNTIME_MODE === "public-gateway") {
+			throw new Error("Market event scouting is unavailable in disposable/public workers");
+		}
+		if (!archiveCwd) throw new Error("Market event scout data path is unavailable");
+		if (marketScout && marketScoutCwd === archiveCwd) return marketScout;
+		if (marketScoutCwd && marketScoutCwd !== archiveCwd) throw new Error("Market event scout lifecycle transition is still draining");
+		marketScout = new MarketEventScout({
+			client: marketEventDocumentClient(pi),
+			statePath: marketEventScoutFilePath(archiveCwd),
+			getTrackedSymbols: () => [...MOVER_UNIVERSE, ...watchlist],
+		});
+		marketScoutCwd = archiveCwd;
+		return marketScout;
+	};
+
+	const prepareMarketScout = async (): Promise<{ scout: MarketEventScout; generation: number }> => {
+		if (marketScoutDrain) await marketScoutDrain;
+		if (marketScoutCwd && marketScoutCwd !== archiveCwd) await stopMarketScout();
+		return { scout: getMarketScout(), generation: marketScoutGeneration };
+	};
+
+	const runMarketScout = async (expectedGeneration?: number): Promise<MarketEventScoutRunResult> => {
+		const prepared = await prepareMarketScout();
+		if (prepared.generation !== marketScoutGeneration) throw new Error("Market event scout lifecycle changed before polling");
+		if (expectedGeneration !== undefined
+			&& (!marketScoutSchedulerActive || expectedGeneration !== marketScoutGeneration)) {
+			throw new Error("Market event scout lifecycle changed before polling");
+		}
+		if (!marketScoutAbort || marketScoutAbort.signal.aborted) marketScoutAbort = new AbortController();
+		const controller = marketScoutAbort;
+		const operation = prepared.scout.run({ signal: controller.signal });
+		marketScoutInFlight = operation;
+		try {
+			const result = await operation;
+			marketScoutLastError = undefined;
+			marketScoutLastNotifiedError = undefined;
+			return result;
+		} catch (error) {
+			if (!controller.signal.aborted) {
+				marketScoutLastError = cleanText(error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 240);
+			}
+			throw error;
+		} finally {
+			if (marketScoutInFlight === operation) marketScoutInFlight = undefined;
+		}
+	};
+
+	const armMarketScout = (ctx: ExtensionContext, generation: number, delayMs: number): void => {
+		if (!marketScoutSchedulerActive || generation !== marketScoutGeneration) return;
+		marketScoutTimer = setTimeout(() => {
+			marketScoutTimer = undefined;
+			if (!marketScoutSchedulerActive || generation !== marketScoutGeneration) return;
+			void (async () => {
+				let completed = false;
+				try {
+					await runMarketScout(generation);
+					completed = true;
+				} catch (error) {
+					if (!marketScoutSchedulerActive || generation !== marketScoutGeneration) return;
+					const message = cleanText(error instanceof Error ? error.message : String(error)).slice(0, 180);
+					if (ctx.mode === "tui" && message !== marketScoutLastNotifiedError) {
+						marketScoutLastNotifiedError = message;
+						ctx.ui.notify(`Market scout paused: ${message}`, "warning");
+					}
+				}
+				if (!marketScoutSchedulerActive || generation !== marketScoutGeneration) return;
+				let delay = 60_000;
+				if (completed) {
+					try {
+						delay = marketScoutScheduleDelay(Date.now(), await getMarketScout().nextDueAt());
+					} catch {
+						// State/configuration errors retry slowly; the warning above is de-duplicated.
+					}
+				}
+				armMarketScout(ctx, generation, delay);
+			})();
+		}, delayMs);
+		marketScoutTimer.unref?.();
+	};
+
+	const startMarketScout = async (ctx: ExtensionContext): Promise<void> => {
+		let enabled = false;
+		try {
+			enabled = readMarketScoutEnabled();
+		} catch (error) {
+			await stopMarketScout();
+			marketScoutLastError = cleanText(error instanceof Error ? error.message : String(error)).slice(0, 240);
+			if (ctx.mode === "tui") ctx.ui.notify(`Market scout disabled: ${marketScoutLastError}`, "warning");
+			return;
+		}
+		if (marketScoutCwd && marketScoutCwd !== archiveCwd) await stopMarketScout();
+		if (!enabled || isResearchWorkerProcess) {
+			if (marketScoutSchedulerActive) await stopMarketScout();
+			return;
+		}
+		if (marketScoutSchedulerActive && marketScoutCwd === archiveCwd) return;
+		try {
+			const prepared = await prepareMarketScout();
+			if (prepared.generation !== marketScoutGeneration) return;
+		} catch (error) {
+			await stopMarketScout();
+			marketScoutLastError = cleanText(error instanceof Error ? error.message : String(error)).slice(0, 240);
+			if (ctx.mode === "tui") ctx.ui.notify(`Market scout disabled: ${marketScoutLastError}`, "warning");
+			return;
+		}
+		if (marketScoutSchedulerActive && marketScoutCwd === archiveCwd) return;
+		marketScoutAbort = new AbortController();
+		marketScoutSchedulerActive = true;
+		const generation = ++marketScoutGeneration;
+		armMarketScout(ctx, generation, 0);
+	};
+
 	const restoreSessionState = async (ctx: ExtensionContext, reason?: SessionStartEvent["reason"]): Promise<void> => {
 		resetResearchJobs();
 		if (isResearchWorkerProcess) return;
 		await ensureArchiveLoaded(ctx, true);
+		await startMarketScout(ctx);
 		// Fresh session bootstrap: pre-warm the shared research cache for the
 		// requests a new session is most likely to make. Resume/fork/reload do
 		// not re-warm; the once-per-bootstrap guard is cleared by
@@ -8029,9 +8303,10 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (!ctx.hasPendingMessages()) scheduleResearchPump(ctx);
 	});
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", async () => {
 		researchExtracts.clear();
 		if (!isResearchWorkerProcess) {
+			await stopMarketScout();
 			researchWorkerCoordinator?.dispose();
 			researchWorkerCoordinator = undefined;
 		}
@@ -8848,6 +9123,62 @@ export default function (pi: ExtensionAPI) {
 			// only after IPC correlation is installed; agent_start owns the
 			// dispatched -> running transition.
 			pumpResearchQueue(ctx, true);
+		},
+	});
+
+	pi.registerCommand("market-scout", {
+		description: "Inspect or poll the shadow public-feed event scout: /market-scout [status|sync]",
+		handler: async (args: string, ctx: ExtensionCommandContext) => {
+			const action = args.trim().toLowerCase() || "status";
+			if (action !== "status" && action !== "sync") {
+				ctx.ui.notify("Use /market-scout status or /market-scout sync", "error");
+				return;
+			}
+			if (isResearchWorkerProcess || process.env.PUBLIC_SESSION_WORKER === "1" || process.env.TERMINAL_RUNTIME_MODE === "public-gateway") {
+				ctx.ui.notify("Market scouting is unavailable in disposable/public workers", "warning");
+				return;
+			}
+			try {
+				await ensureArchiveLoaded(ctx);
+				if (action === "sync") {
+					const result = await runMarketScout();
+					ctx.ui.notify([
+						"MARKET EVENT SCOUT · SHADOW ONLY · MODEL DISPATCH OFF",
+						`Polled ${result.polledSources} source(s): ${result.successfulSources} ok · ${result.failedSources} failed`,
+						`Baseline ${result.baselineItems} · new ${result.newItems} · admit-shadow ${result.admitted} · watch ${result.watched} · suppress ${result.suppressed}`,
+						result.decisions.length > 0
+							? result.decisions.slice(0, 4).map((decision) => `${decision.disposition.toUpperCase()} P${decision.priority} · ${decision.symbols.join(",") || decision.target?.lane || "UNRESOLVED"} · ${decision.title}`).join("\n")
+							: "No new actionable observations.",
+					].join("\n"), result.failedSources > 0 ? "warning" : "info");
+					return;
+				}
+
+				if (!archiveCwd) throw new Error("Market event scout data path is unavailable");
+				const state = await readMarketEventScoutState(marketEventScoutFilePath(archiveCwd));
+				let enabledLabel = "off";
+				try { enabledLabel = readMarketScoutEnabled() ? "on" : "off"; } catch { enabledLabel = "invalid"; }
+				let transportLabel = configuredUnbrowserMcpUrl() ? "MCP" : "unconfigured";
+				try {
+					if (!configuredUnbrowserMcpUrl() && readMarketScoutLocalCliEnabled()) transportLabel = "local CLI (explicit dev opt-in)";
+				} catch { transportLabel = "invalid"; }
+				const sourceLines = DEFAULT_MARKET_EVENT_SOURCES.map((source) => {
+					const sourceState = state.sources.find((candidate) => candidate.sourceId === source.id);
+					if (!sourceState) return `${source.label}: not initialized`;
+					const last = sourceState.lastSuccessAt ? new Date(sourceState.lastSuccessAt).toLocaleString() : "never";
+					return `${source.label}: ${sourceState.lastStatus} · last ${last} · new ${sourceState.newItems} · A/W/S ${sourceState.admitted}/${sourceState.watched}/${sourceState.suppressed}`;
+				});
+				const recent = state.decisions.slice(0, 5).map((decision) =>
+					`${decision.disposition.toUpperCase()} P${decision.priority} · ${decision.symbols.join(",") || decision.target?.lane || "UNRESOLVED"} · ${decision.title}`,
+				);
+				ctx.ui.notify([
+					`MARKET EVENT SCOUT · SHADOW ONLY · scheduler ${enabledLabel} · transport ${transportLabel}`,
+					marketScoutLastError ? `Last runtime error: ${marketScoutLastError}` : "Model dispatch: off; token reservation: off.",
+					...sourceLines,
+					recent.length > 0 ? `Recent observations:\n${recent.join("\n")}` : "Recent observations: none (the first successful poll establishes a baseline).",
+				].join("\n"), marketScoutLastError ? "warning" : "info");
+			} catch (error) {
+				ctx.ui.notify(`Market scout unavailable: ${cleanText(error instanceof Error ? error.message : String(error)).slice(0, 220)}`, "error");
+			}
 		},
 	});
 
