@@ -33,6 +33,7 @@ import {
   WORKER_PROTOCOL_VERSION,
   type WorkerFatalEvent,
   type WorkerRunMessage,
+  type WorkerSettledEvent,
 } from "./research-worker-protocol.js";
 import { wouldExceedTokenLimit } from "../shared/research-precache-ledger.js";
 import { setResearchWorkerUsageCollector, type ResearchWorkerUsage } from "../shared/research-worker-usage.js";
@@ -84,9 +85,8 @@ export function makeRuntimeFatalEvent(run: WorkerRunMessage, error: unknown): Wo
 }
 
 /** Best-effort bounded IPC flush before abort/disposal closes the channel. */
-async function sendRuntimeFatalEvent(run: WorkerRunMessage, error: unknown): Promise<void> {
+async function sendTerminalEvent(event: WorkerFatalEvent | WorkerSettledEvent): Promise<void> {
   if (typeof process.send !== "function") return;
-  const event = makeRuntimeFatalEvent(run, error);
   await new Promise<void>((resolve) => {
     let completed = false;
     const finish = () => {
@@ -104,14 +104,24 @@ async function sendRuntimeFatalEvent(run: WorkerRunMessage, error: unknown): Pro
   });
 }
 
-function sendBootstrapEvent(
+function makeSettledCancellationEvent(run: WorkerRunMessage): WorkerSettledEvent {
+  return {
+    version: WORKER_PROTOCOL_VERSION,
+    type: "settled",
+    jobId: run.jobId,
+    attemptId: run.attemptId,
+    sequence: bootstrapSequence++,
+    outcome: "cancelled",
+  };
+}
+
+async function sendBootstrapEvent(
   run: WorkerRunMessage,
   type: "fatal" | "settled",
-  payload: { error?: string; outcome?: "cancelled" },
-): void {
-  if (typeof process.send !== "function") return;
+  payload: { error?: string } = {},
+): Promise<void> {
   if (type === "fatal") {
-    process.send({
+    await sendTerminalEvent({
       version: WORKER_PROTOCOL_VERSION,
       type,
       jobId: run.jobId,
@@ -121,14 +131,7 @@ function sendBootstrapEvent(
     });
     return;
   }
-  process.send({
-    version: WORKER_PROTOCOL_VERSION,
-    type,
-    jobId: run.jobId,
-    attemptId: run.attemptId,
-    sequence: bootstrapSequence++,
-    outcome: payload.outcome || "cancelled",
-  });
+  await sendTerminalEvent(makeSettledCancellationEvent(run));
 }
 
 function encodedRunMessage(run: WorkerRunMessage): string {
@@ -362,13 +365,13 @@ async function main(): Promise<void> {
   activeRun = run;
   installCancellationListener();
   if (cancellationRequested) {
-    sendBootstrapEvent(run, "settled", { outcome: "cancelled" });
+    await sendBootstrapEvent(run, "settled");
     return;
   }
 
   session = await createWorkerSession();
   if (cancellationRequested) {
-    sendBootstrapEvent(run, "settled", { outcome: "cancelled" });
+    await sendBootstrapEvent(run, "settled");
     return;
   }
 
@@ -394,11 +397,11 @@ if (isMainModule) {
     .catch(async (error) => {
       process.exitCode = 1;
       if (activeRun && !runDispatched) {
-        sendBootstrapEvent(activeRun, "fatal", {
+        await sendBootstrapEvent(activeRun, "fatal", {
           error: safeResearchWorkerFailure(error),
         });
       } else {
-        if (activeRun) await sendRuntimeFatalEvent(activeRun, error);
+        if (activeRun) await sendTerminalEvent(makeRuntimeFatalEvent(activeRun, error));
         await abortDispatchedFailure();
       }
     })
