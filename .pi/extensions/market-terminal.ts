@@ -2931,7 +2931,7 @@ function normalizeChart(raw: Record<string, unknown>): Omit<CanvasChartBlock, "i
 	};
 }
 
-function normalizeCanvasBlocks(value: unknown): CanvasBlock[] {
+function normalizeCanvasBlocks(value: unknown, coalesceSources = true): CanvasBlock[] {
 	if (!Array.isArray(value)) return [];
 	const blocks: CanvasBlock[] = [];
 	for (const raw of value.slice(0, 12)) {
@@ -2995,7 +2995,7 @@ function normalizeCanvasBlocks(value: unknown): CanvasBlock[] {
 			}
 		}
 	}
-	return coalesceSourceBlocks(blocks).slice(0, 12);
+	return (coalesceSources ? coalesceSourceBlocks(blocks) : blocks).slice(0, 12);
 }
 
 /**
@@ -3073,24 +3073,65 @@ export function splitPairedCanvas(
 	if (pairedCanvas.stage !== "complete") {
 		return { error: `Paired canvas stage is ${pairedCanvas.stage ?? "missing"}, expected complete` };
 	}
+	const pairedBlocks = normalizeCanvasBlocks(pairedCanvas.blocks, false);
 	const partitions: Record<ResearchIntent, CanvasBlock[]> = { brief: [], why: [] };
 	const seen: Record<ResearchIntent, Set<string>> = { brief: new Set(), why: new Set() };
-	for (const block of normalizeCanvasBlocks(pairedCanvas.blocks)) {
+	const readCounts: Record<ResearchIntent, number> = { brief: 0, why: 0 };
+	let sharedSources = 0;
+	for (const block of pairedBlocks) {
 		const rawId = (block.id ?? "").toLowerCase();
-		const targets: ResearchIntent[] = rawId.startsWith("brief-")
-			? ["brief"]
-			: rawId.startsWith("why-") ? ["why"]
-				: rawId.startsWith("shared-") || rawId.startsWith("ta-") ? ["brief", "why"] : [];
+		let targets: ResearchIntent[] = [];
+		let partitionId = rawId;
+		if (rawId.startsWith("brief-") || rawId.startsWith("why-")) {
+			const target: ResearchIntent = rawId.startsWith("brief-") ? "brief" : "why";
+			const prefix = `${target}-`;
+			partitionId = rawId.slice(prefix.length);
+			const allowed = target === "brief"
+				? new Set(["read", "evidence", "unknowns"])
+				: new Set(["read", "evidence", "scenarios", "unknowns"]);
+			if (!allowed.has(partitionId)) {
+				return { error: `Unsupported paired ${target} block id: ${partitionId || "empty"}` };
+			}
+			const classified = classifyDossierHint({ ...block, id: partitionId });
+			if (classified !== undefined && classified !== partitionId) {
+				return { error: `Paired ${target}-${partitionId} block has mismatched dossierHint ${classified}` };
+			}
+			if (partitionId === "read") {
+				const sourceIds = blockSourceIds(block);
+				if (sourceIds.length === 0 || blockItemSourceIdSets(block).some((ids) => ids.length === 0)) {
+					return { error: `Paired ${target} read must carry sourceIds for every claim item` };
+				}
+				readCounts[target] += 1;
+			}
+			targets = [target];
+		} else if (rawId.startsWith("shared-")) {
+			partitionId = rawId.slice("shared-".length);
+			if (partitionId !== "sources" || block.kind !== "sources") {
+				return { error: `Unsupported paired shared block id: ${partitionId || "empty"}` };
+			}
+			if (block.dossierHint !== undefined && block.dossierHint !== "sources") {
+				return { error: "Paired shared-sources block has a mismatched dossierHint" };
+			}
+			sharedSources += 1;
+			targets = ["brief", "why"];
+		} else if (rawId.startsWith("ta-")) {
+			targets = ["brief", "why"];
+		}
 		for (const target of targets) {
-			const prefix = target === "brief" ? "brief-" : "why-";
-			const id = rawId.startsWith(prefix)
-				? rawId.slice(prefix.length)
-				: rawId.startsWith("shared-") ? rawId.slice("shared-".length) : rawId;
+			const id = rawId.startsWith("ta-") ? rawId : partitionId;
 			if (!id) return { error: `Paired ${target} block has an empty post-prefix id` };
 			if (seen[target].has(id)) return { error: `Duplicate paired ${target} block id: ${id}` };
 			seen[target].add(id);
 			partitions[target].push(id === rawId ? block : { ...block, id });
 		}
+	}
+	for (const intent of ["brief", "why"] as const) {
+		if (readCounts[intent] !== 1) {
+			return { error: `Paired ${intent} partition requires exactly one sourced read block` };
+		}
+	}
+	if (sharedSources !== 1) {
+		return { error: "Paired canvas requires exactly one shared-sources block" };
 	}
 
 	const sourceIdsFor = (blocks: CanvasBlock[]): Set<string> => {
@@ -8285,10 +8326,14 @@ export default function (pi: ExtensionAPI) {
 			const job = correlatedResearchJob(params.research_id, symbol);
 			const stage = (params.stage || "complete") as CanvasStage;
 			const content = params.content !== undefined ? cleanText(String(params.content)).slice(0, MAX_CANVAS_CHARS) : "";
-			const norm = normalizeCanvasBlocks(params.blocks);
+			// Preserve paired source-block cardinality until the hard partition
+			// contract has been checked; general canvas normalization coalesces
+			// source blocks for display and would otherwise hide duplicates.
+			const norm = normalizeCanvasBlocks(params.blocks, !job?.pairedTarget);
 			if (norm.some(isReservedTechnicalBlock)) throw new Error("Block IDs beginning with ta- are reserved for deterministic market_technicals output; omit them and they will be preserved automatically");
 			if (!content.trim() && norm.length === 0) throw new Error("market_canvas requires non-empty content or at least one valid block");
 			if (stage === "partial" && !job) throw new Error("stage=partial requires an active research_id");
+			if (stage === "partial" && job?.pairedTarget) throw new Error("Paired pre-cache research requires one complete canvas publish");
 			if (stage === "partial" && norm.length === 0) throw new Error("stage=partial requires at least one real structural block");
 			if (stage === "complete" && job) {
 				const packets = normalizeEvidencePackets(job.evidencePackets);
@@ -8332,7 +8377,7 @@ export default function (pi: ExtensionAPI) {
 					}
 				}
 			}
-			const canvas = storeCanvas({
+			const canvasUpdate: Canvas = {
 				symbol,
 				title: cleanText(params.title).slice(0, 160) || `${symbol} research`,
 				content,
@@ -8341,7 +8386,12 @@ export default function (pi: ExtensionAPI) {
 				...(job ? { researchId: job.id, stage, chartScope: job.chartScope, researchKey: job.researchKey, intent: job.intent, contextLabel: job.contextLabel } : params.stage ? { stage } : {}),
 				...(job?.evidencePackets?.length ? { evidencePackets: job.evidencePackets } : {}),
 				...(params.citations !== undefined ? { evidenceCitations } : {}),
-			}, Boolean(job));
+			};
+			if (job?.pairedTarget) {
+				const split = splitPairedCanvas(canvasUpdate, job.pairedTarget.brief, job.pairedTarget.why);
+				if ("error" in split) throw new Error(split.error);
+			}
+			const canvas = storeCanvas(canvasUpdate, Boolean(job));
 			const totalBlocks = normalizeCanvasBlocks(canvas.blocks).length;
 			if (job) {
 				updateResearchJob(job.id, {
