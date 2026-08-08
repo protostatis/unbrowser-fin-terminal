@@ -79,7 +79,37 @@ export interface TerminalFrameState {
   eventsFocus?: "lanes" | "briefing";
   storyScroll?: TerminalScrollWindow;
   eventScroll?: TerminalScrollWindow;
+  /** Ticker canvas scroll state; present on RESEARCH and wide SPLIT layouts. */
+  canvasScroll?: TerminalScrollWindow;
+  /** Wide ticker view identity emitted by the canonical extension. */
+  tickerLayout?: "quote" | "research" | "split";
+  /** Whether the current terminal dimensions can render the ticker split. */
+  tickerSplitAvailable?: boolean;
+  /** Frozen source-list context when a ticker was opened from MOVERS or WATCH. */
+  tickerNavigation?: {
+    source: "movers" | "watch";
+    index: number;
+    count: number;
+  };
   hasCanvas?: boolean;
+  /** Present only while an archived research canvas is displayed. */
+  archive?: {
+    position: number;
+    count: number;
+    asOf?: number;
+  };
+  /**
+   * Live layout geometry published by the extension's debugState(). The browser
+   * interaction layer uses this (instead of hardcoded row counts) so it stays
+   * correct as the extension reclaims/collapses header & footer rows.
+   */
+  layout?: {
+    headerRows: number;
+    footerRows: number;
+    width: number;
+    totalRows: number;
+    splitPane: boolean;
+  };
 }
 
 export interface MobileAction {
@@ -89,6 +119,13 @@ export interface MobileAction {
   input?: string;
   tone?: "default" | "accent" | "warning";
   disabled?: boolean;
+}
+
+/** A full ticker view can restore Split only when the terminal confirms it fits. */
+export function canRestoreTickerSplit(state?: TerminalFrameState): boolean {
+  return state?.mode === "ticker"
+    && state.tickerSplitAvailable === true
+    && (state.tickerLayout === "quote" || state.tickerLayout === "research");
 }
 
 export const SCOPE_ACTIONS: ReadonlyArray<{
@@ -124,6 +161,7 @@ export function mobileActions(state?: TerminalFrameState): MobileAction[] {
   const watchable =
     isTicker || screen === "MARKET" || screen === "MOVERS" || screen === "WATCH";
   const researchActive = Boolean(state?.research?.active);
+  const archive = state?.archive;
 
   let contextAction: MobileAction;
   if (isTicker) {
@@ -142,6 +180,21 @@ export function mobileActions(state?: TerminalFrameState): MobileAction[] {
     };
   } else {
     contextAction = { id: "help", label: "Help", keyHint: "?", input: "?" };
+  }
+
+  // Archive browsing is otherwise keyboard-only ([ / ]). When an archive is
+  // open, give both directions their own touch actions instead of burying the
+  // user behind an Older-only route.
+  if (!researchActive && archive) {
+    const atOldest = archive.position >= Math.max(0, archive.count - 1);
+    return [
+      contextAction,
+      { id: "why", label: "Why", keyHint: "K", input: "k" },
+      { id: "older", label: "Older", keyHint: "[", input: "[", disabled: atOldest },
+      { id: "newer", label: "Newer", keyHint: "]", input: "]" },
+      { id: "sync", label: "Sync", keyHint: "R", input: "r" },
+      { id: "search", label: "Symbol", keyHint: "/", tone: "accent" },
+    ];
   }
 
   let contextualAction: MobileAction;

@@ -55,13 +55,29 @@ test("pane choices are undefined for single-pane views", () => {
   assert.equal(paneChoices(), undefined);
 });
 
-test("ticker research scrolls its canvas only when one is displayed", () => {
+test("ticker research and wide split scroll their canvas only when one is displayed", () => {
   assert.deepEqual(scrollControls(), []);
   assert.deepEqual(scrollControls({ mode: "ticker", screen: "QUOTE", hasCanvas: true }), []);
   assert.deepEqual(scrollControls({ mode: "ticker", screen: "RESEARCH", hasCanvas: false }), []);
   assert.deepEqual(scrollControls({ mode: "ticker", screen: "RESEARCH", hasCanvas: true }), [
     { target: "canvas", scrollable: true },
   ]);
+  assert.deepEqual(scrollControls({
+    mode: "ticker",
+    screen: "SPLIT",
+    tickerLayout: "split",
+    hasCanvas: true,
+    canvasScroll: { offset: 4, rows: 31, viewportRows: 12 },
+  }), [
+    { target: "canvas", scrollable: true, offset: 4, rows: 31, viewportRows: 12 },
+  ]);
+  assert.equal(scrollControls({
+    mode: "ticker",
+    screen: "SPLIT",
+    tickerLayout: "split",
+    hasCanvas: true,
+    canvasScroll: { offset: 0, rows: 6, viewportRows: 12 },
+  })[0]?.scrollable, false);
 });
 
 test("story and briefing scroll only when content exceeds the viewport", () => {
@@ -204,6 +220,19 @@ test("key hints adapt navigation label and omit Tab on single-pane views", () =>
   assert.equal(ticker[0]?.label, "Scroll canvas");
   assert.equal(ticker[1]?.label, "Brief");
   assert.equal(ticker[2]?.label, "Brief");
+});
+
+test("wide ticker full views advertise Tab to restore Split", () => {
+  const ticker = contextKeyHints({
+    mode: "ticker",
+    screen: "RESEARCH",
+    hasCanvas: true,
+    tickerLayout: "research",
+    tickerSplitAvailable: true,
+  });
+  assert.deepEqual(ticker.map((hint) => hint.keys), ["↑/↓", "Tab", "Enter", "J", "K"]);
+  assert.equal(ticker[1]?.label, "Split");
+  assert.equal(ticker[1]?.input, "\t");
 });
 
 test("key hints prefer scroll guidance when a story pane is scrollable", () => {

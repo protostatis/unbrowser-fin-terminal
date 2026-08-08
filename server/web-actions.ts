@@ -6,7 +6,7 @@
  * NEVER injects arbitrary data. Every emitted byte sequence is one of the
  * exact raw terminal sequences the market-terminal extension's handleInput
  * already understands (verified against pi-tui matchesKey() legacy sequences):
- *   Tab      "\t"        — focus-pane toggle (SIGNALS: headlines↔story, EVENTS: lanes↔briefing)
+ *   Tab      "\t"        — focus-pane toggle (SIGNALS: headlines↔story, EVENTS: lanes↔briefing) or wide ticker Split
  *   Up       "\x1b[A"    — list selection or content scrolling (context-dependent)
  *   Down     "\x1b[B"    — list selection or content scrolling (context-dependent)
  *   Enter    "\r"        — primary action (open ticker, start brief research)
@@ -46,6 +46,13 @@ export type TickerDebugState = {
   symbol: string;
   chartScope?: "day" | "week" | "month" | "year" | "max";
   hasCanvas: boolean;
+  tickerLayout?: "quote" | "research" | "split";
+  tickerNavigation?: {
+    source: "movers" | "watch";
+    index: number;
+    count: number;
+  };
+  canvasScroll?: { offset: number; rows: number; viewportRows: number };
   cacheDecision?: unknown;
   searching?: boolean;
 };
@@ -439,8 +446,8 @@ function resolveScroll(
     if (typeof action.screen === "string" && action.screen !== state.screen) {
       return reject(`scroll rejected: screen "${action.screen}" is stale`);
     }
-    if (state.screen !== "RESEARCH") {
-      return reject("scroll rejected: ticker QUOTE tab does not support scroll");
+    if (state.screen !== "RESEARCH" && state.screen !== "SPLIT") {
+      return reject("scroll rejected: ticker QUOTE view does not support scroll");
     }
     if (!state.hasCanvas) {
       return reject("scroll rejected: ticker RESEARCH has no canvas to scroll");

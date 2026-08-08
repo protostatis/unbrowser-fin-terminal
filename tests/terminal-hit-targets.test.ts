@@ -234,6 +234,30 @@ test("pane headings and wide pane bodies change focus without changing selection
   assert.equal(terminalPaneHitTarget(events, 80, 10, 30, 0.7), undefined);
 });
 
+test("pane geometry follows the live layout block from debugState", () => {
+  // The extension now publishes headerRows/footerRows/splitPane in its
+  // debugState layout block. When the header reclaims rows (e.g. 3 instead of
+  // the legacy 5), a click on row 3 must land in the pane body, not be treated
+  // as chrome. Old servers without `layout` keep the 5/4 fallback.
+  const signalsCompact = {
+    mode: "market" as const,
+    screen: "SIGNALS",
+    available: ["Headline"],
+    selectedIndex: 0,
+    selected: "Headline",
+    signalsFocus: "headlines" as const,
+    layout: { headerRows: 3, footerRows: 3, width: 120, totalRows: 30, splitPane: true },
+  };
+  assert.equal(terminalPaneAtPosition(signalsCompact, 120, 3, 30, 0.8), "story");
+  // Footer now starts at rowCount - footerRows = 30 - 3 = 27.
+  assert.equal(terminalPaneAtPosition(signalsCompact, 120, 26, 30, 0.8), "story");
+  assert.equal(terminalPaneAtPosition(signalsCompact, 120, 27, 30, 0.8), undefined);
+
+  // splitPane false (single-pane screen) suppresses pane clicks entirely.
+  const marketLayout = { ...signalsCompact, screen: "MARKET", layout: { headerRows: 3, footerRows: 3, width: 120, totalRows: 30, splitPane: false } };
+  assert.equal(terminalPaneAtPosition(marketLayout, 120, 10, 30, 0.2), undefined);
+});
+
 test("locked terminal rows expose no pointer action", () => {
   assert.equal(
     terminalRowHitTarget(

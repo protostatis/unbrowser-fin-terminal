@@ -12,6 +12,7 @@
  * everything is derived from state fields the extension already publishes.
  */
 import {
+  canRestoreTickerSplit,
   TERMINAL_INPUTS,
   type ChartScope,
   type TerminalFrameState,
@@ -159,7 +160,7 @@ export interface ScrollControl {
 
 /**
  * Scroll controls that are meaningful for the current view:
- * - ticker RESEARCH tab with a canvas scrolls the canvas;
+ * - ticker RESEARCH or wide SPLIT with a canvas scrolls the canvas;
  * - SIGNALS story / EVENTS briefing scroll only when the reported content
  *   exceeds the viewport (rows > viewportRows). Normal market lists never
  *   scroll — their arrows move the selection instead (see arrowsMoveSelection).
@@ -169,8 +170,21 @@ export function scrollControls(state?: TerminalFrameState): ScrollControl[] {
   if (!state) return controls;
 
   if (state.mode === "ticker") {
-    if (state.screen?.toUpperCase() === "RESEARCH" && state.hasCanvas) {
-      controls.push({ target: "canvas", scrollable: true });
+    const screen = state.screen?.toUpperCase();
+    if ((screen === "RESEARCH" || screen === "SPLIT") && state.hasCanvas) {
+      const scroll = state.canvasScroll;
+      const control: ScrollControl = {
+        target: "canvas",
+        // Older frames did not publish a window; preserve their prior behavior
+        // rather than silently hiding scroll controls.
+        scrollable: scroll ? scroll.rows > scroll.viewportRows : true,
+      };
+      if (scroll) {
+        control.offset = scroll.offset;
+        control.rows = scroll.rows;
+        control.viewportRows = scroll.viewportRows;
+      }
+      controls.push(control);
     }
     return controls;
   }
@@ -323,6 +337,9 @@ export function contextKeyHints(state?: TerminalFrameState): ContextKeyHint[] {
       hints.push({ keys: "Tab", label: "Pane", tone: "primary", input: TERMINAL_INPUTS.tab });
     }
   } else {
+    if (canRestoreTickerSplit(state)) {
+      hints.push({ keys: "Tab", label: "Split", tone: "primary", input: TERMINAL_INPUTS.tab });
+    }
     hints.push({
       keys: "Enter",
       label: "Brief",
@@ -345,10 +362,21 @@ export function contextKeyHints(state?: TerminalFrameState): ContextKeyHint[] {
 
 function navigationHint(state: TerminalFrameState): ContextKeyHint | undefined {
   if (state.mode === "ticker") {
-    if (state.screen?.toUpperCase() === "RESEARCH" && state.hasCanvas) {
-      return { keys: "↑/↓", label: "Scroll canvas", tone: "primary", input: TERMINAL_INPUTS.up };
+    const screen = state.screen?.toUpperCase();
+    if ((screen === "RESEARCH" || screen === "SPLIT") && state.hasCanvas) {
+      return {
+        keys: "↑/↓",
+        label: screen === "SPLIT" ? "Scroll research" : "Scroll canvas",
+        tone: "primary",
+        input: TERMINAL_INPUTS.up,
+      };
     }
-    return { keys: "←/→", label: "Switch tab", tone: "primary", input: TERMINAL_INPUTS.right };
+    return {
+      keys: "←/→",
+      label: screen === "SPLIT" ? "Full view" : "Switch tab",
+      tone: "primary",
+      input: TERMINAL_INPUTS.right,
+    };
   }
 
   const screen = state.screen?.toUpperCase();
