@@ -2489,6 +2489,22 @@ strong {
   }
 }
 
+/* Touch: the top-right corner is owned by the ContextHud — a persistent
+   ‹ Back button (ticker detail) plus the fading action cluster
+   (Why/Watch/Refresh/Cancel), all anchored at top:8/right:8. The session
+   banner shared that exact corner and visually collided with the Back button
+   whenever a ticker was open. Move it to the top-left and cap its width so it
+   can never reach the HUD column. Excludes the conversion-preview variant,
+   which is a separate absolute-positioned layout with its own corner. */
+@media (hover: none) and (pointer: coarse) {
+  .public-session-banner:not(.conversion-session-banner) {
+    left: max(8px, env(safe-area-inset-left));
+    right: auto;
+    /* 8px own left inset + 40px back button + 8px right inset + 16px gap. */
+    max-width: calc(100vw - 72px);
+  }
+}
+
 .replay-dialog-body {
   display: flex;
   flex-direction: column;
