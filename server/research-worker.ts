@@ -5,6 +5,11 @@
  * receives one versioned IPC run message, starts a worker-mode extension
  * command, and exits after Pi settles. The extension emits sequenced canvas
  * and progress events directly over the IPC channel.
+ *
+ * For paired pre-cache runs, the worker is gated by a per-run token limit:
+ * before each provider turn, total usage + context estimate + model max
+ * output is compared against the limit, and the turn is aborted if it would
+ * exceed. Interactive jobs are unaffected.
  */
 
 import path from "node:path";
@@ -28,6 +33,8 @@ import {
   WORKER_PROTOCOL_VERSION,
   type WorkerRunMessage,
 } from "./research-worker-protocol.js";
+import { wouldExceedTokenLimit } from "../shared/research-precache-ledger.js";
+import { setResearchWorkerUsageCollector, type ResearchWorkerUsage } from "../shared/research-worker-usage.js";
 
 const CWD = path.resolve(process.env.MARKET_ROOT?.trim() || process.cwd());
 const RUN_TIMEOUT_MS = 10 * 60_000;
@@ -189,6 +196,75 @@ export async function waitForSettlement(
   });
 }
 
+/**
+ * Install a per-turn token guard for paired pre-cache jobs. Subscribes
+ * to turn_start events; before each provider turn, checks whether the
+ * projected total tokens would exceed the token limit and aborts if so.
+ * Does nothing for interactive (non-pre-cache) jobs or when no limit is set.
+ */
+export function installTokenGuard(
+  activeSession: AgentSession,
+  tokenLimit: number,
+): () => void {
+  let guardTriggered = false;
+  const unsubscribe = activeSession.subscribe((event) => {
+    if (event.type !== "turn_start") return;
+    if (cancellationRequested) return;
+    if (guardTriggered) {
+      void activeSession.abort();
+      return;
+    }
+    try {
+      const stats = activeSession.getSessionStats();
+      const usedTotal = stats.tokens.total;
+      const contextEstimate = activeSession.getContextUsage()?.tokens;
+      const modelMaxTokens = activeSession.model?.maxTokens;
+      if (
+        contextEstimate === null
+        || contextEstimate === undefined
+        || modelMaxTokens === undefined
+        || wouldExceedTokenLimit({ usedTotal, contextEstimate, modelMaxTokens, tokenLimit })
+      ) {
+        guardTriggered = true;
+        void activeSession.abort();
+      }
+    } catch {
+      // Unknown accounting cannot safely authorize another paid provider turn.
+      guardTriggered = true;
+      void activeSession.abort();
+    }
+  });
+  return unsubscribe;
+}
+
+/**
+ * Collect Pi-reported session usage stats.
+ * Stats shape: { tokens: { input, output, cacheRead, cacheWrite, total }, cost: number }
+ */
+export function collectSessionUsage(
+  activeSession: AgentSession,
+): ResearchWorkerUsage | undefined {
+  try {
+    const stats = activeSession.getSessionStats();
+    const t = stats.tokens as Record<string, unknown>;
+    const tokenCount = (value: unknown): number | undefined => typeof value === "number"
+      && Number.isFinite(value) && value >= 0 && Number.isInteger(value) ? value : undefined;
+    const inputTokens = tokenCount(t.input);
+    const outputTokens = tokenCount(t.output);
+    const cacheReadTokens = tokenCount(t.cacheRead);
+    const cacheWriteTokens = tokenCount(t.cacheWrite);
+    const reportedTotal = tokenCount(t.total);
+    if (inputTokens === undefined || outputTokens === undefined || cacheReadTokens === undefined
+      || cacheWriteTokens === undefined || reportedTotal === undefined) return undefined;
+    const totalTokens = inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens;
+    if (reportedTotal !== totalTokens) return undefined;
+    const cost = typeof stats.cost === "number" && Number.isFinite(stats.cost) && stats.cost >= 0 ? stats.cost : undefined;
+    return { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, totalTokens, ...(cost !== undefined ? { cost } : {}) };
+  } catch {
+    return undefined;
+  }
+}
+
 export async function dispatchAndWaitForSettlement(
   activeSession: AgentSession,
   command: string,
@@ -204,6 +280,7 @@ export async function dispatchAndWaitForSettlement(
 }
 
 async function shutdown(): Promise<void> {
+  setResearchWorkerUsageCollector(undefined);
   try {
     session?.dispose();
   } catch {
@@ -236,6 +313,14 @@ async function main(): Promise<void> {
     sendBootstrapEvent(run, "settled", { outcome: "cancelled" });
     return;
   }
+
+  // Install token guard for paired pre-cache jobs with a token limit.
+  if (run.request.origin === "precache" && typeof run.request.tokenLimit === "number") {
+    installTokenGuard(session, run.request.tokenLimit);
+  }
+
+  // Register across native ESM / jiti extension caches before the turn starts.
+  setResearchWorkerUsageCollector(() => session ? collectSessionUsage(session) : undefined);
 
   await dispatchAndWaitForSettlement(
     session,

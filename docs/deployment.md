@@ -112,11 +112,34 @@ fail-closed:
 
 | Env | Default | Production guidance |
 |---|---|---|
-| `MARKET_PRECACHE_ENABLED` | on (non-public) | Leave on; `0` disables pre-warming entirely |
+| `MARKET_PRECACHE_ENABLED` | on (non-public) | Leave on; `0` disables pre-warming entirely. Disposable public workers remain cold even if enabled |
 | `MARKET_PRECACHE_QUALITY_GATE` | `1` | Leave on. Prevents evidence-blocked canvases from being cached as warm and runs the extraction canary + identity cooldown |
-| `MARKET_PRECACHE_MAX_JOBS` | `24` | Cap the warm plan (Market Story + watchlist + top-10 movers) |
-| `MARKET_PRECACHE_TICKERS` | active watchlist | Override the pre-warmed ticker set; `none` disables ticker warming |
-| `MARKET_RESEARCH_PROMPT` | `legacy` | **Recommended: `compact`** — hard output contract, ~36% less job-instruction context, and eliminates the search-title hallucination observed under `legacy` (benchmarked; see the branch's benchmark script `scripts/benchmark-prompts.ts`) |
+| `MARKET_PRECACHE_MAX_JOBS` | `24` | Cap the warm paired-context plan (story, headline, events, movers). Secondary to budget ceiling |
+| `MARKET_PRECACHE_BUDGET` | `2000000` | UTC-day total Pi-reported token budget for paired pre-cache runs (10 000–10 000 000) |
+| `MARKET_PRECACHE_RUN_LIMIT` | `100000` | Conservative reservation per paired run; at most ~20 attempts/day at defaults (5 000–500 000) |
+| `MARKET_RESEARCH_PROMPT` | `legacy` | **Recommended: `compact`** for interactive/unpaired research. Paired warm jobs always use their strict `paired-v1` partition contract |
+
+Pre-cache pairing:
+
+- Paired contexts run one research/evidence extraction for both BRIEF and WHY,
+  then split into two independently validated canvases with the exact
+  interactive identities. The synthetic `v1/paired/*` identity is never
+  archived or exposed as a cache hit.
+- Plan order is deterministic: Market Story, the bootstrap snapshot's lead
+  SIGNALS headline, all three EVENT_LANES, then ticker pairs strictly by mover
+  rank. There is no watchlist fallback.
+- A context is skipped only when both exact BRIEF and WHY identities are
+  same-day usable. If only one half is fresh, the pair still runs, but the
+  host must not overwrite the fresh half.
+- With the quality gate enabled, degraded halves remain in archive history for
+  cooldown telemetry but are not cache-eligible; a usable sibling half remains
+  independently eligible.
+- The budget ledger lives under `MARKET_DATA_DIR` as
+  `market-precache-ledger.json`. Reservations are permanent for the UTC day
+  (no refunds); actual usage is telemetry-only. This guarantees at most
+  ~20 attempts/day at defaults. The worker checks projected Pi usage before
+  every provider turn, including the first. Budget settings cannot change
+  after that UTC day's ledger record has been created.
 
 Behavior to expect in production:
 
@@ -129,8 +152,8 @@ Behavior to expect in production:
   extractor or un-blocked source recovers without wasting workers.
 - Completed canvases are archived to `$MARKET_DATA_DIR/market-research-archive.json`
   with typed quality telemetry (`quality`, `generation`), and are shared across
-  sessions. One parent process writes per archive path (the deployment is a
-  singleton; public workers do not warm).
+  sessions. One parent process writes both archive and pre-cache ledger per data
+  directory (the deployment is a singleton; public workers do not warm).
 
 ## Post-Deployment Verification
 

@@ -14,6 +14,8 @@ venv/
 *.log
 .pi/market-research-archive.json
 .pi/market-research-archive.json.tmp-*
+.pi/market-precache-ledger.json
+.pi/market-precache-ledger.json.tmp-*
 node_modules/
 dist-web/
 dist-server/

@@ -4,6 +4,7 @@ import {
   buildResearchPrompt,
   buildResearchPromptCompact,
   buildResearchPromptLegacy,
+  buildResearchPromptPaired,
   readResearchPromptVariant,
   type ResearchPromptJob,
 } from "../.pi/extensions/market-terminal.js";
@@ -68,4 +69,46 @@ test("research prompt variants are env-selected", () => {
     if (previous === undefined) delete process.env.MARKET_RESEARCH_PROMPT;
     else process.env.MARKET_RESEARCH_PROMPT = previous;
   }
+});
+
+test("paired prompt requires one shared evidence pass and strict BRIEF/WHY partitions", () => {
+  const paired: ResearchPromptJob = {
+    ...JOB,
+    researchKey: `v1/paired/${"a".repeat(32)}`,
+    contextLabel: "PAIRED AAPL",
+    pairedTarget: {
+      brief: { researchKey: "v1/ticker/brief", intent: "brief", contextLabel: "AAPL BRIEF", question: "Brief AAPL" },
+      why: { researchKey: "v1/ticker/why", intent: "why", contextLabel: "AAPL WHY", question: "Why AAPL" },
+      neededBrief: true,
+      neededWhy: true,
+    },
+  };
+  const prompt = buildResearchPromptPaired(paired, "Brief AAPL", "Why AAPL");
+  assert.match(prompt, /ONE evidence discovery\/extraction/);
+  assert.match(prompt, /id=brief-\*/);
+  assert.match(prompt, /id=why-\*/);
+  assert.match(prompt, /id=shared-\*/);
+  assert.match(prompt, /brief-read/);
+  assert.match(prompt, /why-scenarios/);
+  assert.match(prompt, /market_technicals/);
+  assert.match(prompt, /BRIEF QUESTION: Brief AAPL/);
+  assert.match(prompt, /WHY QUESTION: Why AAPL/);
+});
+
+test("paired event/headline MARKET prompts do not add generic technical analysis", () => {
+  const eventJob: ResearchPromptJob = {
+    ...JOB,
+    symbol: "MARKET",
+    researchKey: `v1/paired/${"b".repeat(32)}`,
+    contextLabel: "PAIRED EARNINGS",
+    pairedTarget: {
+      brief: { researchKey: "v1/market/events/earnings/brief", intent: "brief", contextLabel: "EARNINGS BRIEF", question: "Brief" },
+      why: { researchKey: "v1/market/events/earnings/why", intent: "why", contextLabel: "EARNINGS WHY", question: "Why" },
+      neededBrief: true,
+      neededWhy: true,
+    },
+  };
+  const prompt = buildResearchPromptPaired(eventJob, "Brief", "Why");
+  assert.doesNotMatch(prompt, /market_technicals/);
+  assert.match(prompt, /on-demand catalyst monitor/);
 });

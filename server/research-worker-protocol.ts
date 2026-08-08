@@ -5,9 +5,28 @@
  * Framework-independent — no Pi SDK imports.
  */
 
+import { pairedPairKey } from "../shared/research-precache-ledger.js";
+import type { ResearchWorkerUsage } from "../shared/research-worker-usage.js";
+
 export const WORKER_PROTOCOL_VERSION = 1;
 const MAX_IPC_BYTES = 64 * 1024;
 const MAX_CANVAS_CONTENT_CHARS = 12_000;
+
+// ── Paired target (optional, for paired pre-cache runs) ───────────────────
+
+export interface PairedTargetIdentity {
+  researchKey: string;
+  intent: "brief" | "why";
+  contextLabel: string;
+  question: string;
+}
+
+export interface PairedTarget {
+  brief: PairedTargetIdentity;
+  why: PairedTargetIdentity;
+  neededBrief: boolean;
+  neededWhy: boolean;
+}
 
 // ── Research request context (immutable per job) ──────────────────────────
 
@@ -18,7 +37,17 @@ export interface ResearchRequestContext {
   researchKey: string;
   intent: "brief" | "why";
   contextLabel: string;
+  /** Optional paired pre-cache target. Never exposed as a cache hit. */
+  pairedTarget?: PairedTarget;
+  /** Only for paired pre-cache workers. */
+  origin?: "precache";
+  /** Per-run token limit for pre-turn abort guard (paired pre-cache only). */
+  tokenLimit?: number;
 }
+
+// ── Worker usage (reported on settled events) ─────────────────────────────
+
+export type WorkerUsage = ResearchWorkerUsage;
 
 // ── Parent → Worker messages ──────────────────────────────────────────────
 
@@ -76,6 +105,7 @@ export interface WorkerSettledEvent extends WorkerEventHeader {
   type: "settled";
   outcome: "complete" | "failed" | "cancelled";
   error?: string;
+  usage?: WorkerUsage;
 }
 
 /** Bootstrap or protocol failure. Worker will exit after this. */
@@ -127,6 +157,57 @@ const RESEARCH_OUTCOMES = new Set(["queued", "running", "partial", "complete", "
 const RESEARCH_ACTIVITIES = new Set(["seeding", "fetching", "extracting", "synthesizing"]);
 const SETTLED_OUTCOMES = new Set(["complete", "failed", "cancelled"]);
 const EVENT_TYPES = new Set(["started", "job", "canvas", "settled", "fatal"]);
+// ── Paired target guard (strict) ──────────────────────────────────────────
+
+function isValidPairedIdentity(value: unknown): value is PairedTargetIdentity {
+  if (!isRecord(value)) return false;
+  const rk = value.researchKey;
+  const i = value.intent;
+  const cl = value.contextLabel;
+  const q = value.question;
+  return (
+    isNonEmptyString(rk, 200) &&
+    typeof i === "string" && INTENTS.has(i) &&
+    isNonEmptyString(cl, 200) &&
+    isNonEmptyString(q, 4000)
+  );
+}
+
+function isValidPairedTarget(value: unknown): value is PairedTarget {
+  if (!isRecord(value)) return false;
+  const brief = value.brief;
+  const why = value.why;
+  if (!isValidPairedIdentity(brief) || !isValidPairedIdentity(why)) return false;
+  // Strict: brief.intent must be "brief", why.intent must be "why"
+  if (brief.intent !== "brief" || why.intent !== "why") return false;
+  if (!brief.researchKey.endsWith("/brief") || !why.researchKey.endsWith("/why")) return false;
+  // Keys must be distinct and non-synthetic (not v1/paired/*)
+  if (brief.researchKey === why.researchKey) return false;
+  if (brief.researchKey.startsWith("v1/paired/") || why.researchKey.startsWith("v1/paired/")) return false;
+  if (typeof value.neededBrief !== "boolean" || typeof value.neededWhy !== "boolean") return false;
+  if (!value.neededBrief && !value.neededWhy) return false;
+  return true;
+}
+
+function isValidWorkerUsage(value: unknown): value is WorkerUsage {
+  if (!isRecord(value)) return false;
+  const u = value as Record<string, unknown>;
+  const fields = ["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "totalTokens"] as const;
+  for (const field of fields) {
+    const v = u[field];
+    if (typeof v !== "number" || !Number.isFinite(v) || v < 0 || v > 1_000_000_000 || !Number.isInteger(v)) return false;
+  }
+  const input = u.inputTokens as number;
+  const output = u.outputTokens as number;
+  const total = u.totalTokens as number;
+  const cacheRead = u.cacheReadTokens as number;
+  const cacheWrite = u.cacheWriteTokens as number;
+  if (total !== input + output + cacheRead + cacheWrite) return false;
+  if (u.cost !== undefined) {
+    if (typeof u.cost !== "number" || !Number.isFinite(u.cost) || u.cost < 0 || u.cost > 1_000_000) return false;
+  }
+  return true;
+}
 
 // ── Request guard ─────────────────────────────────────────────────────────
 
@@ -140,7 +221,7 @@ export function isValidResearchRequest(
   const rk = value.researchKey;
   const i = value.intent;
   const cl = value.contextLabel;
-  return (
+  const baseValid = (
     isNonEmptyString(s, 20) &&
     isNonEmptyString(q, 4000) &&
     typeof cs === "string" &&
@@ -150,6 +231,25 @@ export function isValidResearchRequest(
     INTENTS.has(i) &&
     isNonEmptyString(cl, 200)
   );
+  if (!baseValid) return false;
+  const pt = value.pairedTarget;
+  if (pt !== undefined && !isValidPairedTarget(pt)) return false;
+  const origin = value.origin;
+  if (origin !== undefined && origin !== "precache") return false;
+  const tokenLimit = value.tokenLimit;
+  if (tokenLimit !== undefined && (
+    typeof tokenLimit !== "number" || !Number.isFinite(tokenLimit)
+    || tokenLimit < 5_000 || tokenLimit > 500_000 || !Number.isInteger(tokenLimit)
+  )) return false;
+  if (pt) {
+    if (origin !== "precache" || tokenLimit === undefined || i !== "brief" || !/^v1\/paired\/[a-f0-9]{32}$/.test(String(rk))) return false;
+    const pairedTarget = pt as PairedTarget;
+    const expected = pairedPairKey(String(s), String(cs), pairedTarget.brief.researchKey, pairedTarget.why.researchKey);
+    if (rk !== `v1/paired/${expected.slice("pair-".length)}`) return false;
+  } else if (origin !== undefined || tokenLimit !== undefined || String(rk).startsWith("v1/paired/")) {
+    return false;
+  }
+  return true;
 }
 
 // ── Event header guard ────────────────────────────────────────────────────
@@ -211,6 +311,8 @@ export function isWorkerCanvasEvent(
     isBoundedString(canvas.content, MAX_CANVAS_CONTENT_CHARS) &&
     typeof canvas.updatedAt === "number" &&
     Number.isFinite(canvas.updatedAt) &&
+    canvas.updatedAt > 0 &&
+    canvas.updatedAt <= 9_000_000_000_000_000 &&
     (canvas.blocks === undefined || (Array.isArray(canvas.blocks) && canvas.blocks.length <= 12)) &&
     isBoundedJson(canvas)
   );
@@ -222,8 +324,12 @@ export function isWorkerSettledEvent(
   if (!isWorkerEventHeader(value) || value.type !== "settled") return false;
   const rec = value as unknown as Record<string, unknown>;
   const o = rec.outcome;
-  return typeof o === "string" && SETTLED_OUTCOMES.has(o)
+  const baseValid = typeof o === "string" && SETTLED_OUTCOMES.has(o)
     && (rec.error === undefined || isBoundedString(rec.error, 500));
+  if (!baseValid) return false;
+  const usage = rec.usage;
+  if (usage !== undefined && !isValidWorkerUsage(usage)) return false;
+  return true;
 }
 
 export function isWorkerFatalEvent(
