@@ -292,19 +292,18 @@ as `LEGACY`, but are never reused for a newly keyed request.
 
 When a session starts (the `/market` flow in TUI, the live server, or a private
 workspace), the terminal bootstraps the shared research cache with the agent
-requests a fresh session is most likely to make: the Market Story BRIEF (news),
-a BRIEF for **every** watchlist ticker, and a BRIEF for the current **top-10
-movers** (discovered by a best-effort market snapshot fetch at bootstrap). These
-run as ordinary background research jobs through the same FIFO queue and
-isolated workers, so their completed canvases are written to the shared archive
-and reused by every later session. The first user request of the day for a
-pre-warmed identity then hits the cache prompt with a current-date `AS OF`
-instead of starting a cold research run.
+requests a fresh session is most likely to make. Each warm job builds BRIEF and
+WHY from one shared evidence pass, in this order: Market Story, the bootstrap
+snapshot's lead SIGNALS headline, all three EVENTS lanes, then ticker pairs by
+snapshot mover rank. There is no watchlist fallback. If snapshot discovery
+fails, Market Story and the EVENTS lanes still warm.
 
-Pre-warming is date-gated, not freshness-maximal: an identity is only rebuilt
-when its newest archived canvas is not from the current UTC calendar date, so a
-weekend of inactivity costs one rebuild, not a job per session. Jobs already
-covered or already running are skipped.
+The host strictly partitions a completed paired canvas and writes only the exact
+interactive BRIEF/WHY identities. A pair is skipped when both halves already
+have usable same-day archives; if only one half is stale, the pair runs but the
+fresh half is not overwritten. Completed exact canvases are shared with later
+sessions, so the first matching request can use a current-date cache instead of
+starting cold research.
 
 Pre-warm jobs never compete with interactive research: at most
 `MARKET_RESEARCH_CONCURRENCY - 1` warm jobs are in flight at once (one worker
@@ -319,10 +318,23 @@ Configure it with environment variables:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MARKET_PRECACHE_ENABLED` | `1` (private/live/TUI), `0` (public workers) | Master switch, `1/true/on` or `0/false/off`. Public workers spend the visitor's bounded research budget (`PUBLIC_MAX_RESEARCH_RUNS`), so they stay cold unless this is explicitly set. |
-| `MARKET_PRECACHE_TICKERS` | active watchlist | Comma-separated tickers to pre-warm (e.g. `AAPL,NVDA,TSLA`); `none` disables ticker pre-warming (Market Story + movers only). A non-empty list with no valid symbols is a configuration error. |
-| `MARKET_PRECACHE_MAX_JOBS` | `24` | Cap on the pre-warm plan per bootstrap (Market Story + watchlist + movers), `1`–`24`. In-flight warm jobs are additionally capped at `MARKET_RESEARCH_CONCURRENCY - 1`. |
+| `MARKET_PRECACHE_ENABLED` | `1` (private/live/TUI), `0` (public workers) | Master switch, `1/true/on` or `0/false/off`. Disposable public workers are always cold, even if this variable is enabled. |
+| `MARKET_PRECACHE_MAX_JOBS` | `24` | Cap on the pre-warm plan per bootstrap (story + headline + events + movers), `1`–`24`. Secondary to budget ceiling. In-flight warm jobs are additionally capped at `MARKET_RESEARCH_CONCURRENCY - 1`. |
 | `MARKET_PRECACHE_QUALITY_GATE` | `1` | A/B switch for the quality gates. When on (default): a pre-warm identity is fresh only when the archive holds a **usable** same-day canvas (complete, fetched-evidence, item-level sourced read, no scenarios in a BRIEF) — evidence-blocked or unsupported canvases never satisfy the cache and are re-warmed; and a missing `UNBROWSER_MCP_URL` skips the source pre-warm entirely (extraction has no local fallback, so it would only produce degraded TA-only canvases). Set to `0` to restore the baseline date-only freshness and fan-out. |
+| `MARKET_PRECACHE_BUDGET` | `2000000` | UTC-day total Pi-reported token budget for paired pre-cache runs (10 000–10 000 000). See `market-precache-ledger.json`. |
+| `MARKET_PRECACHE_RUN_LIMIT` | `100000` | Conservative reservation per paired run; at most ~20 attempts/day at defaults (5 000–500 000). |
+
+The synthetic `v1/paired/*` worker identity is never archived or exposed as a
+cache hit. Before dispatch, the parent durably reserves the full per-run limit
+in `$MARKET_DATA_DIR/market-precache-ledger.json` (or `.pi/` without a data
+directory). Reservations are permanent for their UTC day; actual Pi usage and
+cost are settlement telemetry. The worker checks projected Pi usage before
+every provider turn, including the first. Budget settings are fixed once that
+UTC day's ledger record exists and can be changed for the next day.
+
+With the quality gate enabled, degraded split halves are retained in archive
+history for cooldown telemetry but are never published as cache-eligible
+results. Usable halves from the same paired run remain independently eligible.
 
 Quality is enforced host-side, not by the model: `assessCanvasQuality` requires a
 complete canvas with at least one fetched packet whose read (and any evidence
@@ -348,9 +360,9 @@ rest of the plan waits for its verdict, and the circuit opens immediately only i
 a completed canary reaches zero sources end-to-end (challenged/limited pages
 prove the extractor was reachable).
 
-The shared archive assumes one parent terminal process writes per archive path;
-use a single `MARKET_DATA_DIR` writer (or exclusive mounts) when multiple
-processes share storage.
+The shared archive and pre-cache budget ledger assume one parent terminal
+process writes per `MARKET_DATA_DIR`; use a single writer (or exclusive mounts)
+when multiple processes share storage.
 
 The `1`–`5` keys switch chart range/interval (DAY 5m pre/post, WEEK 15m, MONTH
 hourly, YEAR daily, TOTAL coarse long-term bars). Yahoo may coarsen the
