@@ -41,11 +41,15 @@ COPY --from=build /app/dist-server ./dist-server
 COPY --from=build /app/dist-web ./dist-web
 # The canonical extension is source-loaded by Pi at runtime. Its concurrent
 # research coordinator resolves the compiled worker modules from /app/server.
+# Keep both source and compiled shared modules: Pi/jiti loads the TypeScript
+# sources while the native ESM research child resolves adjacent JavaScript.
 COPY --from=build /app/dist-server/server ./server
+COPY --from=build /app/shared ./shared
+COPY --from=build /app/dist-server/shared ./shared
 COPY package.json ./package.json
-COPY shared ./shared
 COPY .pi/extensions ./.pi/extensions
 
+RUN node --input-type=module -e "await import('./server/research-worker.js')"
 RUN mkdir -p /data/pi-agent && chown -R node:node /data
 
 USER node
