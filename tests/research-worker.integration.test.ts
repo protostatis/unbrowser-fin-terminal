@@ -10,7 +10,7 @@ import {
 } from "../server/research-worker-coordinator.js";
 import type { WorkerEvent } from "../server/research-worker-protocol.js";
 
-test("coordinator reclaims a real worker after dispatch failure without a configured model", async () => {
+test("real worker reports a terminal fatal event after dispatched model failure", async () => {
   const agentDir = await mkdtemp(path.join(tmpdir(), "fin-terminal-worker-test-"));
   const childFactory = createDefaultWorkerFactory();
   const workerFactory: WorkerFactory = (env) => childFactory({
@@ -31,17 +31,23 @@ test("coordinator reclaims a real worker after dispatch failure without a config
   let coordinator: ResearchWorkerCoordinator | undefined;
 
   try {
-    const failure = await new Promise<Error>((resolve, reject) => {
+    const fatal = await new Promise<Extract<WorkerEvent, { type: "fatal" }>>((resolve, reject) => {
       const timer = setTimeout(() => {
         coordinator?.dispose();
         reject(new Error("research worker integration test timed out"));
       }, 30_000);
       coordinator = new ResearchWorkerCoordinator({
         workerFactory,
-        onEvent: (event) => events.push(event),
+        onEvent: (event) => {
+          events.push(event);
+          if (event.type === "fatal") {
+            clearTimeout(timer);
+            resolve(event);
+          }
+        },
         onError: (_jobId, error) => {
           clearTimeout(timer);
-          resolve(error);
+          reject(error);
         },
       });
       const result = coordinator.enqueue("integration-job", {
@@ -55,8 +61,12 @@ test("coordinator reclaims a real worker after dispatch failure without a config
       if (!result.accepted) reject(new Error(`worker was not dispatched: ${result.reason}`));
     });
 
-    assert.match(failure.message, /exited unexpectedly/);
-    assert.deepEqual(events.map((event) => event.type), ["started", "job"]);
+    assert.equal(fatal.sequence, Number.MAX_SAFE_INTEGER);
+    assert.ok(fatal.error.length > 0 && fatal.error.length <= 400);
+    assert.deepEqual(events.map((event) => event.type), ["started", "job", "fatal"]);
+    for (let attempt = 0; attempt < 100 && coordinator.activeCount !== 0; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
     assert.equal(coordinator.activeCount, 0);
   } finally {
     coordinator?.dispose();
