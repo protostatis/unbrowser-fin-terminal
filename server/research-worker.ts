@@ -31,6 +31,7 @@ import { createWebUi } from "./web-ui.js";
 import {
   isParentMessage,
   WORKER_PROTOCOL_VERSION,
+  type WorkerFatalEvent,
   type WorkerRunMessage,
 } from "./research-worker-protocol.js";
 import { wouldExceedTokenLimit } from "../shared/research-precache-ledger.js";
@@ -45,6 +46,63 @@ let activeRun: WorkerRunMessage | undefined;
 let cancellationRequested = false;
 let bootstrapSequence = 0;
 let runDispatched = false;
+
+/**
+ * Runtime failures can race extension-owned IPC events after dispatch. Use a
+ * terminal sentinel sequence so the coordinator accepts exactly one fatal
+ * event regardless of how many lower-sequence progress events were emitted.
+ */
+const RUNTIME_FATAL_SEQUENCE = Number.MAX_SAFE_INTEGER;
+
+/** Redact credentials, opaque identifiers, and URLs before crossing IPC. */
+export function safeResearchWorkerFailure(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  const safe = raw
+    .replace(/https?:\/\/\S+/gi, "[url]")
+    .replace(
+      /(authorization|api[-_ ]?key|token|secret|password)\s*[:=]\s*(?:bearer\s+)?[^\s,;]+/gi,
+      "$1=[redacted]",
+    )
+    .replace(/\b(?:sk|pk|sess|key|token)[-_][A-Za-z0-9_-]{8,}\b/gi, "[redacted]")
+    .replace(/\b[A-Za-z0-9_-]{32,}\b/g, "[opaque]")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 400);
+  return safe || "Research worker failed after dispatch";
+}
+
+/** Build the bounded terminal event used when the worker main loop rejects. */
+export function makeRuntimeFatalEvent(run: WorkerRunMessage, error: unknown): WorkerFatalEvent {
+  return {
+    version: WORKER_PROTOCOL_VERSION,
+    type: "fatal",
+    jobId: run.jobId,
+    attemptId: run.attemptId,
+    sequence: RUNTIME_FATAL_SEQUENCE,
+    error: safeResearchWorkerFailure(error),
+  };
+}
+
+/** Best-effort bounded IPC flush before abort/disposal closes the channel. */
+async function sendRuntimeFatalEvent(run: WorkerRunMessage, error: unknown): Promise<void> {
+  if (typeof process.send !== "function") return;
+  const event = makeRuntimeFatalEvent(run, error);
+  await new Promise<void>((resolve) => {
+    let completed = false;
+    const finish = () => {
+      if (completed) return;
+      completed = true;
+      clearTimeout(timeout);
+      resolve();
+    };
+    const timeout = setTimeout(finish, 250);
+    try {
+      process.send!(event, () => finish());
+    } catch {
+      finish();
+    }
+  });
+}
 
 function sendBootstrapEvent(
   run: WorkerRunMessage,
@@ -337,9 +395,10 @@ if (isMainModule) {
       process.exitCode = 1;
       if (activeRun && !runDispatched) {
         sendBootstrapEvent(activeRun, "fatal", {
-          error: error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500),
+          error: safeResearchWorkerFailure(error),
         });
       } else {
+        if (activeRun) await sendRuntimeFatalEvent(activeRun, error);
         await abortDispatchedFailure();
       }
     })
