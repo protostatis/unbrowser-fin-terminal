@@ -129,6 +129,7 @@ const MAX_TITLE_CHARS = 500;
 const MAX_SUMMARY_CHARS = 4_000;
 const MAX_CATEGORY_CHARS = 120;
 const MAX_URL_CHARS = 2_000;
+const MAX_XML_DEPTH = 64;
 const DEFAULT_MAX_SEEN_PER_SOURCE = 500;
 const DEFAULT_MAX_STORED_DECISIONS = 300;
 const DEFAULT_ERROR_BACKOFF_MS = 5 * 60_000;
@@ -240,15 +241,175 @@ function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function elementBlocks(xml: string, localName: string): string[] {
-  const name = escapeRegex(localName);
-  const pattern = new RegExp(
-    `<(?:[A-Za-z_][\\w.-]*:)?${name}\\b[^>]*>[\\s\\S]*?<\\/(?:[A-Za-z_][\\w.-]*:)?${name}\\s*>`,
-    "gi",
-  );
-  const matches = [...xml.matchAll(pattern)];
-  if (matches.length > MAX_FEED_ITEMS) throw new Error(`Feed exceeds the ${MAX_FEED_ITEMS}-item safety limit`);
-  return matches.map((match) => match[0]);
+interface OpenXmlElement {
+  name: string;
+  localName: string;
+  start: number;
+}
+
+function xmlLocalName(name: string): string {
+  return (name.includes(":") ? name.slice(name.lastIndexOf(":") + 1) : name).toLowerCase();
+}
+
+function findXmlTagEnd(xml: string, start: number): number {
+  let quote: "\"" | "'" | undefined;
+  for (let index = start; index < xml.length; index += 1) {
+    const character = xml[index];
+    if (quote) {
+      if (character === quote) quote = undefined;
+    } else if (character === "\"" || character === "'") {
+      quote = character;
+    } else if (character === ">") {
+      return index;
+    }
+  }
+  throw new Error("incomplete feed document: unterminated XML tag");
+}
+
+function findXmlDeclarationEnd(xml: string, start: number): number {
+  let quote: "\"" | "'" | undefined;
+  let subsetDepth = 0;
+  for (let index = start; index < xml.length; index += 1) {
+    const character = xml[index];
+    if (quote) {
+      if (character === quote) quote = undefined;
+    } else if (character === "\"" || character === "'") {
+      quote = character;
+    } else if (character === "[") {
+      subsetDepth += 1;
+    } else if (character === "]" && subsetDepth > 0) {
+      subsetDepth -= 1;
+    } else if (character === ">" && subsetDepth === 0) {
+      return index;
+    }
+  }
+  throw new Error("incomplete feed document: unterminated XML declaration");
+}
+
+function validateXmlAttributes(raw: string): boolean {
+  let index = 0;
+  const seen = new Set<string>();
+  while (index < raw.length) {
+    const whitespaceStart = index;
+    while (/\s/.test(raw[index] ?? "")) index += 1;
+    if (index === raw.length) return true;
+    if (index === whitespaceStart) return false;
+    const nameMatch = /^[A-Za-z_][A-Za-z0-9_.-]*(?::[A-Za-z_][A-Za-z0-9_.-]*)?/.exec(raw.slice(index));
+    if (!nameMatch) return false;
+    const name = nameMatch[0];
+    if (seen.has(name)) return false;
+    seen.add(name);
+    index += name.length;
+    while (/\s/.test(raw[index] ?? "")) index += 1;
+    if (raw[index] !== "=") return false;
+    index += 1;
+    while (/\s/.test(raw[index] ?? "")) index += 1;
+    const quote = raw[index];
+    if (quote !== "\"" && quote !== "'") return false;
+    index += 1;
+    const valueEnd = raw.indexOf(quote, index);
+    if (valueEnd < 0 || raw.slice(index, valueEnd).includes("<")) return false;
+    index = valueEnd + 1;
+  }
+  return true;
+}
+
+/** Validate the bounded XML structure and return every complete feed entry. */
+function parseFeedStructure(xml: string, entryLocalName: string): { rootName: string; blocks: string[] } {
+  const stack: OpenXmlElement[] = [];
+  const blocks: string[] = [];
+  const wantedLocalName = entryLocalName.toLowerCase();
+  let rootName: string | undefined;
+  let rootClosed = false;
+  let cursor = 0;
+
+  while (cursor < xml.length) {
+    const tagStart = xml.indexOf("<", cursor);
+    if (tagStart < 0) {
+      if (stack.length === 0 && xml.slice(cursor).trim()) throw new Error("malformed feed document: text outside the root element");
+      cursor = xml.length;
+      break;
+    }
+    if (stack.length === 0 && xml.slice(cursor, tagStart).trim()) {
+      throw new Error("malformed feed document: text outside the root element");
+    }
+
+    if (xml.startsWith("<!--", tagStart)) {
+      const end = xml.indexOf("-->", tagStart + 4);
+      if (end < 0) throw new Error("incomplete feed document: unterminated XML comment");
+      if (xml.slice(tagStart + 4, end).includes("--")) throw new Error("malformed feed document: invalid XML comment");
+      cursor = end + 3;
+      continue;
+    }
+    if (xml.startsWith("<![CDATA[", tagStart)) {
+      if (stack.length === 0) throw new Error("malformed feed document: CDATA outside the root element");
+      const end = xml.indexOf("]]>", tagStart + 9);
+      if (end < 0) throw new Error("incomplete feed document: unterminated CDATA section");
+      cursor = end + 3;
+      continue;
+    }
+    if (xml.startsWith("<?", tagStart)) {
+      const end = xml.indexOf("?>", tagStart + 2);
+      if (end < 0) throw new Error("incomplete feed document: unterminated processing instruction");
+      cursor = end + 2;
+      continue;
+    }
+    if (/^<!DOCTYPE\b/i.test(xml.slice(tagStart, tagStart + 16))) {
+      if (stack.length > 0 || rootName !== undefined) throw new Error("malformed feed document: misplaced document declaration");
+      cursor = findXmlDeclarationEnd(xml, tagStart + 2) + 1;
+      continue;
+    }
+    if (xml.startsWith("<!", tagStart)) throw new Error("malformed feed document: unsupported XML declaration");
+
+    const tagEnd = findXmlTagEnd(xml, tagStart + 1);
+    const rawTag = xml.slice(tagStart + 1, tagEnd);
+    if (rawTag.startsWith("/")) {
+      const closeMatch = /^\/([A-Za-z_][A-Za-z0-9_.-]*(?::[A-Za-z_][A-Za-z0-9_.-]*)?)\s*$/.exec(rawTag);
+      if (!closeMatch) throw new Error("malformed feed document: invalid closing tag");
+      const name = closeMatch[1]!;
+      const opened = stack.pop();
+      if (!opened || opened.name !== name) throw new Error(`malformed feed document: unexpected closing tag ${name}`);
+      if (opened.localName === wantedLocalName) {
+        blocks.push(xml.slice(opened.start, tagEnd + 1));
+        if (blocks.length > MAX_FEED_ITEMS) throw new Error(`Feed exceeds the ${MAX_FEED_ITEMS}-item safety limit`);
+      }
+      if (stack.length === 0) rootClosed = true;
+      cursor = tagEnd + 1;
+      continue;
+    }
+
+    const openMatch = /^([A-Za-z_][A-Za-z0-9_.-]*(?::[A-Za-z_][A-Za-z0-9_.-]*)?)([\s\S]*)$/.exec(rawTag);
+    if (!openMatch) throw new Error("malformed feed document: invalid opening tag");
+    const name = openMatch[1]!;
+    let attributes = openMatch[2] ?? "";
+    const trimmedAttributes = attributes.trimEnd();
+    const selfClosing = trimmedAttributes.endsWith("/");
+    if (selfClosing) attributes = trimmedAttributes.slice(0, -1);
+    if (!validateXmlAttributes(attributes)) throw new Error(`malformed feed document: invalid attributes on ${name}`);
+    if (stack.length === 0) {
+      if (rootName !== undefined || rootClosed) throw new Error("malformed feed document: multiple root elements");
+      rootName = name;
+    }
+    const localName = xmlLocalName(name);
+    if (localName === wantedLocalName && stack.some((element) => element.localName === wantedLocalName)) {
+      throw new Error("malformed feed document: nested feed entries");
+    }
+    if (selfClosing) {
+      if (localName === wantedLocalName) {
+        blocks.push(xml.slice(tagStart, tagEnd + 1));
+        if (blocks.length > MAX_FEED_ITEMS) throw new Error(`Feed exceeds the ${MAX_FEED_ITEMS}-item safety limit`);
+      }
+      if (stack.length === 0) rootClosed = true;
+    } else {
+      stack.push({ name, localName, start: tagStart });
+      if (stack.length > MAX_XML_DEPTH) throw new Error(`Feed exceeds the ${MAX_XML_DEPTH}-level XML nesting safety limit`);
+    }
+    cursor = tagEnd + 1;
+  }
+
+  if (stack.length > 0 || (rootName !== undefined && !rootClosed)) throw new Error("incomplete feed document: unclosed XML element");
+  if (!rootName) throw new Error("non-feed document: missing XML root element");
+  return { rootName, blocks };
 }
 
 function elementValues(xml: string, qualifiedName: string): string[] {
@@ -333,18 +494,20 @@ function parseCategories(block: string): string[] {
 export function parsePublicFeed(source: MarketEventSource, body: string): PublicFeedItem[] {
   if (body.length > MAX_FEED_CHARS) throw new Error(`${source.label} feed exceeds the document safety limit`);
   const xml = body.replace(/^\uFEFF/, "");
-  const root = /<(rss|feed|rdf:RDF)\b/i.exec(xml)?.[1];
-  if (!root) throw new Error(`${source.label} returned a non-feed document`);
-  const closingRoot = new RegExp(`<\\/${escapeRegex(root)}\\s*>`, "i");
-  if (!closingRoot.test(xml)) throw new Error(`${source.label} returned an incomplete feed document`);
   const entryName = source.format === "atom" ? "entry" : "item";
-  const blocks = elementBlocks(xml, entryName);
+  const parsed = parseFeedStructure(xml, entryName);
+  const rootLocalName = xmlLocalName(parsed.rootName);
+  const expectedRoot = source.format === "atom"
+    ? rootLocalName === "feed"
+    : rootLocalName === "rss" || rootLocalName === "rdf";
+  if (!expectedRoot) throw new Error(`${source.label} returned a non-feed document`);
+  const blocks = parsed.blocks;
   const items: PublicFeedItem[] = [];
   const seen = new Set<string>();
 
   for (const block of blocks) {
     const title = boundedText(firstElementValue(block, "title"), MAX_TITLE_CHARS);
-    if (!title) continue;
+    if (!title) throw new Error(`${source.label} feed ${entryName} is missing a title`);
     const rawUrl = source.format === "atom" ? atomLink(block) : firstElementValue(block, "link");
     const url = safePublicUrl(rawUrl, source.url);
     const summary = boundedText(

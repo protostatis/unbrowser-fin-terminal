@@ -87,6 +87,15 @@ test("feed parser rejects incomplete, oversized, and item-overflow documents", (
   assert.throws(() => parsePublicFeed(HALT_SOURCE, overflow), /200-item safety limit/);
 });
 
+test("feed parser rejects a malformed or title-less sibling instead of returning a partial poll", () => {
+  const valid = rssItem({ guid: "halt-valid", symbol: "NVDA" });
+  const malformed = `<?xml version="1.0"?><rss><channel>${valid}<item><guid>halt-broken</guid></channel></rss>`;
+  assert.throws(() => parsePublicFeed(HALT_SOURCE, malformed), /malformed feed document/);
+
+  const titleless = rss(valid, `<item><guid>halt-titleless</guid><link>https://exchange.example/events/titleless</link></item>`);
+  assert.throws(() => parsePublicFeed(HALT_SOURCE, titleless), /missing a title/);
+});
+
 test("Atom parser chooses alternate links and preserves stable entry IDs", () => {
   const source: MarketEventSource = {
     id: "test-filings",
@@ -420,6 +429,43 @@ test("truncated and item-overflow documents never establish or advance a baselin
     state = await scout.getState();
     assert.equal(state.sources[0]?.baselineComplete, false);
     assert.deepEqual(state.sources[0]?.seenEventIds, []);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a malformed poll cannot consume a valid unseen event from dedupe state", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "market-scout-malformed-test-"));
+  const statePath = join(directory, "scout.json");
+  let now = Date.parse("2026-08-07T12:05:00Z");
+  const first = rss(rssItem({ guid: "halt-1", symbol: "NVDA" }));
+  const secondItem = rssItem({ guid: "halt-2", symbol: "AAPL", published: "Fri, 07 Aug 2026 12:06:00 GMT" });
+  const malformed = `<?xml version="1.0"?><rss><channel>${secondItem}<item><guid>halt-broken</guid></channel></rss>`;
+  const recovered = rss(secondItem, rssItem({ guid: "halt-1", symbol: "NVDA" }));
+  const responses = [document(first), document(malformed), document(recovered)];
+  const scout = new MarketEventScout({
+    client: { async readDocument() { return responses.shift()!; } },
+    statePath,
+    sources: [HALT_SOURCE],
+    getTrackedSymbols: () => ["NVDA", "AAPL"],
+    now: () => now,
+  });
+
+  try {
+    assert.equal((await scout.run({ force: true })).baselineItems, 1);
+    now += 60_000;
+    const failed = await scout.run({ force: true });
+    assert.equal(failed.failedSources, 1);
+    let state = await scout.getState();
+    assert.equal(state.sources[0]?.newItems, 0);
+    assert.equal(state.sources[0]?.seenEventIds.length, 1);
+
+    now += 60_000;
+    const retried = await scout.run({ force: true });
+    assert.equal(retried.newItems, 1);
+    assert.equal(retried.admitted, 1);
+    state = await scout.getState();
+    assert.equal(state.sources[0]?.seenEventIds.length, 2);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
