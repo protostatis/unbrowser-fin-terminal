@@ -44,7 +44,7 @@ Then use:
 /market                 Open the Market Map
 /market AAPL            Open a ticker panel
 /market-history AAPL    Browse archived research
-/market-scout status    Inspect shadow event-source health and decisions
+/market-scout status    Inspect event health and no-dispatch trigger evidence
 /market-scout sync      Poll event sources that are currently due
 /market-debug market    Open deterministic debug fixtures
 ```
@@ -319,9 +319,14 @@ High-confidence items are labeled `admit-shadow`; ambiguous items are retained
 as `watch`; unsupported or stale items are counted as `suppress` but not stored
 in the recent-decision list.
 
-This is intentionally observation-only. It never starts agent research, reserves
-tokens, writes research canvases, or scrapes unattended search-result pages.
-Use `/market-scout status` to inspect source health and recent decisions, and
+This is intentionally observation-only. Every new non-suppressed decision is
+also mapped into an immutable dry-run BRIEF candidate for a ticker, the macro
+EVENT lane, or SIGNALS/Market Story. A fixed simulation policy records whether
+the candidate would trigger or would be gated by disposition, route coverage,
+priority, freshness, target cooldown, or daily volume. It never starts agent
+research, reserves tokens, writes research canvases, or scrapes unattended
+search-result pages. Use `/market-scout status` to inspect source health,
+candidate volume, route coverage, and gate pressure, and
 `/market-scout sync` to poll only sources whose configured interval is due. The
 bounded atomic journal is
 `$MARKET_DATA_DIR/market-event-scout.json` (or `.pi/market-event-scout.json`).

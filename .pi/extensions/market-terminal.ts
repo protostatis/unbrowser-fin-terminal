@@ -49,6 +49,7 @@ import {
 	readMarketEventScoutState,
 	type MarketEventDocumentClient,
 	type MarketEventScoutRunResult,
+	type MarketEventTriggerCandidate,
 } from "../../shared/market-event-scout.js";
 
 type ChartScope = "day" | "week" | "month" | "year" | "max";
@@ -1095,6 +1096,20 @@ export function readMarketScoutLocalCliEnabled(env: NodeJS.ProcessEnv = process.
 	if (value === "1" || value === "true" || value === "on") return true;
 	if (value === "0" || value === "false" || value === "off") return false;
 	throw new Error("MARKET_SCOUT_LOCAL_CLI must be 1/true/on or 0/false/off");
+}
+
+function marketEventTriggerCandidateLabel(candidate: MarketEventTriggerCandidate): string {
+	const route = candidate.route?.kind === "ticker-brief"
+		? `TICKER ${candidate.route.symbol}`
+		: candidate.route?.kind === "macro-event-brief"
+			? "EVENT MACRO"
+			: candidate.route?.kind === "market-story-brief"
+				? "MARKET STORY"
+				: "UNMAPPED";
+	const outcome = candidate.outcome === "would-trigger"
+		? "WOULD TRIGGER"
+		: `GATED ${candidate.gateReasonCodes.join(",") || "UNKNOWN"}`;
+	return `${outcome} · ${route} · P${candidate.priority} · ${candidate.title}`;
 }
 
 export function marketScoutScheduleDelay(now: number, dueAt: number): number {
@@ -9560,7 +9575,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("market-scout", {
-		description: "Inspect or poll the shadow public-feed event scout: /market-scout [status|sync]",
+		description: "Inspect or poll the event scout and trigger dry run: /market-scout [status|sync]",
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
 			const action = args.trim().toLowerCase() || "status";
 			if (action !== "status" && action !== "sync") {
@@ -9576,12 +9591,13 @@ export default function (pi: ExtensionAPI) {
 				if (action === "sync") {
 					const result = await runMarketScout();
 					ctx.ui.notify([
-						"MARKET EVENT SCOUT · SHADOW ONLY · MODEL DISPATCH OFF",
+						"MARKET EVENT SCOUT · TRIGGER DRY RUN · MODEL DISPATCH OFF",
 						`Polled ${result.polledSources} source(s): ${result.successfulSources} ok · ${result.failedSources} failed`,
 						`Baseline ${result.baselineItems} · new ${result.newItems} · admit-shadow ${result.admitted} · watch ${result.watched} · suppress ${result.suppressed}`,
-						result.decisions.length > 0
-							? result.decisions.slice(0, 4).map((decision) => `${decision.disposition.toUpperCase()} P${decision.priority} · ${decision.symbols.join(",") || decision.target?.lane || "UNRESOLVED"} · ${decision.title}`).join("\n")
-							: "No new actionable observations.",
+						`Dry-run candidates ${result.candidateEvaluated} · would trigger ${result.wouldTrigger} · gated ${result.gated}`,
+						result.triggerCandidates.length > 0
+							? result.triggerCandidates.slice(0, 4).map(marketEventTriggerCandidateLabel).join("\n")
+							: "No new trigger candidates.",
 					].join("\n"), result.failedSources > 0 ? "warning" : "info");
 					return;
 				}
@@ -9603,11 +9619,24 @@ export default function (pi: ExtensionAPI) {
 				const recent = state.decisions.slice(0, 5).map((decision) =>
 					`${decision.disposition.toUpperCase()} P${decision.priority} · ${decision.symbols.join(",") || decision.target?.lane || "UNRESOLVED"} · ${decision.title}`,
 				);
+				const policy = state.triggerDryRun.policy;
+				const todayKey = new Date().toISOString().slice(0, 10);
+				const today = state.triggerDryRun.days.find((entry) => entry.day === todayKey)?.aggregate;
+				const routes = today?.routes;
+				const associations = today?.associations;
+				const gates = today?.gates;
+				const recentCandidates = state.triggerDryRun.candidates.slice(0, 5).map(marketEventTriggerCandidateLabel);
 				ctx.ui.notify([
-					`MARKET EVENT SCOUT · SHADOW ONLY · scheduler ${enabledLabel} · transport ${transportLabel}`,
-					marketScoutLastError ? `Last runtime error: ${marketScoutLastError}` : "Model dispatch: off; token reservation: off.",
+					`MARKET EVENT SCOUT · TRIGGER DRY RUN · scheduler ${enabledLabel} · transport ${transportLabel}`,
+					marketScoutLastError ? `Last runtime error: ${marketScoutLastError}` : "Model dispatch: off; token reservation: off; canvas mutation: off.",
+					`Simulation policy v${policy.version}: min P${policy.minPriority} · TTL ${Math.round(policy.ttlMs / 60_000)}m · target cooldown ${Math.round(policy.targetCooldownMs / 60_000)}m · daily cap ${policy.dailyCap}`,
+					`UTC ${todayKey}: candidates ${today?.evaluated ?? 0} · mapped ${today?.mapped ?? 0} · would trigger ${today?.wouldTrigger ?? 0} · gated ${today?.gated ?? 0}`,
+					`Routes TICKER/EVENT/STORY/UNMAPPED ${routes?.tickerBrief ?? 0}/${routes?.macroEventBrief ?? 0}/${routes?.marketStoryBrief ?? 0}/${routes?.unsupported ?? 0}`,
+					`Associations STRUCTURED/EXPLICIT/MARKET/UNRESOLVED ${associations?.structuredSymbol ?? 0}/${associations?.explicitSymbol ?? 0}/${associations?.marketWide ?? 0}/${associations?.unresolved ?? 0} · missing publication ${today?.missingPublishedAt ?? 0}`,
+					`Gates NOT-ADMITTED/UNMAPPED/PRIORITY/TTL/COOLDOWN/CAP ${gates?.notAdmitted ?? 0}/${gates?.unsupportedRoute ?? 0}/${gates?.belowPriority ?? 0}/${gates?.expired ?? 0}/${gates?.targetCooldown ?? 0}/${gates?.dailyCap ?? 0}`,
 					...sourceLines,
 					recent.length > 0 ? `Recent observations:\n${recent.join("\n")}` : "Recent observations: none (the first successful poll establishes a baseline).",
+					recentCandidates.length > 0 ? `Recent dry-run candidates:\n${recentCandidates.join("\n")}` : "Recent dry-run candidates: none.",
 				].join("\n"), marketScoutLastError ? "warning" : "info");
 			} catch (error) {
 				ctx.ui.notify(`Market scout unavailable: ${cleanText(error instanceof Error ? error.message : String(error)).slice(0, 220)}`, "error");

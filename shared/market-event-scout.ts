@@ -1,9 +1,11 @@
 /**
- * Deterministic, shadow-only market event scout.
+ * Deterministic market-event scout with a no-dispatch trigger dry run.
  *
  * Public RSS/Atom feeds are acquired through Unbrowser, parsed with bounded
  * helpers, associated to a tracked security or market lane, and persisted for
- * inspection. This module never dispatches model research or reserves tokens.
+ * inspection. It also records bounded "would trigger" evidence under a fixed
+ * simulation policy. This module never dispatches model research or reserves
+ * tokens.
  */
 
 import { createHash } from "node:crypto";
@@ -68,6 +70,97 @@ export interface MarketEventDecision {
   reasonCodes: string[];
 }
 
+export type MarketEventTriggerRoute =
+  | { kind: "ticker-brief"; symbol: string }
+  | { kind: "macro-event-brief" }
+  | { kind: "market-story-brief" };
+
+export type MarketEventTriggerGateReason =
+  | "not-admitted"
+  | "unsupported-route"
+  | "below-priority"
+  | "expired"
+  | "target-cooldown"
+  | "daily-cap";
+
+export interface MarketEventTriggerPolicy {
+  version: 1;
+  minPriority: number;
+  ttlMs: number;
+  targetCooldownMs: number;
+  dailyCap: number;
+}
+
+export interface MarketEventTriggerCandidate {
+  id: string;
+  mappingVersion: 1;
+  decisionId: string;
+  sourceId: string;
+  observedAt: number;
+  publishedAt?: number;
+  evaluatedAt: number;
+  title: string;
+  url?: string;
+  eventClass: MarketEventClass;
+  association: MarketEventAssociation;
+  disposition: MarketEventDisposition;
+  priority: number;
+  decisionReasonCodes: string[];
+  route?: MarketEventTriggerRoute;
+  targetKey?: string;
+  expiresAt: number;
+  outcome: "would-trigger" | "gated";
+  gateReasonCodes: MarketEventTriggerGateReason[];
+  /** Snapshot the simulated policy so retained evidence stays interpretable. */
+  policy: MarketEventTriggerPolicy;
+}
+
+export interface MarketEventTriggerAggregate {
+  evaluated: number;
+  mapped: number;
+  wouldTrigger: number;
+  gated: number;
+  missingPublishedAt: number;
+  routes: {
+    tickerBrief: number;
+    macroEventBrief: number;
+    marketStoryBrief: number;
+    unsupported: number;
+  };
+  associations: {
+    structuredSymbol: number;
+    explicitSymbol: number;
+    marketWide: number;
+    unresolved: number;
+  };
+  gates: {
+    notAdmitted: number;
+    unsupportedRoute: number;
+    belowPriority: number;
+    expired: number;
+    targetCooldown: number;
+    dailyCap: number;
+  };
+}
+
+export interface MarketEventTriggerDayState {
+  day: string;
+  aggregate: MarketEventTriggerAggregate;
+}
+
+export interface MarketEventTriggerCooldownState {
+  targetKey: string;
+  lastWouldTriggerAt: number;
+}
+
+export interface MarketEventTriggerDryRunState {
+  policy: MarketEventTriggerPolicy;
+  candidates: MarketEventTriggerCandidate[];
+  totals: MarketEventTriggerAggregate;
+  days: MarketEventTriggerDayState[];
+  cooldowns: MarketEventTriggerCooldownState[];
+}
+
 export interface MarketEventScoutSourceState {
   sourceId: string;
   baselineComplete: boolean;
@@ -86,11 +179,13 @@ export interface MarketEventScoutSourceState {
 }
 
 export interface MarketEventScoutState {
-  version: 1;
+  version: 2;
   updatedAt: number;
   sources: MarketEventScoutSourceState[];
   /** Recent actionable observations only; suppressed events remain counters. */
   decisions: MarketEventDecision[];
+  /** Durable simulation evidence only; no research job is dispatched. */
+  triggerDryRun: MarketEventTriggerDryRunState;
 }
 
 export interface MarketEventScoutRunResult {
@@ -105,6 +200,10 @@ export interface MarketEventScoutRunResult {
   watched: number;
   suppressed: number;
   decisions: MarketEventDecision[];
+  triggerCandidates: MarketEventTriggerCandidate[];
+  candidateEvaluated: number;
+  wouldTrigger: number;
+  gated: number;
 }
 
 export interface MarketEventDocumentClient {
@@ -119,6 +218,8 @@ export interface MarketEventScoutOptions {
   now?: () => number;
   maxSeenPerSource?: number;
   maxStoredDecisions?: number;
+  maxStoredTriggerCandidates?: number;
+  triggerPolicy?: MarketEventTriggerPolicy;
   errorBackoffMs?: number;
   sourceTimeoutMs?: number;
 }
@@ -136,6 +237,19 @@ const DEFAULT_ERROR_BACKOFF_MS = 5 * 60_000;
 const DEFAULT_SOURCE_TIMEOUT_MS = 45_000;
 const EVENT_MAX_AGE_MS = 72 * 60 * 60_000;
 const EVENT_MAX_FUTURE_SKEW_MS = 15 * 60_000;
+const DEFAULT_MAX_STORED_TRIGGER_CANDIDATES = 1_000;
+const MAX_TRIGGER_DAYS = 31;
+const MAX_TRIGGER_COOLDOWNS = 2_000;
+const TRIGGER_MAPPING_VERSION = 1 as const;
+
+/** Conservative simulation defaults. They do not authorize model dispatch. */
+export const DEFAULT_MARKET_EVENT_TRIGGER_POLICY: Readonly<MarketEventTriggerPolicy> = Object.freeze({
+  version: 1,
+  minPriority: 80,
+  ttlMs: 2 * 60 * 60_000,
+  targetCooldownMs: 6 * 60 * 60_000,
+  dailyCap: 8,
+});
 
 export const DEFAULT_MARKET_EVENT_SOURCES: readonly MarketEventSource[] = Object.freeze([
   {
@@ -691,6 +805,230 @@ export function evaluateMarketEvent(
   };
 }
 
+function cloneTriggerPolicy(policy: MarketEventTriggerPolicy): MarketEventTriggerPolicy {
+  return { ...policy };
+}
+
+function sameTriggerPolicy(a: MarketEventTriggerPolicy, b: MarketEventTriggerPolicy): boolean {
+  return a.version === b.version
+    && a.minPriority === b.minPriority
+    && a.ttlMs === b.ttlMs
+    && a.targetCooldownMs === b.targetCooldownMs
+    && a.dailyCap === b.dailyCap;
+}
+
+function safeTimestampAdd(value: number, durationMs: number): number {
+  return Math.min(Number.MAX_SAFE_INTEGER, value + durationMs);
+}
+
+function triggerCandidateId(decisionId: string): string {
+  const hash = createHash("sha256");
+  hash.update("market-event-trigger-candidate-v1\0").update(decisionId);
+  return `trg-${hash.digest("hex").slice(0, 32)}`;
+}
+
+/** Map only validated scout targets; never infer a route from untrusted prose. */
+export function proposeMarketEventTriggerRoute(decision: MarketEventDecision): MarketEventTriggerRoute | undefined {
+  if (decision.target?.kind === "ticker") {
+    const symbol = normalizeSymbol(decision.target.symbol ?? "");
+    return symbol ? { kind: "ticker-brief", symbol } : undefined;
+  }
+  if (decision.target?.kind === "market" && decision.target.lane === "macro") {
+    return { kind: "macro-event-brief" };
+  }
+  if (decision.target?.kind === "market" && decision.target.lane === "story") {
+    return { kind: "market-story-brief" };
+  }
+  return undefined;
+}
+
+function triggerTargetKey(route: MarketEventTriggerRoute | undefined): string | undefined {
+  if (!route) return undefined;
+  if (route.kind === "ticker-brief") return `ticker:${route.symbol}`;
+  if (route.kind === "macro-event-brief") return "event:macro";
+  return "market-story";
+}
+
+export function createMarketEventTriggerAggregate(): MarketEventTriggerAggregate {
+  return {
+    evaluated: 0,
+    mapped: 0,
+    wouldTrigger: 0,
+    gated: 0,
+    missingPublishedAt: 0,
+    routes: { tickerBrief: 0, macroEventBrief: 0, marketStoryBrief: 0, unsupported: 0 },
+    associations: { structuredSymbol: 0, explicitSymbol: 0, marketWide: 0, unresolved: 0 },
+    gates: { notAdmitted: 0, unsupportedRoute: 0, belowPriority: 0, expired: 0, targetCooldown: 0, dailyCap: 0 },
+  };
+}
+
+function emptyTriggerDryRunState(
+  policy: MarketEventTriggerPolicy = DEFAULT_MARKET_EVENT_TRIGGER_POLICY,
+): MarketEventTriggerDryRunState {
+  return {
+    policy: cloneTriggerPolicy(policy),
+    candidates: [],
+    totals: createMarketEventTriggerAggregate(),
+    days: [],
+    cooldowns: [],
+  };
+}
+
+function marketEventTriggerDay(timestamp: number): string {
+  return new Date(timestamp).toISOString().slice(0, 10);
+}
+
+/**
+ * Evaluate one immutable dry-run candidate. Stateful inputs are observations,
+ * not reservations; this function never touches workers, tokens, or canvases.
+ */
+export function evaluateMarketEventTriggerCandidate(
+  decision: MarketEventDecision,
+  options: {
+    evaluatedAt: number;
+    policy?: MarketEventTriggerPolicy;
+    lastWouldTriggerAt?: number;
+    wouldTriggerToday?: number;
+  },
+): MarketEventTriggerCandidate {
+  const policy = cloneTriggerPolicy(options.policy ?? DEFAULT_MARKET_EVENT_TRIGGER_POLICY);
+  if (!validateDecision(decision) || !validateTriggerPolicy(policy)
+    || !validInteger(options.evaluatedAt, decision.observedAt, Number.MAX_SAFE_INTEGER)
+    || (options.lastWouldTriggerAt !== undefined
+      && !validInteger(options.lastWouldTriggerAt, 1, Number.MAX_SAFE_INTEGER))
+    || (options.wouldTriggerToday !== undefined
+      && !validInteger(options.wouldTriggerToday, 0, Number.MAX_SAFE_INTEGER))) {
+    throw new Error("Market event trigger dry-run input is invalid");
+  }
+  const route = proposeMarketEventTriggerRoute(decision);
+  const targetKey = triggerTargetKey(route);
+  const expiresAt = safeTimestampAdd(decision.publishedAt ?? decision.observedAt, policy.ttlMs);
+  const gateReasonCodes: MarketEventTriggerGateReason[] = [];
+
+  if (decision.disposition !== "admit-shadow") gateReasonCodes.push("not-admitted");
+  if (!route) gateReasonCodes.push("unsupported-route");
+  if (decision.priority < policy.minPriority) gateReasonCodes.push("below-priority");
+  if (options.evaluatedAt >= expiresAt) gateReasonCodes.push("expired");
+
+  // Stateful pressure is meaningful only after the candidate passes all
+  // stateless gates. Gated candidates never consume cooldown or daily volume.
+  if (gateReasonCodes.length === 0) {
+    if (options.lastWouldTriggerAt !== undefined
+      && options.evaluatedAt < safeTimestampAdd(options.lastWouldTriggerAt, policy.targetCooldownMs)) {
+      gateReasonCodes.push("target-cooldown");
+    }
+    if ((options.wouldTriggerToday ?? 0) >= policy.dailyCap) gateReasonCodes.push("daily-cap");
+  }
+
+  return {
+    id: triggerCandidateId(decision.id),
+    mappingVersion: TRIGGER_MAPPING_VERSION,
+    decisionId: decision.id,
+    sourceId: decision.sourceId,
+    observedAt: decision.observedAt,
+    publishedAt: decision.publishedAt,
+    evaluatedAt: options.evaluatedAt,
+    title: decision.title,
+    url: decision.url,
+    eventClass: decision.eventClass,
+    association: decision.association,
+    disposition: decision.disposition,
+    priority: decision.priority,
+    decisionReasonCodes: [...decision.reasonCodes],
+    route,
+    targetKey,
+    expiresAt,
+    outcome: gateReasonCodes.length === 0 ? "would-trigger" : "gated",
+    gateReasonCodes,
+    policy,
+  };
+}
+
+function incrementTriggerAggregate(
+  aggregate: MarketEventTriggerAggregate,
+  candidate: MarketEventTriggerCandidate,
+): void {
+  aggregate.evaluated += 1;
+  if (candidate.route) aggregate.mapped += 1;
+  if (candidate.outcome === "would-trigger") aggregate.wouldTrigger += 1;
+  else aggregate.gated += 1;
+  if (candidate.publishedAt === undefined) aggregate.missingPublishedAt += 1;
+
+  if (candidate.route?.kind === "ticker-brief") aggregate.routes.tickerBrief += 1;
+  else if (candidate.route?.kind === "macro-event-brief") aggregate.routes.macroEventBrief += 1;
+  else if (candidate.route?.kind === "market-story-brief") aggregate.routes.marketStoryBrief += 1;
+  else aggregate.routes.unsupported += 1;
+
+  if (candidate.association === "structured-symbol") aggregate.associations.structuredSymbol += 1;
+  else if (candidate.association === "explicit-symbol") aggregate.associations.explicitSymbol += 1;
+  else if (candidate.association === "market-wide") aggregate.associations.marketWide += 1;
+  else aggregate.associations.unresolved += 1;
+
+  for (const reason of candidate.gateReasonCodes) {
+    if (reason === "not-admitted") aggregate.gates.notAdmitted += 1;
+    else if (reason === "unsupported-route") aggregate.gates.unsupportedRoute += 1;
+    else if (reason === "below-priority") aggregate.gates.belowPriority += 1;
+    else if (reason === "expired") aggregate.gates.expired += 1;
+    else if (reason === "target-cooldown") aggregate.gates.targetCooldown += 1;
+    else aggregate.gates.dailyCap += 1;
+  }
+}
+
+function recordTriggerCandidates(
+  state: MarketEventTriggerDryRunState,
+  decisions: readonly MarketEventDecision[],
+  options: {
+    evaluatedAt: number;
+    policy: MarketEventTriggerPolicy;
+    maxStoredCandidates: number;
+  },
+): MarketEventTriggerCandidate[] {
+  if (state.totals.evaluated > 0 && !sameTriggerPolicy(state.policy, options.policy)) {
+    throw new Error("Market event trigger dry-run policy changed without a versioned migration");
+  }
+  state.policy = cloneTriggerPolicy(options.policy);
+  const knownIds = new Set(state.candidates.map((candidate) => candidate.id));
+  const cooldowns = new Map(state.cooldowns.map((entry) => [entry.targetKey, entry.lastWouldTriggerAt]));
+  const dayKey = marketEventTriggerDay(options.evaluatedAt);
+  let day = state.days.find((entry) => entry.day === dayKey);
+  if (!day) {
+    day = { day: dayKey, aggregate: createMarketEventTriggerAggregate() };
+    state.days.push(day);
+  }
+  const created: MarketEventTriggerCandidate[] = [];
+
+  for (const decision of decisions) {
+    const id = triggerCandidateId(decision.id);
+    if (knownIds.has(id)) continue;
+    const route = proposeMarketEventTriggerRoute(decision);
+    const targetKey = triggerTargetKey(route);
+    const candidate = evaluateMarketEventTriggerCandidate(decision, {
+      evaluatedAt: options.evaluatedAt,
+      policy: options.policy,
+      lastWouldTriggerAt: targetKey ? cooldowns.get(targetKey) : undefined,
+      wouldTriggerToday: day.aggregate.wouldTrigger,
+    });
+    knownIds.add(candidate.id);
+    created.push(candidate);
+    incrementTriggerAggregate(state.totals, candidate);
+    incrementTriggerAggregate(day.aggregate, candidate);
+    if (candidate.outcome === "would-trigger" && candidate.targetKey) {
+      cooldowns.set(candidate.targetKey, candidate.evaluatedAt);
+    }
+  }
+
+  state.candidates = [...created, ...state.candidates]
+    .sort((a, b) => b.evaluatedAt - a.evaluatedAt || b.priority - a.priority || a.id.localeCompare(b.id))
+    .slice(0, options.maxStoredCandidates);
+  state.days = state.days.sort((a, b) => b.day.localeCompare(a.day)).slice(0, MAX_TRIGGER_DAYS);
+  state.cooldowns = [...cooldowns.entries()]
+    .filter(([, lastWouldTriggerAt]) => options.evaluatedAt < safeTimestampAdd(lastWouldTriggerAt, options.policy.targetCooldownMs))
+    .map(([targetKey, lastWouldTriggerAt]) => ({ targetKey, lastWouldTriggerAt }))
+    .sort((a, b) => b.lastWouldTriggerAt - a.lastWouldTriggerAt || a.targetKey.localeCompare(b.targetKey))
+    .slice(0, MAX_TRIGGER_COOLDOWNS);
+  return created;
+}
+
 export function marketEventScoutFilePath(cwd: string, env: NodeJS.ProcessEnv = process.env): string {
   const configured = env.MARKET_DATA_DIR?.trim();
   if (configured) {
@@ -701,7 +1039,7 @@ export function marketEventScoutFilePath(cwd: string, env: NodeJS.ProcessEnv = p
 }
 
 function emptyState(now: number): MarketEventScoutState {
-  return { version: 1, updatedAt: now, sources: [], decisions: [] };
+  return { version: 2, updatedAt: now, sources: [], decisions: [], triggerDryRun: emptyTriggerDryRunState() };
 }
 
 function validInteger(value: unknown, min: number, max: number): value is number {
@@ -783,6 +1121,201 @@ function validateDecisionSemantics(decision: MarketEventDecision): boolean {
   return decision.target.kind === "ticker" && decision.symbols.length === 1;
 }
 
+function hasExactKeys(record: Record<string, unknown>, keys: readonly string[]): boolean {
+  return Object.keys(record).length === keys.length && keys.every((key) => Object.hasOwn(record, key));
+}
+
+function validateTriggerPolicy(raw: unknown): raw is MarketEventTriggerPolicy {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
+  const policy = raw as Record<string, unknown>;
+  return hasExactKeys(policy, ["version", "minPriority", "ttlMs", "targetCooldownMs", "dailyCap"])
+    && policy.version === 1
+    && validInteger(policy.minPriority, 0, 100)
+    && validInteger(policy.ttlMs, 60_000, 72 * 60 * 60_000)
+    && validInteger(policy.targetCooldownMs, 60_000, 30 * 24 * 60 * 60_000)
+    && validInteger(policy.dailyCap, 1, 1_000);
+}
+
+function validateTriggerRoute(raw: unknown): raw is MarketEventTriggerRoute {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
+  const route = raw as Record<string, unknown>;
+  if (route.kind === "ticker-brief") {
+    return hasExactKeys(route, ["kind", "symbol"])
+      && typeof route.symbol === "string" && normalizeSymbol(route.symbol) === route.symbol;
+  }
+  return hasExactKeys(route, ["kind"])
+    && (route.kind === "macro-event-brief" || route.kind === "market-story-brief");
+}
+
+const TRIGGER_GATE_REASONS = new Set<MarketEventTriggerGateReason>([
+  "not-admitted",
+  "unsupported-route",
+  "below-priority",
+  "expired",
+  "target-cooldown",
+  "daily-cap",
+]);
+
+function validTriggerTargetKey(value: unknown): value is string {
+  if (value === "event:macro" || value === "market-story") return true;
+  if (typeof value !== "string" || !value.startsWith("ticker:")) return false;
+  const symbol = value.slice("ticker:".length);
+  return normalizeSymbol(symbol) === symbol;
+}
+
+function validateTriggerCandidate(raw: unknown): raw is MarketEventTriggerCandidate {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
+  const candidate = raw as Record<string, unknown>;
+  if (!(typeof candidate.id === "string" && /^trg-[a-f0-9]{32}$/.test(candidate.id))
+    || candidate.mappingVersion !== TRIGGER_MAPPING_VERSION
+    || typeof candidate.decisionId !== "string" || !/^evt-[a-f0-9]{32}$/.test(candidate.decisionId)
+    || candidate.id !== triggerCandidateId(candidate.decisionId)
+    || typeof candidate.sourceId !== "string" || !/^[a-z0-9-]{1,80}$/.test(candidate.sourceId)
+    || !validInteger(candidate.observedAt, 1, Number.MAX_SAFE_INTEGER)
+    || (candidate.publishedAt !== undefined && !validInteger(candidate.publishedAt, 1, Number.MAX_SAFE_INTEGER))
+    || !validInteger(candidate.evaluatedAt, candidate.observedAt, Number.MAX_SAFE_INTEGER)
+    || typeof candidate.title !== "string" || candidate.title.length < 1 || candidate.title.length > MAX_TITLE_CHARS
+    || boundedText(candidate.title, MAX_TITLE_CHARS) !== candidate.title
+    || (candidate.url !== undefined && !(typeof candidate.url === "string" && candidate.url.length <= MAX_URL_CHARS
+      && sanitizePublicUrl(candidate.url) === candidate.url))
+    || !(candidate.eventClass === "halt" || candidate.eventClass === "corporate-action" || candidate.eventClass === "filing"
+      || candidate.eventClass === "macro" || candidate.eventClass === "regulatory" || candidate.eventClass === "other")
+    || !(candidate.association === "structured-symbol" || candidate.association === "explicit-symbol"
+      || candidate.association === "market-wide" || candidate.association === "unresolved")
+    || !(candidate.disposition === "admit-shadow" || candidate.disposition === "watch" || candidate.disposition === "suppress")
+    || !validInteger(candidate.priority, 0, 100)
+    || !Array.isArray(candidate.decisionReasonCodes) || candidate.decisionReasonCodes.length > 10
+    || !candidate.decisionReasonCodes.every((reason) => typeof reason === "string" && /^[a-z0-9-]{1,100}$/.test(reason))
+    || new Set(candidate.decisionReasonCodes as string[]).size !== candidate.decisionReasonCodes.length
+    || !validateTriggerPolicy(candidate.policy)
+    || !validInteger(candidate.expiresAt, 1, Number.MAX_SAFE_INTEGER)
+    || !(candidate.outcome === "would-trigger" || candidate.outcome === "gated")
+    || !Array.isArray(candidate.gateReasonCodes) || candidate.gateReasonCodes.length > TRIGGER_GATE_REASONS.size
+    || !candidate.gateReasonCodes.every((reason) => typeof reason === "string"
+      && TRIGGER_GATE_REASONS.has(reason as MarketEventTriggerGateReason))
+    || new Set(candidate.gateReasonCodes as string[]).size !== candidate.gateReasonCodes.length) {
+    return false;
+  }
+
+  const policy = candidate.policy as MarketEventTriggerPolicy;
+  const route = candidate.route === undefined ? undefined : validateTriggerRoute(candidate.route)
+    ? candidate.route as MarketEventTriggerRoute : undefined;
+  if (candidate.route !== undefined && !route) return false;
+  const expectedTargetKey = triggerTargetKey(route);
+  if (expectedTargetKey === undefined) {
+    if (candidate.targetKey !== undefined) return false;
+  } else if (!validTriggerTargetKey(candidate.targetKey) || candidate.targetKey !== expectedTargetKey) {
+    return false;
+  }
+  if (route?.kind === "ticker-brief"
+    && candidate.association !== "structured-symbol" && candidate.association !== "explicit-symbol") return false;
+  if (route && route.kind !== "ticker-brief" && candidate.association !== "market-wide") return false;
+
+  const expectedExpiresAt = safeTimestampAdd(
+    (candidate.publishedAt ?? candidate.observedAt) as number,
+    policy.ttlMs,
+  );
+  if (candidate.expiresAt !== expectedExpiresAt) return false;
+  const gates = new Set(candidate.gateReasonCodes as MarketEventTriggerGateReason[]);
+  const notAdmitted = candidate.disposition !== "admit-shadow";
+  const unsupportedRoute = route === undefined;
+  const belowPriority = (candidate.priority as number) < policy.minPriority;
+  const expired = (candidate.evaluatedAt as number) >= expectedExpiresAt;
+  if (gates.has("not-admitted") !== notAdmitted
+    || gates.has("unsupported-route") !== unsupportedRoute
+    || gates.has("below-priority") !== belowPriority
+    || gates.has("expired") !== expired) return false;
+  const hasStatelessGate = notAdmitted || unsupportedRoute || belowPriority || expired;
+  if (hasStatelessGate && (gates.has("target-cooldown") || gates.has("daily-cap"))) return false;
+  if (candidate.outcome === "would-trigger") return gates.size === 0;
+  return gates.size > 0 && (hasStatelessGate || gates.has("target-cooldown") || gates.has("daily-cap"));
+}
+
+function validateCounterGroup(raw: unknown, keys: readonly string[]): raw is Record<string, number> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
+  const group = raw as Record<string, unknown>;
+  return hasExactKeys(group, keys)
+    && keys.every((key) => validInteger(group[key], 0, Number.MAX_SAFE_INTEGER));
+}
+
+function validateTriggerAggregate(raw: unknown): raw is MarketEventTriggerAggregate {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
+  const aggregate = raw as Record<string, unknown>;
+  if (!hasExactKeys(aggregate, ["evaluated", "mapped", "wouldTrigger", "gated", "missingPublishedAt", "routes", "associations", "gates"])
+    || !validInteger(aggregate.evaluated, 0, Number.MAX_SAFE_INTEGER)
+    || !validInteger(aggregate.mapped, 0, Number.MAX_SAFE_INTEGER)
+    || !validInteger(aggregate.wouldTrigger, 0, Number.MAX_SAFE_INTEGER)
+    || !validInteger(aggregate.gated, 0, Number.MAX_SAFE_INTEGER)
+    || !validInteger(aggregate.missingPublishedAt, 0, Number.MAX_SAFE_INTEGER)
+    || !validateCounterGroup(aggregate.routes, ["tickerBrief", "macroEventBrief", "marketStoryBrief", "unsupported"])
+    || !validateCounterGroup(aggregate.associations, ["structuredSymbol", "explicitSymbol", "marketWide", "unresolved"])
+    || !validateCounterGroup(aggregate.gates, ["notAdmitted", "unsupportedRoute", "belowPriority", "expired", "targetCooldown", "dailyCap"])) {
+    return false;
+  }
+  const routes = aggregate.routes as Record<string, number>;
+  const associations = aggregate.associations as Record<string, number>;
+  const gates = aggregate.gates as Record<string, number>;
+  const evaluated = aggregate.evaluated as number;
+  const gated = aggregate.gated as number;
+  return aggregate.mapped === routes.tickerBrief + routes.macroEventBrief + routes.marketStoryBrief
+    && evaluated === aggregate.mapped + routes.unsupported
+    && evaluated === (aggregate.wouldTrigger as number) + gated
+    && aggregate.missingPublishedAt <= evaluated
+    && evaluated === associations.structuredSymbol + associations.explicitSymbol + associations.marketWide + associations.unresolved
+    && Object.values(gates).every((count) => count <= gated);
+}
+
+function validateTriggerDryRunState(raw: unknown): raw is MarketEventTriggerDryRunState {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
+  const state = raw as Record<string, unknown>;
+  if (!hasExactKeys(state, ["policy", "candidates", "totals", "days", "cooldowns"])
+    || !validateTriggerPolicy(state.policy)
+    || !Array.isArray(state.candidates) || state.candidates.length > 2_000 || !state.candidates.every(validateTriggerCandidate)
+    || !validateTriggerAggregate(state.totals)
+    || !Array.isArray(state.days) || state.days.length > MAX_TRIGGER_DAYS
+    || !Array.isArray(state.cooldowns) || state.cooldowns.length > MAX_TRIGGER_COOLDOWNS) return false;
+
+  const candidates = state.candidates as MarketEventTriggerCandidate[];
+  if (new Set(candidates.map((candidate) => candidate.id)).size !== candidates.length
+    || new Set(candidates.map((candidate) => candidate.decisionId)).size !== candidates.length
+    || candidates.some((candidate) => !sameTriggerPolicy(candidate.policy, state.policy as MarketEventTriggerPolicy))) return false;
+  for (let index = 1; index < candidates.length; index += 1) {
+    const previous = candidates[index - 1]!;
+    const current = candidates[index]!;
+    if (previous.evaluatedAt < current.evaluatedAt
+      || (previous.evaluatedAt === current.evaluatedAt && previous.priority < current.priority)
+      || (previous.evaluatedAt === current.evaluatedAt && previous.priority === current.priority && previous.id > current.id)) return false;
+  }
+
+  const days = state.days as unknown[];
+  const dayKeys: string[] = [];
+  for (const rawDay of days) {
+    if (!rawDay || typeof rawDay !== "object" || Array.isArray(rawDay)) return false;
+    const day = rawDay as Record<string, unknown>;
+    if (!hasExactKeys(day, ["day", "aggregate"])
+      || typeof day.day !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(day.day)
+      || new Date(`${day.day}T00:00:00.000Z`).toISOString().slice(0, 10) !== day.day
+      || !validateTriggerAggregate(day.aggregate)) return false;
+    dayKeys.push(day.day);
+  }
+  if (new Set(dayKeys).size !== dayKeys.length || dayKeys.some((day, index) => index > 0 && day > dayKeys[index - 1]!)) return false;
+
+  const cooldowns = state.cooldowns as unknown[];
+  const cooldownKeys: string[] = [];
+  let previousCooldownAt = Number.MAX_SAFE_INTEGER;
+  for (const rawCooldown of cooldowns) {
+    if (!rawCooldown || typeof rawCooldown !== "object" || Array.isArray(rawCooldown)) return false;
+    const cooldown = rawCooldown as Record<string, unknown>;
+    if (!hasExactKeys(cooldown, ["targetKey", "lastWouldTriggerAt"])
+      || !validTriggerTargetKey(cooldown.targetKey)
+      || !validInteger(cooldown.lastWouldTriggerAt, 1, Number.MAX_SAFE_INTEGER)
+      || cooldown.lastWouldTriggerAt > previousCooldownAt) return false;
+    cooldownKeys.push(cooldown.targetKey);
+    previousCooldownAt = cooldown.lastWouldTriggerAt;
+  }
+  return new Set(cooldownKeys).size === cooldownKeys.length;
+}
+
 export async function readMarketEventScoutState(path: string, now: number = Date.now()): Promise<MarketEventScoutState> {
   let text: string;
   try {
@@ -801,11 +1334,13 @@ export async function readMarketEventScoutState(path: string, now: number = Date
     throw new Error("Malformed market event scout state: not an object");
   }
   const state = parsed as Record<string, unknown>;
-  if (state.version !== 1 || !Array.isArray(state.sources) || !Array.isArray(state.decisions)) {
+  if ((state.version !== 1 && state.version !== 2) || !Array.isArray(state.sources) || !Array.isArray(state.decisions)
+    || (state.version === 2 && state.triggerDryRun === undefined)) {
     throw new Error("Malformed market event scout state: unsupported schema");
   }
   if (state.sources.length > 100 || !state.sources.every(validateSourceState)
-    || state.decisions.length > 2_000 || !state.decisions.every(validateDecision)) {
+    || state.decisions.length > 2_000 || !state.decisions.every(validateDecision)
+    || (state.version === 2 && !validateTriggerDryRunState(state.triggerDryRun))) {
     throw new Error("Malformed market event scout state: invalid record");
   }
   const sources = state.sources as MarketEventScoutSourceState[];
@@ -820,10 +1355,15 @@ export async function readMarketEventScoutState(path: string, now: number = Date
     throw new Error("Malformed market event scout state: invalid updatedAt");
   }
   return {
-    version: 1,
+    version: 2,
     updatedAt: state.updatedAt,
     sources,
     decisions,
+    // v1 migration is deliberately empty: retained historical decisions are
+    // not replayed as newly observed trigger evidence.
+    triggerDryRun: state.version === 2
+      ? state.triggerDryRun as MarketEventTriggerDryRunState
+      : emptyTriggerDryRunState(),
   };
 }
 
@@ -932,6 +1472,8 @@ export class MarketEventScout {
   private readonly now: () => number;
   private readonly maxSeenPerSource: number;
   private readonly maxStoredDecisions: number;
+  private readonly maxStoredTriggerCandidates: number;
+  private readonly triggerPolicy: MarketEventTriggerPolicy;
   private readonly errorBackoffMs: number;
   private readonly sourceTimeoutMs: number;
   private running?: Promise<MarketEventScoutRunResult>;
@@ -945,6 +1487,15 @@ export class MarketEventScout {
     this.now = options.now ?? Date.now;
     this.maxSeenPerSource = positiveInteger(options.maxSeenPerSource, DEFAULT_MAX_SEEN_PER_SOURCE, 2_000);
     this.maxStoredDecisions = positiveInteger(options.maxStoredDecisions, DEFAULT_MAX_STORED_DECISIONS, 2_000);
+    this.maxStoredTriggerCandidates = positiveInteger(
+      options.maxStoredTriggerCandidates,
+      DEFAULT_MAX_STORED_TRIGGER_CANDIDATES,
+      2_000,
+    );
+    if (!validateTriggerPolicy(options.triggerPolicy ?? DEFAULT_MARKET_EVENT_TRIGGER_POLICY)) {
+      throw new Error("Market event trigger dry-run policy is invalid");
+    }
+    this.triggerPolicy = cloneTriggerPolicy(options.triggerPolicy ?? DEFAULT_MARKET_EVENT_TRIGGER_POLICY);
     this.errorBackoffMs = positiveInteger(options.errorBackoffMs, DEFAULT_ERROR_BACKOFF_MS, 24 * 60 * 60_000);
     this.sourceTimeoutMs = positiveInteger(options.sourceTimeoutMs, DEFAULT_SOURCE_TIMEOUT_MS, 2 * 60_000);
     if (this.sources.length < 1 || this.sources.length > 100) throw new Error("Market event scout source count is invalid");
@@ -1067,6 +1618,11 @@ export class MarketEventScout {
 
     if (options.signal?.aborted) throw options.signal.reason ?? new Error("Market event scout aborted");
     runDecisions.sort((a, b) => b.priority - a.priority || b.observedAt - a.observedAt || a.id.localeCompare(b.id));
+    const triggerCandidates = recordTriggerCandidates(state.triggerDryRun, runDecisions, {
+      evaluatedAt: this.now(),
+      policy: this.triggerPolicy,
+      maxStoredCandidates: this.maxStoredTriggerCandidates,
+    });
     if (runDecisions.length > 0) {
       const byId = new Map<string, MarketEventDecision>();
       for (const decision of [...runDecisions, ...state.decisions]) {
@@ -1093,6 +1649,10 @@ export class MarketEventScout {
       watched,
       suppressed,
       decisions: runDecisions,
+      triggerCandidates,
+      candidateEvaluated: triggerCandidates.length,
+      wouldTrigger: triggerCandidates.filter((candidate) => candidate.outcome === "would-trigger").length,
+      gated: triggerCandidates.filter((candidate) => candidate.outcome === "gated").length,
     };
   }
 }

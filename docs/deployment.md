@@ -159,8 +159,8 @@ Behavior to expect in production:
 
 The event scout is a separate, opt-in observation loop. It polls official public
 RSS/Atom sources through Unbrowser, records deterministic `admit-shadow`, `watch`,
-and suppression counters, and does **not** dispatch a model, reserve pre-cache
-budget, or mutate research canvases.
+and suppression counters, and evaluates a bounded trigger **dry run**. It does
+**not** dispatch a model, reserve pre-cache budget, or mutate research canvases.
 
 | Env | Default | Production guidance |
 |---|---|---|
@@ -186,8 +186,41 @@ Operational contract:
   `TERMINAL_RUNTIME_MODE=public-gateway` hard-disable scheduling. Do not enable
   the scout in disposable workers.
 - Use `/market-scout status` to inspect source health and recent actionable
-  observations. Keep all decisions shadow-only until observed precision, recall,
-  daily volume, and ticker-association quality justify a separate trigger design.
+  observations. The same status view reports dry-run route coverage, UTC daily
+  candidate volume, and gate pressure. These are operational measurements, not
+  precision, recall, or association-correctness claims; those require reviewed
+  labels and an independent denominator. Keep all decisions no-dispatch until
+  that evidence justifies a separate execution adapter.
+
+### Trigger dry-run contract
+
+Every newly observed non-suppressed decision is mapped from its validated target
+only; titles are never reparsed to invent a route:
+
+- ticker target → ticker BRIEF proposal;
+- `macro` market target → macro EVENTS BRIEF proposal;
+- `story` market target → SIGNALS/Market Story BRIEF proposal.
+
+Only `admit-shadow` decisions can reach `would-trigger`. The version-1 simulation
+policy requires priority 80, a two-hour publication TTL, a six-hour per-target
+cooldown, and a cap of eight `would-trigger` outcomes per UTC day. Those values
+are conservative hypotheses for measuring pressure, not authorization or
+evidence-backed production thresholds. `watch` decisions are retained as gated
+mapping evidence; current market-story decisions therefore do not qualify.
+Gated candidates consume neither cooldown nor daily capacity. The candidate and
+its policy snapshot are immutable, while bounded lifetime/day aggregates survive
+candidate-record rotation. Once evidence exists, changing any policy value
+requires an explicit policy/schema migration so daily aggregates cannot silently
+blend incomparable cohorts.
+
+The journal schema is version 2. A valid version-1 journal migrates in memory and
+is written as version 2 on the next atomic scout commit; retained version-1
+decisions are deliberately not backfilled as candidates. Source dedupe, decision
+records, candidate outcomes, cooldowns, and daily counts commit in the same
+temp-file/fsync/rename operation. An older binary rejects a version-2 journal and
+leaves scouting fail-closed instead of deleting unknown evidence. Disable the
+scout before an application rollback that predates journal v2; restore compatible
+code to resume polling.
 
 ## Post-Deployment Verification
 
