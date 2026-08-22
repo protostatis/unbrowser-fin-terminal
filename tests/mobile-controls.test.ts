@@ -25,6 +25,16 @@ test("mobile actions adapt to market, ticker, research, and cache states", () =>
   assert.equal(signals[0]?.id, "pane");
   assert.equal(signals.find((action) => action.id === "older")?.input, "[");
 
+  const marketScreen = mobileActions({ mode: "market", screen: "MARKET" });
+  const crypto = marketScreen.find((action) => action.id === "crypto");
+  assert.ok(crypto, "MARKET screen should expose a Crypto toggle in the deck");
+  assert.equal(crypto?.input, "g");
+  assert.equal(crypto?.label, "Crypto");
+
+  const cryptoView = mobileActions({ mode: "market", screen: "MARKET", marketView: "crypto" });
+  assert.equal(cryptoView.find((action) => action.id === "crypto")?.label, "Global");
+  assert.equal(market.find((action) => action.id === "crypto"), undefined, "no-screen market state should not add the toggle");
+
   const ticker = mobileActions({ mode: "ticker", watched: true });
   assert.equal(ticker[0]?.id, "back");
   assert.equal(ticker.find((action) => action.id === "watch")?.label, "Unwatch");
