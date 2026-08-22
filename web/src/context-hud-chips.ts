@@ -1,4 +1,5 @@
 import {
+  canRestoreTickerSplit,
   TERMINAL_INPUTS,
   type ResearchActivityStatus,
   type TerminalFrameState,
@@ -55,8 +56,20 @@ export function contextHudChips(
 
   const screen = state?.screen?.toUpperCase();
   if (state?.mode === "ticker") {
+    if (canRestoreTickerSplit(state)) {
+      chips.push({ id: "split", label: "▦ Split", input: TERMINAL_INPUTS.tab, tone: "accent" });
+    }
+    if (state.tickerLayout === "quote" && (state.tickerNavigation?.count ?? 0) > 1) {
+      const source = state.tickerNavigation?.source === "watch" ? "Watch" : "Movers";
+      chips.push({ id: "previous-ticker", label: `‹ ${source}`, input: TERMINAL_INPUTS.up });
+      chips.push({ id: "next-ticker", label: `${source} ›`, input: TERMINAL_INPUTS.down });
+    }
     chips.push({ id: "brief", label: "Brief", input: "j" });
     chips.push({ id: "why", label: "Why", input: "k", tone: "accent" });
+    if (screen === "RESEARCH" || screen === "SPLIT") {
+      chips.push({ id: "older", label: "Older", input: "[" });
+      if (state.archive) chips.push({ id: "newer", label: "Newer", input: "]" });
+    }
     chips.push({ id: "watch", label: state?.watched ? "★ Unwatch" : "★ Watch", input: "e" });
     chips.push({ id: "refresh", label: "⟳ Refresh", input: "r" });
   } else if (screen === "SIGNALS" || screen === "EVENTS") {
@@ -73,6 +86,10 @@ export function contextHudChips(
     });
     chips.push({ id: "brief", label: "Brief", input: "j" });
     chips.push({ id: "why", label: "Why", input: "k" });
+    if (screen === "SIGNALS") {
+      chips.push({ id: "older", label: "Older", input: "[" });
+      if (state?.archive) chips.push({ id: "newer", label: "Newer", input: "]" });
+    }
     chips.push({ id: "refresh", label: "⟳ Refresh", input: "r" });
   } else {
     // MARKET / MOVERS / WATCH: quote rows are tight on a phone, so expose a

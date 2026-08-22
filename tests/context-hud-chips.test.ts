@@ -12,17 +12,94 @@ test("ticker exposes brief, why, watch, and refresh", () => {
   assert.equal(watched.find((chip) => chip.id === "watch")?.label, "★ Unwatch");
 });
 
+test("wide ticker full views expose a Split restore control", () => {
+  for (const tickerLayout of ["quote", "research"] as const) {
+    const split = contextHudChips({
+      mode: "ticker",
+      screen: tickerLayout.toUpperCase(),
+      tickerLayout,
+      tickerSplitAvailable: true,
+    }).find((chip) => chip.id === "split");
+    assert.deepEqual(split, {
+      id: "split",
+      label: "▦ Split",
+      input: "\t",
+      tone: "accent",
+    });
+  }
+  assert.equal(
+    contextHudChips({
+      mode: "ticker",
+      screen: "SPLIT",
+      tickerLayout: "split",
+      tickerSplitAvailable: true,
+    }).some((chip) => chip.id === "split"),
+    false,
+  );
+  assert.equal(
+    contextHudChips({
+      mode: "ticker",
+      screen: "QUOTE",
+      tickerLayout: "quote",
+      tickerSplitAvailable: false,
+    }).some((chip) => chip.id === "split"),
+    false,
+  );
+});
+
+test("Quote exposes existing-arrow ticker cycling for an originating source list", () => {
+  const chips = contextHudChips({
+    mode: "ticker",
+    screen: "QUOTE",
+    tickerLayout: "quote",
+    tickerNavigation: { source: "watch", index: 1, count: 3 },
+  });
+  assert.deepEqual(
+    chips.filter((chip) => chip.id === "previous-ticker" || chip.id === "next-ticker"),
+    [
+      { id: "previous-ticker", label: "‹ Watch", input: "\x1b[A" },
+      { id: "next-ticker", label: "Watch ›", input: "\x1b[B" },
+    ],
+  );
+  assert.equal(
+    contextHudChips({
+      mode: "ticker",
+      screen: "SPLIT",
+      tickerLayout: "split",
+      tickerNavigation: { source: "movers", index: 1, count: 3 },
+    }).some((chip) => chip.id === "next-ticker"),
+    false,
+  );
+});
+
+test("research and wide ticker split expose archive navigation", () => {
+  assert.deepEqual(ids({ mode: "ticker", screen: "RESEARCH" }), [
+    "brief",
+    "why",
+    "older",
+    "watch",
+    "refresh",
+  ]);
+  assert.deepEqual(ids({
+    mode: "ticker",
+    screen: "SPLIT",
+    tickerLayout: "split",
+    archive: { position: 0, count: 3 },
+  }), ["brief", "why", "older", "newer", "watch", "refresh"]);
+});
+
 test("MARKET / MOVERS / WATCH expose Open + Refresh", () => {
   for (const screen of ["MARKET", "MOVERS", "WATCH"]) {
     assert.deepEqual(ids({ mode: "market", screen }), ["open", "refresh"]);
   }
 });
 
-test("SIGNALS and EVENTS expose a pane toggle plus brief, why, refresh", () => {
+test("SIGNALS and EVENTS expose a pane toggle plus relevant research actions", () => {
   assert.deepEqual(ids({ mode: "market", screen: "SIGNALS", signalsFocus: "headlines" }), [
     "pane",
     "brief",
     "why",
+    "older",
     "refresh",
   ]);
   assert.deepEqual(ids({ mode: "market", screen: "EVENTS", eventsFocus: "lanes" }), [

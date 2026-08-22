@@ -550,6 +550,15 @@ test("scroll ticker RESEARCH with canvas (down)", () => {
   assert.deepEqual(result, [K_DOWN, K_DOWN, K_DOWN]);
 });
 
+test("scroll ticker wide SPLIT research canvas (down)", () => {
+  const result = resolveWebAction(
+    { action: "scroll", direction: "down", amount: 2 },
+    tickerState({ screen: "SPLIT", tickerLayout: "split", hasCanvas: true }),
+  );
+  accepted(result);
+  assert.deepEqual(result, [K_DOWN, K_DOWN]);
+});
+
 test("scroll rejects ticker QUOTE tab", () => {
   const result = resolveWebAction(
     { action: "scroll", direction: "down" },

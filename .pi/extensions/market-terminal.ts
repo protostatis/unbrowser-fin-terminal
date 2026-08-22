@@ -55,11 +55,13 @@ import {
 	readMarketEventScoutState,
 	type MarketEventDocumentClient,
 	type MarketEventScoutRunResult,
+	type MarketEventTriggerCandidate,
 } from "../../shared/market-event-scout.js";
 
 type ChartScope = "day" | "week" | "month" | "year" | "max";
 type ResearchIntent = "brief" | "why";
 type ResearchIdentity = { researchKey: string; intent: ResearchIntent; contextLabel: string };
+type TickerLayout = "quote" | "research" | "split";
 
 /** Paired pre-cache target carrying exact BRIEF and WHY identities. */
 type PairedCacheIdentity = { researchKey: string; intent: ResearchIntent; contextLabel: string; question: string };
@@ -302,10 +304,31 @@ type MarketHubNavigationState = {
 	eventsFocus?: "lanes" | "briefing";
 	eventBriefingScroll?: number;
 };
+type TickerNavigationSource = "movers" | "watch";
+/** Immutable list context captured when a ticker opens from MOVERS or WATCH. */
+type TickerNavigation = {
+	source: TickerNavigationSource;
+	symbols: string[];
+	index: number;
+};
+
+function tickerNavigationLabel(navigation: TickerNavigation | undefined): string | undefined {
+	if (!navigation || navigation.symbols.length === 0) return undefined;
+	const index = Math.max(0, Math.min(navigation.index, navigation.symbols.length - 1));
+	return `${navigation.source === "watch" ? "WATCH" : "MOVERS"} ${index + 1}/${navigation.symbols.length}`;
+}
 type TerminalResult =
 	| { action: "close" }
 	| { action: "back"; chartScope: ChartScope }
-	| { action: "quote"; symbol: string; archivedCanvas?: Canvas; returnState?: MarketHubNavigationState; chartScope: ChartScope }
+	| {
+		action: "quote";
+		symbol: string;
+		archivedCanvas?: Canvas;
+		returnState?: MarketHubNavigationState;
+		tickerNavigation?: TickerNavigation;
+		tickerLayout?: TickerLayout;
+		chartScope: ChartScope;
+	}
 	| ({ action: "research"; symbol: string; question: string; returnTo: "quote" | "market"; forceRefresh?: boolean; chartScope: ChartScope; origin?: "precache"; pairedTarget?: PairedCacheTarget; tokenLimit?: number; precacheReservation?: PrecacheReservationRef } & ResearchIdentity);
 type ResearchRequest = Extract<TerminalResult, { action: "research" }>;
 type ResearchOutcome = "queued" | "running" | "partial" | "complete" | "failed" | "cancelled";
@@ -903,6 +926,13 @@ const MARKET_OVERLAY_OPTIONS = {
 	overlayOptions: { width: "100%", maxHeight: "100%", row: 0, col: 0, margin: 0 },
 } as const;
 
+// A ticker split must leave enough room for both an interpretable chart and a
+// readable research column. Below this it deliberately retains the existing
+// full-width Quote / Research tabs instead of producing two compromised panes.
+const TICKER_SPLIT_MIN_WIDTH = 110;
+const TICKER_SPLIT_MIN_ROWS = 26;
+const TICKER_SPLIT_LEFT_RATIO = 0.45;
+
 function normalizeSymbol(value: string): string | undefined {
 	const symbol = value.trim().toUpperCase();
 	// Standard tickers (AAPL), caret-prefixed indices (^GSPC), Chinese indices (000001.SS)
@@ -1081,6 +1111,20 @@ export function readMarketScoutLocalCliEnabled(env: NodeJS.ProcessEnv = process.
 	if (value === "1" || value === "true" || value === "on") return true;
 	if (value === "0" || value === "false" || value === "off") return false;
 	throw new Error("MARKET_SCOUT_LOCAL_CLI must be 1/true/on or 0/false/off");
+}
+
+function marketEventTriggerCandidateLabel(candidate: MarketEventTriggerCandidate): string {
+	const route = candidate.route?.kind === "ticker-brief"
+		? `TICKER ${candidate.route.symbol}`
+		: candidate.route?.kind === "macro-event-brief"
+			? "EVENT MACRO"
+			: candidate.route?.kind === "market-story-brief"
+				? "MARKET STORY"
+				: "UNMAPPED";
+	const outcome = candidate.outcome === "would-trigger"
+		? "WOULD TRIGGER"
+		: `GATED ${candidate.gateReasonCodes.join(",") || "UNKNOWN"}`;
+	return `${outcome} · ${route} · P${candidate.priority} · ${candidate.title}`;
 }
 
 export function marketScoutScheduleDelay(now: number, dueAt: number): number {
@@ -1352,6 +1396,18 @@ function plainWrap(value: string, width: number): string[] {
 	return result;
 }
 
+/**
+ * Comfortable reading column for research prose. Full-width text at 120 cols
+ * wraps near the limit, which is past comfortable reading length; capping prose
+ * (summary/bullet/news/note bodies) to ~78 cols keeps it legible. Structural
+ * blocks — charts, data tables, metric grids — intentionally keep the full
+ * content width so they stay dense.
+ */
+const PROSE_WRAP_MAX = 78;
+function proseWrapWidth(contentWidth: number): number {
+	return Math.max(20, Math.min(contentWidth, PROSE_WRAP_MAX));
+}
+
 function twoColumn(left: string[], right: string[], width: number, targetRows = 0, leftRatio = 0.59): string[] {
 	const gap = " │ ";
 	const leftWidth = Math.max(32, Math.floor((width - visibleWidth(gap)) * Math.max(0.35, Math.min(0.7, leftRatio))));
@@ -1493,15 +1549,25 @@ type ArcadeControllerOptions = {
 	watch?: boolean;
 	cancel?: boolean;
 	back?: boolean;
+	/** This view accepts [ / ] archive navigation. */
+	archive?: boolean;
 	cache?: boolean;
 	jLabel?: "OPEN" | "BRIEF";
-	horizontalLabel?: "SCREEN" | "TAB";
-	verticalLabel?: "SELECT" | "SCROLL" | "IDLE";
+	horizontalLabel?: "SCREEN" | "TAB" | "VIEW";
+	verticalLabel?: "SELECT" | "SCROLL" | "CYCLE" | "IDLE";
 	tabLabel?: string;
+	/** Show the compact single-line controller (default) or the expanded two-line help. */
+	expanded?: boolean;
+	/** MARKET-screen GLOBAL↔CRYPTO subview toggle hint (set on the MARKET screen). */
+	cryptoView?: "global" | "crypto";
 };
 
-// Shared two-line controller footer. Navigation labels describe the active
-// screen instead of advertising one ambiguous global behavior.
+/**
+ * Shared controller footer. Defaults to ONE concise contextual line so the body
+ * keeps maximum rows; `?` toggles `expanded` for the full two-line reference.
+ * Cache-decision and search states always render their full two-line modal
+ * guidance regardless of `expanded` (those choices must stay fully visible).
+ */
 function renderArcadeController(lines: string[], width: number, th: Theme, fit: (text: string) => string, opts: ArcadeControllerOptions): void {
 	if (opts.cache) {
 		lines.push(fit(th.fg("warning", "CACHE DECISION · NAVIGATION LOCKED")));
@@ -1516,25 +1582,69 @@ function renderArcadeController(lines: string[], width: number, th: Theme, fit: 
 
 	const horizontal = opts.horizontalLabel ?? "SCREEN";
 	const vertical = opts.verticalLabel ?? "SELECT";
-	const tab = opts.tabLabel ?? "ONE PANE";
 	const jLabel = opts.jLabel ?? "OPEN";
 	const compact = width < 72;
-	const separator = compact ? " " : "  ";
-	const nav = compact
-		? `[A/D] ${horizontal.toLowerCase()}  [W/S] ${vertical.toLowerCase()}  [Tab] ${tab.toLowerCase()}`
-		: `D-PAD  [A/D] ${horizontal}  [W/S] ${vertical}  [TAB] ${tab.toUpperCase()}`;
-	const actions = [
-		...(opts.back ? ["[B] BACK"] : []),
-		"[Q] QUIT",
-		...(opts.cancel ? ["[C] CANCEL"] : []),
-		`[J] ${jLabel}`,
-		"[K] WHY",
-		...(opts.watch ? ["[E] WATCH"] : []),
-		"[R] SYNC",
-		...(opts.search ? ["[/] SEARCH"] : []),
+	const tight = width < 94;
+	const sep = compact ? " " : "  ";
+	// Tab toggles a real second pane only on split screens; elsewhere it is a
+	// no-op, so we only surface the hint where it does something useful.
+	const tabMeaningful = Boolean(opts.tabLabel && opts.tabLabel !== "ONE PANE");
+	const tabHint = opts.tabLabel?.toLowerCase() ?? "pane";
+
+	// Expanded: the original verbose two-line reference (nav + actions).
+	if (opts.expanded) {
+		const nav = compact
+			? `[A/D] ${horizontal.toLowerCase()}  [W/S] ${vertical.toLowerCase()}${tabMeaningful ? `  [Tab] ${tabHint}` : ""}  [?] collapse`
+			: `D-PAD  [A/D] ${horizontal}  [W/S] ${vertical}${tabMeaningful ? `  [TAB] ${tabHint.toUpperCase()}` : ""}  [?] COLLAPSE HELP`;
+		const actions = [
+			...(opts.back ? ["[B] BACK"] : []),
+			"[Q] QUIT",
+			...(opts.cancel ? ["[C] CANCEL"] : []),
+			`[J] ${jLabel}`,
+			"[K] WHY",
+			...(opts.archive ? ["[ / ] ARCHIVE"] : []),
+			...(opts.watch ? ["[E] WATCH"] : []),
+			...(opts.cryptoView ? [`[G] ${opts.cryptoView === "crypto" ? "GLOBAL" : "CRYPTO"}`] : []),
+			"[R] SYNC",
+			...(opts.search ? ["[/] SEARCH"] : []),
+			"[?] HELP",
+		];
+		lines.push(fit(th.fg(opts.cancel ? "warning" : "dim", nav)));
+		lines.push(fit(th.fg(opts.cancel ? "warning" : "dim", actions.join(sep))));
+		return;
+	}
+
+	// Default: a single concise line carrying navigation + the primary actions.
+	// At narrow widths, show only the core path plus ? help rather than clipping
+	// the tail of a long all-actions string; expanded help still exposes every
+	// secondary action.
+	const coreParts = [
+		`[A/D] ${horizontal.toLowerCase()}`,
+		`[W/S] ${vertical.toLowerCase()}`,
+		...(tabMeaningful ? [`[Tab] ${tabHint}`] : []),
+		`[J] ${jLabel.toLowerCase()}`,
+		"[K] why",
+		"[Q] quit",
+		"[?] help",
 	];
-	lines.push(fit(th.fg(opts.cancel ? "warning" : "dim", nav)));
-	lines.push(fit(th.fg(opts.cancel ? "warning" : "dim", actions.join(separator))));
+	const fullParts = [
+		`[A/D] ${horizontal.toLowerCase()}`,
+		`[W/S] ${vertical.toLowerCase()}`,
+		...(tabMeaningful ? [`[Tab] ${tabHint}`] : []),
+		...(opts.cancel ? ["[C] CANCEL"] : []),
+		`[J] ${jLabel.toLowerCase()}`,
+		"[K] why",
+		...(opts.archive ? ["[ ] archive"] : []),
+		...(opts.watch ? ["[E] watch"] : []),
+		...(opts.back ? ["[B] back"] : []),
+		...(opts.cryptoView ? [`[G] ${opts.cryptoView === "crypto" ? "global" : "crypto"}`] : []),
+		...(opts.archive ? [] : ["[R] sync"]),
+		...(opts.search ? ["[/] search"] : []),
+		"[Q] quit",
+		"[?] help",
+	];
+	const parts = tight ? coreParts : fullParts;
+	lines.push(fit(th.fg(opts.cancel ? "warning" : "dim", parts.join(sep))));
 }
 
 async function fetchQuote(symbol: string, scope: ChartScope = DEFAULT_CHART_SCOPE, signal?: AbortSignal): Promise<Quote> {
@@ -3917,8 +4027,11 @@ async function readProjectArchive(cwd: string): Promise<ArchivedResearch[]> {
 
 class MarketTerminal {
 	private tab = 0;
+	/** Explicit wide-screen view choice; undefined means use the Split default. */
+	private wideLayout: TickerLayout | undefined;
 	private loading = false;
-	private status = "PLAYER 1 READY";
+	private helpExpanded = false;
+	private status = "READY";
 	private quote: Quote | undefined;
 	private canvas: Canvas | undefined;
 	private archivedCanvas: Canvas | undefined;
@@ -3948,8 +4061,12 @@ class MarketTerminal {
 		private readonly researchActions?: ResearchActions,
 		initialResearch?: ResearchJob,
 		initialScope: ChartScope = DEFAULT_CHART_SCOPE,
+		private readonly tickerNavigation?: TickerNavigation,
+		private readonly returnState?: MarketHubNavigationState,
+		initialTickerLayout?: TickerLayout,
 	) {
 		this.tab = Math.max(0, Math.min(1, initialTab));
+		if (initialTickerLayout) this.selectTickerLayout(initialTickerLayout);
 		this.quote = initialQuote;
 		this.canvas = initialCanvas;
 		this.researchJob = initialResearch;
@@ -3980,7 +4097,9 @@ class MarketTerminal {
 		if (position < 0) return;
 		this.archivedCanvas = history[position]!.canvas;
 		this.archivePosition = position;
-		this.tab = 1;
+		// Archive is an explicit research-reading intent: retain the full-width
+		// research view even when a wide split is otherwise available.
+		this.selectTickerLayout("research");
 		this.canvasScroll = 0;
 		this.status = `ARCHIVE ${position + 1}/${history.length} · AS OF ${archiveAsOf(this.archivedCanvas)}`;
 		this.tui.requestRender();
@@ -4054,6 +4173,67 @@ class MarketTerminal {
 		}
 	}
 
+	/** Resolve the frozen MOVERS/WATCH order and repair a malformed saved index. */
+	private tickerCycleContext(): TickerNavigation | undefined {
+		const navigation = this.tickerNavigation;
+		if (!navigation) return undefined;
+		const symbols = [...new Set(
+			navigation.symbols
+				.map((symbol) => normalizeSymbol(symbol))
+				.filter((symbol): symbol is string => Boolean(symbol)),
+		)];
+		if (symbols.length === 0) return undefined;
+		const currentIndex = symbols.indexOf(this.symbol);
+		const index = currentIndex >= 0
+			? currentIndex
+			: Math.max(0, Math.min(navigation.index, symbols.length - 1));
+		return { source: navigation.source, symbols, index };
+	}
+
+	private tickerCycleReturnState(index: number): MarketHubNavigationState | undefined {
+		const navigation = this.tickerNavigation;
+		if (!this.returnState || !navigation) return this.returnState;
+		const sourceScreen = navigation.source === "watch" ? MARKET_SCREEN.watch : MARKET_SCREEN.movers;
+		if (this.returnState.screen !== sourceScreen) return this.returnState;
+		const selectedByScreen = this.returnState.selectedByScreen
+			? [...this.returnState.selectedByScreen]
+			: undefined;
+		if (selectedByScreen) selectedByScreen[sourceScreen] = index;
+		return {
+			...this.returnState,
+			selected: index,
+			...(selectedByScreen ? { selectedByScreen } : {}),
+		};
+	}
+
+	/**
+	 * W/S follows the same previous/next ordering used by Market Hub lists. It
+	 * only runs in Quote so Research/Split always retain stable canvas scrolling.
+	 */
+	private cycleTicker(direction: -1 | 1): void {
+		const navigation = this.tickerCycleContext();
+		if (!navigation) {
+			this.status = "NO SOURCE LIST · OPEN FROM MOVERS OR WATCH TO CYCLE";
+			return;
+		}
+		if (navigation.symbols.length < 2) {
+			this.status = `${navigation.source === "watch" ? "WATCH" : "MOVERS"} HAS ONE TICKER · B BACK`;
+			return;
+		}
+		const index = (navigation.index + direction + navigation.symbols.length) % navigation.symbols.length;
+		const symbol = navigation.symbols[index]!;
+		this.done({
+			action: "quote",
+			symbol,
+			chartScope: this.chartScope,
+			returnState: this.tickerCycleReturnState(index),
+			tickerNavigation: { ...navigation, index },
+			// Quote owns W/S list traversal, so preserve it across the fresh ticker
+			// instance rather than falling back to the wide Split default.
+			tickerLayout: "quote",
+		});
+	}
+
 	private currentResearchJob(): ResearchJob | undefined {
 		const stored = researchJobFor(this.symbol, this.chartScope, this.researchKey);
 		if (stored) return stored;
@@ -4079,6 +4259,32 @@ class MarketTerminal {
 		return this.loading ? `SHOWING ${shownLabel} · REFRESHING` : `${shownLabel} QUOTE`;
 	}
 
+	private supportsTickerSplit(width: number | undefined = this.layoutMetrics?.width): boolean {
+		return typeof width === "number"
+			&& width >= TICKER_SPLIT_MIN_WIDTH
+			&& terminalRows(this.tui) >= TICKER_SPLIT_MIN_ROWS;
+	}
+
+	/**
+	 * Compact terminals preserve the historic two full-width tabs. On genuinely
+	 * wide terminals, Split is the useful default; A/D can still choose either
+	 * full-width view and Tab returns to Split.
+	 */
+	private activeTickerLayout(width: number | undefined = this.layoutMetrics?.width): TickerLayout {
+		if (!this.supportsTickerSplit(width)) return this.tab === 0 ? "quote" : "research";
+		return this.wideLayout ?? "split";
+	}
+
+	private selectTickerLayout(layout: TickerLayout): void {
+		this.wideLayout = layout;
+		if (layout === "quote") this.tab = 0;
+		else if (layout === "research") this.tab = 1;
+	}
+
+	private tickerScreen(layout: TickerLayout): "QUOTE" | "RESEARCH" | "SPLIT" {
+		return layout === "split" ? "SPLIT" : layout === "quote" ? "QUOTE" : "RESEARCH";
+	}
+
 	private dispatchResearch(request: ResearchRequest): void {
 		if (!this.researchActions) {
 			this.done(request);
@@ -4092,6 +4298,9 @@ class MarketTerminal {
 		this.status = response.status;
 		if (response.accepted) {
 			this.tab = 1;
+			// Preserve Split when it is already the wide layout default, but honor
+			// an explicit full Quote view by moving that user into full Research.
+			if (this.wideLayout === "quote") this.wideLayout = "research";
 			this.canvasScroll = 0;
 		}
 	}
@@ -4116,6 +4325,7 @@ class MarketTerminal {
 		if (this.researchActions?.promptForCache && cached) {
 			this.cacheDecision = { request, cached };
 			this.tab = 1;
+			if (this.wideLayout === "quote") this.wideLayout = "research";
 			this.status = cacheChoiceStatus(request, cached);
 			return;
 		}
@@ -4212,26 +4422,50 @@ class MarketTerminal {
 			this.done({ action: "back", chartScope: this.chartScope });
 			return;
 		}
-		// A/D owns top-level tabs. Tab is reserved for pane focus on split views.
-		if (matchesKey(data, "left") || data === "a" || data === "A") this.tab = 0;
-		else if (matchesKey(data, "right") || data === "d" || data === "D") this.tab = 1;
-		else if (matchesKey(data, "tab")) this.status = `TAB FOCUS IS UNCHANGED · A/D SWITCH ${this.tab === 0 ? "QUOTE → RESEARCH" : "RESEARCH → QUOTE"}`;
-		else if (this.tab === 1 && data === "[") this.browseArchive("older");
-		else if (this.tab === 1 && data === "]") this.browseArchive("newer");
-		else if (this.tab === 1 && !this.displayedCanvas() && isViewportNavigationInput(data))
+		const layout = this.activeTickerLayout();
+		const researchVisible = layout === "research" || layout === "split";
+		const splitSupported = this.supportsTickerSplit();
+		// At wide sizes, A/D retain the familiar full Quote/Research views and
+		// Tab returns to the simultaneous split. Compact terminals behave exactly
+		// as before with the two full-width tabs.
+		if (matchesKey(data, "left") || data === "a" || data === "A") {
+			this.selectTickerLayout("quote");
+			if (splitSupported) {
+				this.status = "QUOTE VIEW · TAB WIDE SPLIT";
+			}
+		} else if (matchesKey(data, "right") || data === "d" || data === "D") {
+			this.selectTickerLayout("research");
+			if (splitSupported) {
+				this.status = "RESEARCH VIEW · TAB WIDE SPLIT";
+			}
+		} else if (matchesKey(data, "tab")) {
+			this.selectTickerLayout("split");
+			if (splitSupported) {
+				this.status = "WIDE SPLIT · QUOTE + RESEARCH";
+			} else {
+				this.status = `A/D SWITCHES ${this.tab === 0 ? "QUOTE → RESEARCH" : "RESEARCH → QUOTE"}`;
+			}
+		} else if (layout === "quote" && (matchesKey(data, "up") || data === "w" || data === "W")) {
+			this.cycleTicker(-1);
+		} else if (layout === "quote" && (matchesKey(data, "down") || data === "s" || data === "S")) {
+			this.cycleTicker(1);
+		} else if (researchVisible && data === "[") this.browseArchive("older");
+		else if (researchVisible && data === "]") this.browseArchive("newer");
+		else if (researchVisible && !this.displayedCanvas() && isViewportNavigationInput(data))
 			this.status = "RESEARCH HAS NO CANVAS YET · J BRIEF · K WHY";
-		// Canvas scrolling when on RESEARCH tab with a canvas.
-		else if (this.tab === 1 && this.displayedCanvas() && (matchesKey(data, "up") || data === "w" || data === "W"))
+		// In Split, W/S intentionally drives the research canvas; the quote pane
+		// has no independent vertical navigation to steal those keys.
+		else if (researchVisible && this.displayedCanvas() && (matchesKey(data, "up") || data === "w" || data === "W"))
 			this.canvasScroll = Math.max(0, this.canvasScroll - 1);
-		else if (this.tab === 1 && this.displayedCanvas() && (matchesKey(data, "down") || data === "s" || data === "S"))
+		else if (researchVisible && this.displayedCanvas() && (matchesKey(data, "down") || data === "s" || data === "S"))
 			this.canvasScroll = Math.min(Number.MAX_SAFE_INTEGER, this.canvasScroll + 1);
-		else if (this.tab === 1 && this.displayedCanvas() && matchesKey(data, "pageUp"))
+		else if (researchVisible && this.displayedCanvas() && matchesKey(data, "pageUp"))
 			this.canvasScroll = Math.max(0, this.canvasScroll - Math.max(1, this.canvasViewportRows - 1));
-		else if (this.tab === 1 && this.displayedCanvas() && matchesKey(data, "pageDown"))
+		else if (researchVisible && this.displayedCanvas() && matchesKey(data, "pageDown"))
 			this.canvasScroll = Math.min(Number.MAX_SAFE_INTEGER, this.canvasScroll + Math.max(1, this.canvasViewportRows - 1));
-		else if (this.tab === 1 && this.displayedCanvas() && matchesKey(data, "home"))
+		else if (researchVisible && this.displayedCanvas() && matchesKey(data, "home"))
 			this.canvasScroll = 0;
-		else if (this.tab === 1 && this.displayedCanvas() && matchesKey(data, "end"))
+		else if (researchVisible && this.displayedCanvas() && matchesKey(data, "end"))
 			this.canvasScroll = Number.MAX_SAFE_INTEGER;
 		else if (data === "e" || data === "E") this.toggleWatch();
 		else if (data === "c" || data === "C") this.cancelResearch();
@@ -4242,15 +4476,22 @@ class MarketTerminal {
 		else if (data === "k" || data === "K") {
 			this.research(tickerWhyQuestion(this.symbol), "why");
 		}
-		else if (data === "?") this.status = this.researchActions
-			? "A/D TABS · W/S RESEARCH SCROLL · TAB ONE PANE · 1–5 SCOPE · [ OLDER · ] NEWER · J BRIEF · K WHY · E WATCH · C CANCEL · B BACK · Q QUIT"
-			: "A/D TABS · W/S RESEARCH SCROLL · TAB ONE PANE · 1–5 SCOPE · [ OLDER · ] NEWER · J BRIEF · K WHY · E WATCH · B BACK · Q QUIT";
+		else if (data === "?") {
+			this.helpExpanded = !this.helpExpanded;
+			this.status = this.helpExpanded ? "HELP EXPANDED · ? TO COLLAPSE" : "HELP COLLAPSED";
+		}
 		this.tui.requestRender();
 	}
 
 	render(width: number): string[] {
 		const th = this.theme;
 		const fit = (text: string) => truncateToWidth(text, width);
+		const totalRows = terminalRows(this.tui);
+		const tickerLayout = this.activeTickerLayout(width);
+		const splitSupported = this.supportsTickerSplit(width);
+		const screen = this.tickerScreen(tickerLayout);
+		const researchVisible = tickerLayout !== "quote";
+		const tickerCycle = this.tickerCycleContext();
 		const researchJob = this.currentResearchJob();
 		const activeCount = activeResearchJobs().length;
 		const statusLine = this.cacheDecision
@@ -4260,13 +4501,19 @@ class MarketTerminal {
 				: this.loading ? this.quoteScopeStatus() : this.status;
 		const controller: ArcadeControllerOptions = {
 			watch: true,
+			archive: researchVisible,
 			cancel: researchSlotHeld(researchJob),
 			back: true,
 			cache: Boolean(this.cacheDecision),
 			jLabel: "BRIEF",
-			horizontalLabel: "TAB",
-			verticalLabel: this.tab === 1 && this.displayedCanvas() ? "SCROLL" : "IDLE",
-			tabLabel: "ONE PANE",
+			horizontalLabel: splitSupported ? "VIEW" : "TAB",
+			verticalLabel: researchVisible && this.displayedCanvas()
+				? "SCROLL"
+				: tickerLayout === "quote" && (tickerCycle?.symbols.length ?? 0) > 1
+					? "CYCLE"
+					: "IDLE",
+			tabLabel: splitSupported ? "SPLIT" : "ONE PANE",
+			expanded: this.helpExpanded,
 		};
 		// Narrow warning: still a full-height composed screen, not a one-liner.
 		if (width < 54) {
@@ -4278,11 +4525,10 @@ class MarketTerminal {
 			footer.push(fit(th.fg("borderMuted", "─".repeat(width))));
 			footer.push(fit(th.fg("dim", statusLine)));
 			renderArcadeController(footer, width, th, fit, controller);
-			const totalRows = terminalRows(this.tui);
 			const output = composeScreen(header, body, footer, totalRows);
 			this.layoutMetrics = computeLayoutMetrics(
 				"ticker",
-				this.tab === 0 ? "QUOTE" : "RESEARCH",
+				screen,
 				width, totalRows,
 				header.length, body.length, footer.length,
 				output,
@@ -4295,20 +4541,22 @@ class MarketTerminal {
 		const badge = meta
 			? `${th.fg(tone, "● " + meta.label)}  ${th.fg("dim", "DELAYED " + relativeAge(this.quote!.updatedAt))}`
 			: th.fg("dim", "DELAYED");
-		const headerLeft = `${th.bold(th.fg("accent", " SIGNAL "))} ${th.bold(th.fg("text", "MARKET ARCADE"))} ${th.fg("dim", "PLAYER 1 · public/delayed MVP")}`;
-		const gap = Math.max(1, width - visibleWidth(headerLeft) - visibleWidth(badge));
-		const headerLine = headerLeft + " ".repeat(gap) + badge;
 
-		const totalRows = terminalRows(this.tui);
 		const header: string[] = [];
-		header.push(fit(headerLine));
-		header.push(fit(th.fg("borderMuted", "─".repeat(width))));
-		let tabs = ["QUOTE", "RESEARCH"]
-			.map((name, index) => (index === this.tab ? th.bg("selectedBg", th.bold(th.fg("accent", ` ${name} `))) : th.fg("dim", ` ${name} `)))
-			.join(" ");
+		// The symbol is the most important identity on a ticker panel, so it
+		// leads the header (next to the brand mark and view controls);
+		// the static "MARKET ARCADE / PLAYER 1" tagline and top rule were
+		// dropped to reclaim rows.
+		let tabs = tickerLayout === "split"
+			? `${th.bg("selectedBg", th.bold(th.fg("accent", " QUOTE ")))} ${th.fg("borderMuted", "│")} ${th.bg("selectedBg", th.bold(th.fg("accent", " RESEARCH ")))}${th.fg("dim", "  WIDE SPLIT")}`
+			: ["QUOTE", "RESEARCH"]
+				.map((name, index) => (index === (tickerLayout === "quote" ? 0 : 1) ? th.bg("selectedBg", th.bold(th.fg("accent", ` ${name} `))) : th.fg("dim", ` ${name} `)))
+				.join(" ");
 		if (totalRows < 20) tabs += th.fg("dim", `  CHART ${CHART_SCOPE_CONFIGS[this.chartScope].label} [1–5] · ${this.quoteScopeStatus()}`);
-		header.push(fit(tabs));
-		// Chart scope selector row (only on QUOTE tab, or always if enough room)
+		const headerLead = `${th.bold(th.fg("accent", " SIGNAL "))} ${th.bold(th.fg("text", this.symbol))} ${tabs}`;
+		const gap = Math.max(1, width - visibleWidth(headerLead) - visibleWidth(badge));
+		header.push(fit(`${headerLead}${" ".repeat(gap)}${badge}`));
+		// Chart scope selector row.
 		if (totalRows >= 20) {
 			const scopeRow = SCOPE_LABEL_ORDER.map((scope) => {
 				const cfg = CHART_SCOPE_CONFIGS[scope];
@@ -4330,13 +4578,14 @@ class MarketTerminal {
 		const bodyRows = Math.max(1, totalRows - header.length - footer.length);
 		const body: string[] = [];
 
-		if (this.tab === 0) this.renderQuote(body, width, th, fit, bodyRows);
+		if (tickerLayout === "split") this.renderTickerSplit(body, width, th, bodyRows);
+		else if (tickerLayout === "quote") this.renderQuote(body, width, th, fit, bodyRows, true);
 		else this.renderCanvas(body, width, th, fit, bodyRows);
 
 		const output = composeScreen(header, body, footer, totalRows);
 		this.layoutMetrics = computeLayoutMetrics(
 			"ticker",
-			this.tab === 0 ? "QUOTE" : "RESEARCH",
+			screen,
 			width, totalRows,
 			header.length, body.length, footer.length,
 			output,
@@ -4344,7 +4593,34 @@ class MarketTerminal {
 		return output;
 	}
 
-	private renderQuote(lines: string[], width: number, th: Theme, fit: (text: string) => string, bodyRows: number): void {
+	/**
+	 * Wide-only ticker layout: live price/chart stays visible on the left while
+	 * the research canvas remains readable on the right. Both children receive
+	 * their actual pane widths, so charts/structured blocks reflow correctly;
+	 * research prose already respects the shared reading-width cap.
+	 */
+	private renderTickerSplit(lines: string[], width: number, th: Theme, bodyRows: number): void {
+		const gapWidth = visibleWidth(" │ ");
+		const quoteWidth = Math.max(32, Math.floor((width - gapWidth) * TICKER_SPLIT_LEFT_RATIO));
+		const researchWidth = Math.max(26, width - gapWidth - quoteWidth);
+		const quoteFit = (text: string) => truncateToWidth(text, quoteWidth);
+		const researchFit = (text: string) => truncateToWidth(text, researchWidth);
+		const quoteLines: string[] = [];
+		const researchLines: string[] = [];
+
+		this.renderQuote(quoteLines, quoteWidth, th, quoteFit, bodyRows);
+		this.renderCanvas(researchLines, researchWidth, th, researchFit, bodyRows);
+		lines.push(...twoColumn(quoteLines, researchLines, width, bodyRows, TICKER_SPLIT_LEFT_RATIO));
+	}
+
+	private renderQuote(
+		lines: string[],
+		width: number,
+		th: Theme,
+		fit: (text: string) => string,
+		bodyRows: number,
+		showCycleHint = false,
+	): void {
 		const quote = this.quote;
 		if (!quote) {
 			lines.push(fit(th.fg("warning", `${this.symbol} quote is unavailable. Press r to retry.`)));
@@ -4386,7 +4662,8 @@ class MarketTerminal {
 
 		// Action block if bodyRows >= 16.
 		if (bodyRows >= 16) {
-			blocks.push([fit(th.fg("accent", "J builds a factual brief · K explains drivers/scenarios · E toggles WATCH."))]);
+			const cycleHint = showCycleHint ? tickerNavigationLabel(this.tickerCycleContext()) : undefined;
+			blocks.push([fit(th.fg("accent", `J builds a factual brief · K explains drivers/scenarios · E toggles WATCH.${cycleHint ? ` · W/S cycle ${cycleHint}` : ""}`))]);
 		}
 
 		lines.push(...stretchBlocks(blocks, bodyRows, "", 1));
@@ -4522,7 +4799,7 @@ class MarketTerminal {
 						srcLineNum++;
 						const sourceText = trimmed.trim().replace(/^[-•*]\s+/, "").replace(/^\d+[.)]\s+/, "");
 						const prefix = `  [${srcLineNum}] `;
-						const wrapped = plainWrap(sourceText, Math.max(10, contentWidth - visibleWidth(prefix)));
+						const wrapped = plainWrap(sourceText, Math.max(10, proseWrapWidth(contentWidth) - visibleWidth(prefix)));
 						for (const [wi, wline] of wrapped.entries()) {
 							block.push(fit(th.fg("muted", wi === 0 ? prefix + wline : " ".repeat(visibleWidth(prefix)) + wline)));
 						}
@@ -4536,7 +4813,7 @@ class MarketTerminal {
 						const marker = /^\d/.test(rawMarker) ? rawMarker : "•";
 						const text = bulletMatch[3]!;
 						const prefix = `  ${indent}${marker} `;
-						const wrapWidth = Math.max(10, contentWidth - visibleWidth(prefix));
+						const wrapWidth = Math.max(10, proseWrapWidth(contentWidth) - visibleWidth(prefix));
 						const wrapped = plainWrap(text, wrapWidth);
 						for (const [wi, wline] of wrapped.entries()) {
 							if (wi === 0) {
@@ -4547,7 +4824,7 @@ class MarketTerminal {
 						}
 					} else {
 						// Plain prose: gutter with │
-						const wrapWidth = Math.max(10, contentWidth - 3);
+						const wrapWidth = Math.max(10, proseWrapWidth(contentWidth) - 3);
 						const wrapped = plainWrap(trimmed, wrapWidth);
 						for (const wline of wrapped) {
 							block.push(fit(th.fg("text", `  │ ${wline}`)));
@@ -4644,7 +4921,7 @@ class MarketTerminal {
 		const refsStr = this.sourceRefsLine(block.sourceIds);
 		result.push(fit(th.fg("accent", ` ◆ ${th.bold(th.fg("accent", title))}${refsStr ? th.fg("dim", refsStr) : ""}`)));
 		if (block.text) {
-			const wrapWidth = Math.max(10, contentWidth - 3);
+			const wrapWidth = Math.max(10, proseWrapWidth(contentWidth) - 3);
 			const wrapped = plainWrap(block.text, wrapWidth);
 			for (const wline of wrapped) {
 				result.push(fit(th.fg("text", `  │ ${wline}`)));
@@ -4745,7 +5022,7 @@ class MarketTerminal {
 		for (const item of items) {
 			const source = item.source || "";
 			const prefix = `> [${source}] `;
-			const wrapWidth = Math.max(10, contentWidth - visibleWidth(prefix));
+			const wrapWidth = Math.max(10, proseWrapWidth(contentWidth) - visibleWidth(prefix));
 			const wrapped = plainWrap(item.headline + this.sourceRefsLine(item.sourceIds), wrapWidth);
 			let first = true;
 			for (const wline of wrapped) {
@@ -4757,7 +5034,7 @@ class MarketTerminal {
 				}
 			}
 			if (item.note) {
-				const noteWrapWidth = Math.max(10, contentWidth - 2);
+				const noteWrapWidth = Math.max(10, proseWrapWidth(contentWidth) - 2);
 				for (const nw of plainWrap(item.note, noteWrapWidth)) {
 					result.push(fit(th.fg("dim", `  ${nw}`)));
 				}
@@ -4785,7 +5062,7 @@ class MarketTerminal {
 			const cfg = roleGlyphs[role] ?? roleGlyphs.fact;
 			const itemRefsStr = this.sourceRefsLine(item.sourceIds);
 			const prefix = `  ${cfg.glyph} `;
-			const wrapWidth = Math.max(10, contentWidth - visibleWidth(prefix));
+			const wrapWidth = Math.max(10, proseWrapWidth(contentWidth) - visibleWidth(prefix));
 			const wrapped = plainWrap(item.text, wrapWidth);
 			for (const [wi, wline] of wrapped.entries()) {
 				if (wi === 0) {
@@ -4866,12 +5143,21 @@ class MarketTerminal {
 		const researchJob = this.currentResearchJob();
 		const recentResearch = latestSettledResearchJobs();
 		const displayCanvas = this.displayedCanvas();
+		const tickerLayout = this.activeTickerLayout();
+		const tickerNavigation = this.tickerCycleContext();
 		const evidenceStatus = deriveEvidenceStatus(displayCanvas);
 		const dossierRead = canvasDossierRead(displayCanvas);
 		return {
 			mode: "ticker" as const,
 			symbol: this.symbol,
-			screen: this.tab === 0 ? "QUOTE" : "RESEARCH",
+			screen: this.tickerScreen(tickerLayout),
+			tickerLayout,
+			tickerSplitAvailable: this.supportsTickerSplit(),
+			tickerNavigation: tickerNavigation ? {
+				source: tickerNavigation.source,
+				index: tickerNavigation.index,
+				count: tickerNavigation.symbols.length,
+			} : undefined,
 			status: this.status,
 			hasQuote: Boolean(this.quote),
 			hasCanvas: Boolean(displayCanvas),
@@ -4882,6 +5168,18 @@ class MarketTerminal {
 			intent: canvasIntent(displayCanvas) ?? researchIntentFromKey(this.researchKey),
 			watched: this.isWatched(),
 			watchlist: [...this.viewWatchlist],
+			layout: this.layoutMetrics ? {
+				headerRows: this.layoutMetrics.headerRows,
+				footerRows: this.layoutMetrics.footerRows,
+				width: this.layoutMetrics.width,
+				totalRows: this.layoutMetrics.totalRows,
+				splitPane: tickerLayout === "split",
+			} : undefined,
+			canvasScroll: tickerLayout !== "quote" && displayCanvas ? {
+				offset: this.canvasScroll,
+				rows: this.canvasRows,
+				viewportRows: this.canvasViewportRows,
+			} : undefined,
 			cacheDecision: this.cacheDecision ? { symbol: this.cacheDecision.request.symbol, researchKey: this.cacheDecision.request.researchKey, intent: this.cacheDecision.request.intent, asOf: this.cacheDecision.cached.updatedAt, chartScope: canvasScope(this.cacheDecision.cached) } : undefined,
 			archive: this.archivePosition !== undefined ? {
 				position: this.archivePosition,
@@ -4926,7 +5224,8 @@ class MarketHub {
 	private eventBriefingRows = 0;
 	private eventBriefingViewportRows = 0;
 	private loading = false;
-	private status = "PLAYER 1 READY · MARKET MAP";
+	private helpExpanded = false;
+	private status = "MARKET MAP READY";
 	private snapshot: MarketSnapshot;
 	private searching = false;
 	private searchQuery = "";
@@ -5120,6 +5419,24 @@ class MarketHub {
 			chartScope: this.chartScope,
 			...(this.archivedMarketCanvas ? { archivedCanvas: this.archivedMarketCanvas } : {}),
 		};
+	}
+
+	/** Capture the exact visible order only for list screens that open tickers. */
+	private tickerNavigation(): TickerNavigation | undefined {
+		const source = this.screen === MARKET_SCREEN.watch
+			? "watch"
+			: this.screen === MARKET_SCREEN.movers
+				? "movers"
+				: undefined;
+		if (!source) return undefined;
+		const entries = this.entries();
+		const selected = entries[this.selected];
+		if (!selected || selected.type !== "quote") return undefined;
+		const symbols = [...new Set(entries.flatMap((entry) =>
+			entry.type === "quote" ? [entry.quote.symbol] : [],
+		))];
+		const index = symbols.indexOf(selected.quote.symbol);
+		return index >= 0 ? { source, symbols, index } : undefined;
 	}
 
 	showArchivedCanvas(canvas: Canvas): void {
@@ -5400,7 +5717,14 @@ class MarketHub {
 				this.showArchivedCanvas(pending.cached);
 				this.status = `USING CACHED ${pending.request.contextLabel} · AS OF ${archiveAsOf(pending.cached)}${cacheEvidenceSuffix(pending.cached)}`;
 			} else {
-				this.done({ action: "quote", symbol: pending.request.symbol, archivedCanvas: pending.cached, returnState: this.navigationState(), chartScope: this.chartScope });
+				this.done({
+					action: "quote",
+					symbol: pending.request.symbol,
+					archivedCanvas: pending.cached,
+					returnState: this.navigationState(),
+					tickerNavigation: this.tickerNavigation(),
+					chartScope: this.chartScope,
+				});
 			}
 			return;
 		}
@@ -5514,7 +5838,7 @@ class MarketHub {
 			this.eventsFocus = this.eventsFocus === "lanes" ? "briefing" : "lanes";
 			this.status = `EVENTS FOCUS · ${this.eventsFocus === "briefing" ? "BRIEFING · W/S SCROLL" : "CATALYST LANES · W/S SELECT"}`;
 		} else if (matchesKey(data, "tab")) {
-			this.status = `${MARKET_SCREEN_NAMES[this.screen]} HAS ONE PANE · A/D SWITCH SCREENS`;
+			this.status = `${MARKET_SCREEN_NAMES[this.screen]} · TAB SWITCHES PANE ON SIGNALS/EVENTS`;
 		} else if (this.screen === MARKET_SCREEN.signals && this.signalsFocus === "story" && !this.displayedMarketCanvas() && isViewportNavigationInput(data)) {
 			this.status = "MARKET STORY HAS NO CANVAS YET · J BRIEF · K WHY";
 		} else if (this.screen === MARKET_SCREEN.events && this.eventsFocus === "briefing" && !this.displayedEventCanvas() && isViewportNavigationInput(data)) {
@@ -5583,19 +5907,19 @@ class MarketHub {
 				return;
 			}
 			const entry = this.entries()[this.selected];
-			if (entry?.type === "quote") this.done({ action: "quote", symbol: entry.quote.symbol, returnState: this.navigationState(), chartScope: this.chartScope });
+			if (entry?.type === "quote") this.done({
+				action: "quote",
+				symbol: entry.quote.symbol,
+				returnState: this.navigationState(),
+				tickerNavigation: this.tickerNavigation(),
+				chartScope: this.chartScope,
+			});
 			else if (entry?.type === "headline") this.research(headlineBriefQuestion(entry.headline.title), headlineResearchIdentity(entry.headline, "brief"));
 			else if (entry?.type === "event") this.research(entry.lane.briefQuestion, eventResearchIdentity(entry.lane, "brief"));
 			else this.research(PRECACHE_MARKET_STORY_QUESTION, marketStoryIdentity("brief"));
 		} else if (data === "?") {
-			const watchHelp = this.screen === MARKET_SCREEN.market || this.screen === MARKET_SCREEN.movers || this.screen === MARKET_SCREEN.watch ? " · E WATCH" : "";
-			const cryptoHelp = this.screen === MARKET_SCREEN.market ? " · G CRYPTO" : "";
-			const paneHelp = this.screen === MARKET_SCREEN.signals || this.screen === MARKET_SCREEN.events ? "TAB PANE FOCUS" : "TAB ONE PANE";
-			const verticalHelp = (this.screen === MARKET_SCREEN.signals && this.signalsFocus === "story")
-				|| (this.screen === MARKET_SCREEN.events && this.eventsFocus === "briefing") ? "W/S SCROLL" : "W/S SELECT";
-			this.status = this.researchActions
-				? `A/D SCREENS · ${paneHelp} · ${verticalHelp} · 1–5 SCOPE · [ OLDER · ] NEWER · J BRIEF/OPEN · K WHY · C CANCEL · / SEARCH${cryptoHelp}${watchHelp} · Q QUIT`
-				: `A/D SCREENS · ${paneHelp} · ${verticalHelp} · 1–5 SCOPE · [ OLDER · ] NEWER · J BRIEF/OPEN · K WHY · / SEARCH${cryptoHelp}${watchHelp} · Q QUIT`;
+			this.helpExpanded = !this.helpExpanded;
+			this.status = this.helpExpanded ? "HELP EXPANDED · ? TO COLLAPSE" : "HELP COLLAPSED";
 		} else if (data === "/") {
 			this.searching = true;
 			this.searchQuery = "";
@@ -5635,21 +5959,24 @@ class MarketHub {
 		const body: string[] = [];
 		const footer: string[] = [];
 
-		const headerLeft = `${th.bold(th.fg("accent", " SIGNAL "))} ${th.bold(th.fg("text", "MARKET ARCADE"))} ${th.fg("dim", "PLAYER 1 · Global relay · public/delayed")}`;
+		// Header — one compact row carries the brand mark, the screen tabs, and
+		// the live market-state badge (provenance/freshness signals the user
+		// trusts). The static "PLAYER 1 / MARKET ARCADE" tagline and the double
+		// horizontal rule were dropped to reclaim rows; snapshot status lives
+		// only in the footer now (it was duplicated here before).
 		const usQuote = this.snapshot.quotes.find((q) => MARKET_BOARDS.some((b) => b.symbol === q.symbol && b.group === "US"));
+		let screenTabs = MARKET_SCREEN_NAMES.map((name, index) => index === this.screen ? th.bg("selectedBg", th.bold(th.fg("accent", ` ${name} `))) : th.fg("dim", ` ${name} `)).join(" ");
+		if (totalRows < 22) screenTabs += th.fg("dim", `  CHART ${CHART_SCOPE_CONFIGS[this.chartScope].label} [1–5]`);
+		const headerLead = `${th.bold(th.fg("accent", " SIGNAL "))}${screenTabs}`;
 		if (usQuote) {
 			const sessionMeta = marketStateMeta(usQuote.marketState);
 			const badge = `${th.fg(sessionMeta.tone, `● ${sessionMeta.label}`)} ${th.fg("dim", `DELAYED ${relativeAge(usQuote.updatedAt)}`)}`;
-			const gap = Math.max(1, width - visibleWidth(headerLeft) - visibleWidth(badge));
-			header.push(fit(`${headerLeft}${" ".repeat(gap)}${badge}`));
+			const gap = Math.max(1, width - visibleWidth(headerLead) - visibleWidth(badge));
+			header.push(fit(`${headerLead}${" ".repeat(gap)}${badge}`));
 		} else {
-			header.push(fit(headerLeft));
+			header.push(fit(headerLead));
 		}
-		header.push(fit(th.fg("borderMuted", "─".repeat(width))));
-		let screenTabs = MARKET_SCREEN_NAMES.map((name, index) => index === this.screen ? th.bg("selectedBg", th.bold(th.fg("accent", ` ${name} `))) : th.fg("dim", ` ${name} `)).join(" ");
-		if (totalRows < 22) screenTabs += th.fg("dim", `  CHART ${CHART_SCOPE_CONFIGS[this.chartScope].label} [1–5] · ${this.snapshotStatus()}`);
-		header.push(fit(screenTabs));
-		// Scope selector row
+		// Scope selector row (without the duplicated snapshot status).
 		if (totalRows >= 22) {
 			const scopeRow = SCOPE_LABEL_ORDER.map((scope) => {
 				const cfg = CHART_SCOPE_CONFIGS[scope];
@@ -5658,11 +5985,16 @@ class MarketHub {
 					? th.bg("selectedBg", th.bold(th.fg("accent", ` ${cfg.key}:${cfg.label} `)))
 					: th.fg("dim", ` ${cfg.key}:${cfg.label} `);
 			}).join("");
-			header.push(fit(`${scopeRow}${th.fg("dim", `  ${this.snapshotStatus()}`)}`));
+			header.push(fit(scopeRow));
 		}
 		if (totalRows >= 20) header.push("");
 
-		const bodyRows = Math.max(1, totalRows - header.length - 4);
+		// Footer height is dynamic: the controller is one line by default and
+		// two when help is expanded (or in the cache/search modal states, which
+		// always render their full guidance).
+		const controllerLines = (this.searching || this.cacheDecision || this.helpExpanded) ? 2 : 1;
+		const footerRows = 2 + controllerLines;
+		const bodyRows = Math.max(1, totalRows - header.length - footerRows);
 		if (width < 54) {
 			body.push(fit(th.fg("warning", "Market Map needs at least 54 columns.")));
 		} else {
@@ -5689,11 +6021,14 @@ class MarketHub {
 			searching: this.searching,
 			cache: Boolean(this.cacheDecision),
 			watch: this.screen === MARKET_SCREEN.market || this.screen === MARKET_SCREEN.movers || this.screen === MARKET_SCREEN.watch,
+			archive: this.screen === MARKET_SCREEN.signals,
 			cancel: researchSlotHeld(visibleJob),
 			jLabel: splitPane ? "BRIEF" : "OPEN",
 			horizontalLabel: "SCREEN",
 			verticalLabel: scrolling ? "SCROLL" : "SELECT",
 			tabLabel,
+			cryptoView: this.screen === MARKET_SCREEN.market ? this.marketView : undefined,
+			expanded: this.helpExpanded,
 		});
 
 		const output = composeScreen(header, body, footer, totalRows);
@@ -5806,7 +6141,7 @@ class MarketHub {
 		const fit = (text: string) => truncateToWidth(text, width);
 		const refs = (ids?: string[]) => ids?.length ? ` [${ids.join(",")}]` : " · UNSOURCED";
 		const pushWrapped = (rows: string[], text: string, prefix = "  │ ", tone: "text" | "muted" | "success" | "error" | "accent" = "text") => {
-			const wrapWidth = Math.max(8, width - visibleWidth(prefix));
+			const wrapWidth = Math.max(8, proseWrapWidth(width) - visibleWidth(prefix));
 			for (const [index, line] of plainWrap(text, wrapWidth).entries()) {
 				rows.push(fit(th.fg(tone, `${index === 0 ? prefix : " ".repeat(visibleWidth(prefix))}${line}`)));
 			}
@@ -5939,6 +6274,30 @@ class MarketHub {
 		return result;
 	}
 
+	private storyEmptyState(job: ResearchJob | undefined, active: boolean, th: Theme): string[] {
+		if (active && job) {
+			const phaseLabel = job.phase === "queued" ? "QUEUED" : job.activity.toUpperCase();
+			const queue = activeResearchJobs().length > 1 ? `${researchQueueLabel()} · ` : "";
+			return [
+				th.fg("accent", `${phaseLabel}`),
+				th.fg("muted", `${queue}sourcing and verifying evidence…`),
+				th.fg("dim", "Live discovery blocks appear here · [C] cancel"),
+				"",
+				th.fg("dim", "Expected blocks:"),
+				th.fg("dim", "  ♦ summary  ■ evidence  ◆ interpretation"),
+				th.fg("dim", "  ▲ catalysts  ▼ risks  ⊞ sources"),
+			];
+		}
+		return [
+			th.fg("accent", "NO MARKET BRIEFING YET"),
+			th.fg("muted", "[J] builds a factual market brief"),
+			th.fg("muted", "[K] explains drivers, scenarios, triggers"),
+			"",
+			th.fg("dim", "A briefing verifies headlines against primary"),
+			th.fg("dim", "sources and separates fact from inference."),
+		];
+	}
+
 	private renderSignals(lines: string[], width: number, th: Theme, fit: (text: string) => string, bodyRows: number): void {
 		const canvas = this.displayedMarketCanvas();
 		const marketResearchJob = this.latestJobFor("MARKET", [this.marketResearchKey]);
@@ -5976,7 +6335,7 @@ class MarketHub {
 			} else {
 				this.signalStoryRows = 0;
 				this.signalStoryViewportRows = 0;
-				right.push(th.fg("dim", marketResearchActive ? `${marketResearchJob!.phase === "queued" ? "QUEUED" : marketResearchJob!.activity.toUpperCase()} · discovery blocks appear here · C cancels` : "J = factual market brief · K = causal/scenario analysis"));
+				right.push(...this.storyEmptyState(marketResearchJob, marketResearchActive, th));
 			}
 			lines.push(...twoColumn(left, right, width, bodyRows));
 			return;
@@ -6005,7 +6364,7 @@ class MarketHub {
 		} else {
 			this.signalStoryRows = 0;
 			this.signalStoryViewportRows = 0;
-			compact.push(fit(th.fg("muted", marketResearchActive ? "Briefing research is running; discovery blocks will appear here." : "No briefing yet · J BRIEF · K WHY")));
+			compact.push(...this.storyEmptyState(marketResearchJob, marketResearchActive, th).map(fit));
 		}
 		lines.push(...compact.slice(0, bodyRows));
 	}
@@ -6027,10 +6386,17 @@ class MarketHub {
 			const why = canvasForResearch("MARKET", this.chartScope, eventResearchIdentity(candidate, "why").researchKey);
 			const briefJob = this.latestJobFor("MARKET", [eventResearchIdentity(candidate, "brief").researchKey]);
 			const whyJob = this.latestJobFor("MARKET", [eventResearchIdentity(candidate, "why").researchKey]);
-			const state = (job: ResearchJob | undefined, result: Canvas | undefined) => researchSlotHeld(job)
-				? job!.phase === "queued" ? "QUEUED" : job!.phase === "cancelling" ? "CANCEL" : "RUNNING"
-				: result ? relativeAge(result.updatedAt) : "--";
-			return `BRIEF ${state(briefJob, brief)} · WHY ${state(whyJob, why)}`;
+			// Glyph + tone + text redundancy so readiness is scannable without
+			// relying on color alone: ⟳ in-progress, ● cached, ○ none.
+			const state = (job: ResearchJob | undefined, result: Canvas | undefined): string => {
+				if (researchSlotHeld(job)) {
+					const label = job!.phase === "queued" ? "QUEUED" : job!.phase === "cancelling" ? "CANCEL" : "RUNNING";
+					return th.fg("warning", `⟳ ${label}`);
+				}
+				if (result) return th.fg("success", `● ${relativeAge(result.updatedAt)}`);
+				return th.fg("dim", "○ --");
+			};
+			return `${th.fg("dim", "BRIEF")} ${state(briefJob, brief)}   ${th.fg("dim", "WHY")} ${state(whyJob, why)}`;
 		};
 		const metadata = canvas
 			? `${(canvasIntent(canvas) || "brief").toUpperCase()} · ${canvas.stage?.toUpperCase() || "COMPLETE"} · AS OF ${archiveAsOf(canvas)}`
@@ -6041,7 +6407,7 @@ class MarketHub {
 				const selected = index === this.selected;
 				left.push(`${selected ? th.bg("selectedBg", th.fg("accent", ">")) : " "} ${selected ? th.bold(th.fg("text", candidate.title)) : th.fg("muted", candidate.title)}`);
 				left.push(th.fg("dim", `    ${candidate.rationale}`));
-				left.push(th.fg("dim", `    ${laneStatus(candidate)}`));
+				left.push(`    ${laneStatus(candidate)}`);
 			}
 			const right = [briefingHeading, lane ? th.bold(th.fg("text", lane.title)) : th.fg("muted", "No catalyst lane selected")];
 			if (metadata) right.push(th.fg("dim", metadata));
@@ -6069,7 +6435,7 @@ class MarketHub {
 		const compact: string[] = [fit(laneHeading), fit(th.fg("warning", "NOT A LIVE CALENDAR · J BRIEF · K WHY")), fit(th.fg("dim", paneHint))];
 		for (const [index, candidate] of EVENT_LANES.entries()) {
 			const selected = index === this.selected;
-			compact.push(fit(`${selected ? th.bg("selectedBg", th.fg("accent", ">")) : " "} ${selected ? th.bold(th.fg("text", candidate.shortLabel)) : th.fg("muted", candidate.shortLabel)}  ${th.fg("dim", laneStatus(candidate))}`));
+			compact.push(fit(`${selected ? th.bg("selectedBg", th.fg("accent", ">")) : " "} ${selected ? th.bold(th.fg("text", candidate.shortLabel)) : th.fg("muted", candidate.shortLabel)}  ${laneStatus(candidate)}`));
 			if (selected) compact.push(fit(th.fg("dim", `  ${candidate.rationale}`)));
 		}
 		compact.push("", fit(briefingHeading), fit(lane ? th.bold(th.fg("text", lane.title)) : th.fg("muted", "No lane selected")));
@@ -6087,17 +6453,25 @@ class MarketHub {
 
 	private renderMovers(lines: string[], width: number, th: Theme, fit: (text: string) => string, bodyRows: number): void {
 		const movers = this.snapshot.movers;
-		const eligible = eligibleMoverQuotes(this.snapshot.quotes).length;
 		const shownScope = CHART_SCOPE_CONFIGS[this.snapshot.chartScope].label;
 		const scopeState = this.loading && this.snapshot.chartScope !== this.chartScope
 			? `SHOWING ${shownScope} · SYNCING ${CHART_SCOPE_CONFIGS[this.chartScope].label}`
 			: `${shownScope} · ${recencyLabel(this.snapshot.updatedAt)}`;
-		const heading = th.bold(th.fg("accent", `AUTO MOVERS · TOP ${movers.length}/${MOVER_LIMIT} · ELIGIBLE ${eligible}/${MOVER_UNIVERSE.length} · ${scopeState}`));
-		const method = th.fg("dim", "LIQUID US UNIVERSE · 65% |MOVE| + 35% $VOLUME · R REFRESH");
+		// Keep the ranking method visible — it is a finance-trust signal — but
+		// fold it into one responsive title row instead of spending a second row
+		// above the list.
+		const listWidth = width >= 84
+			? Math.max(32, Math.floor((width - visibleWidth(" │ ")) * 0.59))
+			: width;
+		const title = listWidth >= 62
+			? `AUTO MOVERS · ${movers.length}/${MOVER_LIMIT} · ${scopeState} · 65% MOVE / 35% $VOL`
+			: listWidth >= 45
+				? `MOVERS ${movers.length}/${MOVER_LIMIT} · ${scopeState} · M65/V35`
+				: `MOVERS ${movers.length} · ${scopeState}`;
+		const heading = th.bold(th.fg("accent", title));
 		if (movers.length === 0) {
 			lines.push(...stretchBlocks([[
 				fit(heading),
-				fit(method),
 				"",
 				fit(th.fg("muted", this.loading ? "Syncing delayed quotes…" : "No eligible movers available. Press R to retry.")),
 			]], bodyRows, th.fg("borderMuted", "  │"), 0));
@@ -6123,7 +6497,7 @@ class MarketHub {
 			const reserveStatus = movers.length > Math.max(1, bodyRows - 3) ? 1 : 0;
 			const capacity = Math.max(1, bodyRows - 3 - reserveStatus);
 			const window = selectionWindow(movers, this.selected, capacity);
-			const left = [heading, method, "", ...window.items.map((mover, offset) => moverRow(mover, window.start + offset))];
+			const left = [heading, "", ...window.items.map((mover, offset) => moverRow(mover, window.start + offset))];
 			if (window.items.length < movers.length) left.push(th.fg("dim", `MOVERS ${window.start + 1}–${window.start + window.items.length} / ${movers.length}`));
 			const right = [th.bold(th.fg("accent", "SELECTED MOVER")), selectedSummary, selectedMetrics, ""];
 			right.push(...chartLines(selectedQuote.points, Math.floor(width * 0.39), (text) => th.fg(chartTone, text), (text) => th.fg("dim", text), selectedQuote.chartScope === "day" ? selectedQuote.previousClose : undefined, Math.max(2, Math.min(18, bodyRows - right.length - 2)), selectedQuote.pointTimes, selectedQuote.pointSessions, selectedQuote.timezone, selectedQuote.interval, (value) => dollars(value, selectedQuote.currency), undefined, undefined, selectedQuote.chartScope));
@@ -6133,7 +6507,7 @@ class MarketHub {
 
 		const capacity = bodyRows >= 18 ? Math.min(MOVER_LIMIT, Math.max(3, Math.floor(bodyRows * 0.42))) : Math.max(2, bodyRows - 7);
 		const window = selectionWindow(movers, this.selected, capacity);
-		const listBlock = [fit(heading), fit(method), ...window.items.map((mover, offset) => fit(moverRow(mover, window.start + offset)))];
+		const listBlock = [fit(heading), ...window.items.map((mover, offset) => fit(moverRow(mover, window.start + offset)))];
 		if (window.items.length < movers.length) listBlock.push(fit(th.fg("dim", `MOVERS ${window.start + 1}–${window.start + window.items.length} / ${movers.length}`)));
 		const detailBlock = [fit(selectedSummary), fit(selectedMetrics)];
 		if (bodyRows >= 18) {
@@ -6163,6 +6537,15 @@ class MarketHub {
 			} : undefined,
 			selectedIndex: this.selected,
 			selectedByScreen: [...this.selectedByScreen],
+			layout: this.layoutMetrics ? {
+				headerRows: this.layoutMetrics.headerRows,
+				footerRows: this.layoutMetrics.footerRows,
+				width: this.layoutMetrics.width,
+				totalRows: this.layoutMetrics.totalRows,
+				splitPane: (this.screen === MARKET_SCREEN.signals || this.screen === MARKET_SCREEN.events)
+					&& this.layoutMetrics.width >= 84
+					&& this.layoutMetrics.totalRows >= 24,
+			} : undefined,
 			selected: entry?.type === "quote" ? entry.quote.symbol : entry?.type === "headline" ? entry.headline.title : entry?.type === "event" ? entry.lane.title : undefined,
 			watched: entry?.type === "quote" ? this.viewWatchlist.includes(entry.quote.symbol) : undefined,
 			available: this.entries().map((item) => item.type === "quote" ? item.quote.symbol : item.type === "headline" ? item.headline.title : item.lane.title),
@@ -6230,6 +6613,17 @@ class MarketHub {
 			lines.push(...stretchBlocks([[fit(heading), "", fit(th.fg("muted", message))]], bodyRows, th.fg("borderMuted", "  │"), 0));
 			return;
 		}
+		const watchRow = (quote: Quote, index: number): string => {
+			const selected = index === this.selected;
+			const direction = (quote.change ?? 0) >= 0 ? "success" : "error";
+			const prefix = selected ? th.bg("selectedBg", th.fg("accent", ">")) : " ";
+			const symbolWidth = width >= 84 ? 8 : 7;
+			const identity = `${prefix} ${directionGlyph(quote.change)} ${th.bold(th.fg("text", quote.symbol.padEnd(symbolWidth)))}`;
+			const quoteFields = `${th.bold(th.fg("text", dollars(quote.price, quote.currency).padStart(9)))} ${th.fg(direction, percent(quote.changePercent).padStart(8))}`;
+			const volume = width >= 72 ? ` ${th.fg("dim", `VOL ${compactNumber(quote.volume).padStart(5)}`)}` : "";
+			const name = width >= 100 ? ` ${th.fg("muted", truncateToWidth(quote.name, 16))}` : "";
+			return `${identity} ${quoteFields}${volume}${name}`;
+		};
 		if (width >= 84 && terminalRows(this.tui) >= 24) {
 			const reserveStatus = entries.length > Math.max(1, bodyRows - 3) ? 1 : 0;
 			const capacity = Math.max(1, bodyRows - 3 - reserveStatus);
@@ -6238,9 +6632,7 @@ class MarketHub {
 			for (const [offset, entry] of window.items.entries()) {
 				if (entry.type !== "quote") continue;
 				const index = window.start + offset;
-				const selected = index === this.selected;
-				const direction = (entry.quote.change ?? 0) >= 0 ? "success" : "error";
-				left.push(`${selected ? th.bg("selectedBg", th.fg("accent", ">")) : " "} ${directionGlyph(entry.quote.change)} ${th.bold(th.fg("text", entry.quote.symbol.padEnd(9)))} ${th.fg(direction, percent(entry.quote.changePercent).padStart(8))} ${th.fg("dim", entry.quote.name)}`);
+				left.push(watchRow(entry.quote, index));
 			}
 			if (window.items.length < entries.length) left.push(th.fg("dim", `WATCH ${window.start + 1}–${window.start + window.items.length} / ${entries.length}`));
 			const selected = entries[this.selected];
@@ -6261,9 +6653,7 @@ class MarketHub {
 		for (const [offset, entry] of window.items.entries()) {
 			if (entry.type !== "quote") continue;
 			const index = window.start + offset;
-			const selected = index === this.selected;
-			const direction = (entry.quote.change ?? 0) >= 0 ? "success" : "error";
-			listBlock.push(fit(`${selected ? th.bg("selectedBg", th.fg("accent", ">")) : " "} ${directionGlyph(entry.quote.change)} ${th.bold(th.fg("text", entry.quote.symbol.padEnd(9)))} ${th.fg(direction, percent(entry.quote.changePercent).padStart(8))} ${th.fg("dim", entry.quote.name)}`));
+			listBlock.push(fit(watchRow(entry.quote, index)));
 		}
 		if (window.items.length < entries.length) listBlock.push(fit(th.fg("dim", `WATCH ${window.start + 1}–${window.start + window.items.length} / ${entries.length}`)));
 		const blocks: string[][] = [listBlock];
@@ -6632,7 +7022,12 @@ function testScreen(component: UITestComponent, width: number, height?: number):
 	return component.render(Math.max(54, Math.min(160, width)));
 }
 
-function createMarketTestHarness(kind: "market" | "ticker", symbol = "AAPL", background = false): void {
+function createMarketTestHarness(
+	kind: "market" | "ticker",
+	symbol = "AAPL",
+	background = false,
+	tickerNavigation?: TickerNavigation,
+): void {
 	uiTest?.simulation?.dispose();
 	const tui: Tui & { terminal: { rows: number } } = { requestRender: () => {}, terminal: { rows: 35 } };
 	let harness!: {
@@ -6648,7 +7043,21 @@ function createMarketTestHarness(kind: "market" | "ticker", symbol = "AAPL", bac
 	const harnessWatchlist = [...DEFAULT_WATCHLIST];
 	const component = kind === "market"
 		? new MarketHub(tui, TEST_THEME, makeTestSnapshot(undefined, harnessWatchlist), async (scope) => makeTestSnapshot(Date.now(), harnessWatchlist, scope), done, 0, undefined, harnessWatchlist, simulation?.actions)
-		: new MarketTerminal(tui, TEST_THEME, nsymbol, makeTestQuote(nsymbol, 0), async (scope) => makeTestQuote(nsymbol, 0, Date.now(), scope), done, 0, undefined, harnessWatchlist, simulation?.actions);
+		: new MarketTerminal(
+			tui,
+			TEST_THEME,
+			nsymbol,
+			makeTestQuote(nsymbol, 0),
+			async (scope) => makeTestQuote(nsymbol, 0, Date.now(), scope),
+			done,
+			0,
+			undefined,
+			harnessWatchlist,
+			simulation?.actions,
+			undefined,
+			DEFAULT_CHART_SCOPE,
+			tickerNavigation,
+		);
 	harness = { component, tui, symbol: nsymbol, simulation };
 	uiTest = harness;
 	simulation?.attach(component);
@@ -7047,6 +7456,9 @@ async function openMarketPanel(
 	researchActions?: ResearchActions,
 	initialArchivedCanvas?: Canvas,
 	initialScope: ChartScope = DEFAULT_CHART_SCOPE,
+	tickerNavigation?: TickerNavigation,
+	returnState?: MarketHubNavigationState,
+	initialTickerLayout?: TickerLayout,
 ): Promise<TerminalResult | undefined> {
 	let quote: Quote | undefined;
 	let initialError: string | undefined;
@@ -7068,7 +7480,7 @@ async function openMarketPanel(
 	let terminal: MarketTerminal | undefined;
 	const result = await ctx.ui.custom<TerminalResult>((tui, theme, _keybindings, done) => {
 		terminal = new MarketTerminal(
-			tui, theme, symbol, quote, (s, signal) => fetchQuote(symbol, s, signal), done, initialTab, initialLiveCanvas, watchlist, researchActions, initialResearch, scope,
+			tui, theme, symbol, quote, (s, signal) => fetchQuote(symbol, s, signal), done, initialTab, initialLiveCanvas, watchlist, researchActions, initialResearch, scope, tickerNavigation, returnState, initialTickerLayout,
 		);
 		if (initialError) terminal.setStatus(`Initial quote unavailable: ${initialError}`);
 		else if (returnStatus) terminal.setStatus(returnStatus);
@@ -8456,6 +8868,11 @@ export default function (pi: ExtensionAPI) {
 			scenario: Type.Optional(StringEnum(["overflow", "citation_reset", "rediscovery"] as const)),
 			button: Type.Optional(StringEnum(["dpad_left", "dpad_right", "dpad_up", "dpad_down", "button_j", "button_k", "button_e", "button_c", "button_r", "button_q", "button_b", "button_g", "focus_next", "history_older", "history_newer", "page_up", "page_down", "scope_day", "scope_week", "scope_month", "scope_year", "scope_max"] as const)),
 			symbol: Type.Optional(Type.String({ description: "Ticker fixture for open_ticker, defaults to AAPL" })),
+			ticker_navigation: Type.Optional(Type.Object({
+				source: StringEnum(["movers", "watch"] as const),
+				symbols: Type.Array(Type.String({ maxLength: 32 }), { minItems: 1, maxItems: 100 }),
+				index: Type.Optional(Type.Integer({ minimum: 0, maximum: 99 })),
+			}, { description: "Optional MOVERS/WATCH list context for ticker-cycle regression testing." })),
 			background: Type.Optional(Type.Boolean({ description: "For open_market/open_ticker, enable deterministic in-place background research simulation" })),
 			width: Type.Optional(Type.Integer({ minimum: 54, maximum: 160, description: "Virtual terminal width, defaults to 120" })),
 			height: Type.Optional(Type.Integer({ minimum: 18, maximum: 80, description: "Virtual terminal height, defaults to 35" })),
@@ -8477,7 +8894,27 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 			if (params.action === "open_market") createMarketTestHarness("market", "AAPL", Boolean(params.background));
-			if (params.action === "open_ticker") createMarketTestHarness("ticker", params.symbol || "AAPL", Boolean(params.background));
+			if (params.action === "open_ticker") {
+				const rawNavigation = params.ticker_navigation;
+				const symbols = rawNavigation
+					? [...new Set(rawNavigation.symbols
+						.map((symbol: string) => normalizeSymbol(symbol))
+						.filter((symbol: string | undefined): symbol is string => Boolean(symbol)))]
+					: [];
+				const tickerNavigation: TickerNavigation | undefined = rawNavigation && symbols.length > 0
+					? {
+						source: rawNavigation.source,
+						symbols,
+						index: Math.max(0, Math.min(
+							typeof rawNavigation.index === "number" && Number.isFinite(rawNavigation.index)
+								? Math.floor(rawNavigation.index)
+								: 0,
+							symbols.length - 1,
+						)),
+					}
+					: undefined;
+				createMarketTestHarness("ticker", params.symbol || "AAPL", Boolean(params.background), tickerNavigation);
+			}
 			if (!uiTest) throw new Error("Open a Market Map or ticker fixture before requesting state or pressing a button.");
 			if (params.action === "press") {
 				if (!params.button) throw new Error("button is required for press");
@@ -9194,7 +9631,22 @@ export default function (pi: ExtensionAPI) {
 				const watchHint = watchlist.includes(next.symbol)
 					? `${next.symbol} IS ON WATCH · E REMOVES · B BACK`
 					: `${next.symbol} OPEN · E ADDS TO WATCH · B BACK`;
-				next = await openMarketPanel(ctx, next.symbol, watchHint, next.archivedCanvas ? 1 : 0, actions, next.archivedCanvas, scope);
+				const listHint = tickerNavigationLabel(next.tickerNavigation);
+				const returnStatus = [listHint, watchHint].filter(Boolean).join(" · ");
+				const initialTickerLayout = next.archivedCanvas ? "research" : next.tickerLayout;
+				const initialTab = next.archivedCanvas || initialTickerLayout === "research" ? 1 : 0;
+				next = await openMarketPanel(
+					ctx,
+					next.symbol,
+					returnStatus,
+					initialTab,
+					actions,
+					next.archivedCanvas,
+					scope,
+					next.tickerNavigation,
+					returnState,
+					initialTickerLayout,
+				);
 				continue;
 			}
 			if (next.action === "back") {
@@ -9255,7 +9707,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("market-scout", {
-		description: "Inspect or poll the shadow public-feed event scout: /market-scout [status|sync]",
+		description: "Inspect or poll the event scout and trigger dry run: /market-scout [status|sync]",
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
 			const action = args.trim().toLowerCase() || "status";
 			if (action !== "status" && action !== "sync") {
@@ -9271,12 +9723,13 @@ export default function (pi: ExtensionAPI) {
 				if (action === "sync") {
 					const result = await runMarketScout();
 					ctx.ui.notify([
-						"MARKET EVENT SCOUT · SHADOW ONLY · MODEL DISPATCH OFF",
+						"MARKET EVENT SCOUT · TRIGGER DRY RUN · MODEL DISPATCH OFF",
 						`Polled ${result.polledSources} source(s): ${result.successfulSources} ok · ${result.failedSources} failed`,
 						`Baseline ${result.baselineItems} · new ${result.newItems} · admit-shadow ${result.admitted} · watch ${result.watched} · suppress ${result.suppressed}`,
-						result.decisions.length > 0
-							? result.decisions.slice(0, 4).map((decision) => `${decision.disposition.toUpperCase()} P${decision.priority} · ${decision.symbols.join(",") || decision.target?.lane || "UNRESOLVED"} · ${decision.title}`).join("\n")
-							: "No new actionable observations.",
+						`Dry-run candidates ${result.candidateEvaluated} · would trigger ${result.wouldTrigger} · gated ${result.gated}`,
+						result.triggerCandidates.length > 0
+							? result.triggerCandidates.slice(0, 4).map(marketEventTriggerCandidateLabel).join("\n")
+							: "No new trigger candidates.",
 					].join("\n"), result.failedSources > 0 ? "warning" : "info");
 					return;
 				}
@@ -9298,11 +9751,24 @@ export default function (pi: ExtensionAPI) {
 				const recent = state.decisions.slice(0, 5).map((decision) =>
 					`${decision.disposition.toUpperCase()} P${decision.priority} · ${decision.symbols.join(",") || decision.target?.lane || "UNRESOLVED"} · ${decision.title}`,
 				);
+				const policy = state.triggerDryRun.policy;
+				const todayKey = new Date().toISOString().slice(0, 10);
+				const today = state.triggerDryRun.days.find((entry) => entry.day === todayKey)?.aggregate;
+				const routes = today?.routes;
+				const associations = today?.associations;
+				const gates = today?.gates;
+				const recentCandidates = state.triggerDryRun.candidates.slice(0, 5).map(marketEventTriggerCandidateLabel);
 				ctx.ui.notify([
-					`MARKET EVENT SCOUT · SHADOW ONLY · scheduler ${enabledLabel} · transport ${transportLabel}`,
-					marketScoutLastError ? `Last runtime error: ${marketScoutLastError}` : "Model dispatch: off; token reservation: off.",
+					`MARKET EVENT SCOUT · TRIGGER DRY RUN · scheduler ${enabledLabel} · transport ${transportLabel}`,
+					marketScoutLastError ? `Last runtime error: ${marketScoutLastError}` : "Model dispatch: off; token reservation: off; canvas mutation: off.",
+					`Simulation policy v${policy.version}: min P${policy.minPriority} · TTL ${Math.round(policy.ttlMs / 60_000)}m · target cooldown ${Math.round(policy.targetCooldownMs / 60_000)}m · daily cap ${policy.dailyCap}`,
+					`UTC ${todayKey}: candidates ${today?.evaluated ?? 0} · mapped ${today?.mapped ?? 0} · would trigger ${today?.wouldTrigger ?? 0} · gated ${today?.gated ?? 0}`,
+					`Routes TICKER/EVENT/STORY/UNMAPPED ${routes?.tickerBrief ?? 0}/${routes?.macroEventBrief ?? 0}/${routes?.marketStoryBrief ?? 0}/${routes?.unsupported ?? 0}`,
+					`Associations STRUCTURED/EXPLICIT/MARKET/UNRESOLVED ${associations?.structuredSymbol ?? 0}/${associations?.explicitSymbol ?? 0}/${associations?.marketWide ?? 0}/${associations?.unresolved ?? 0} · missing publication ${today?.missingPublishedAt ?? 0}`,
+					`Gates NOT-ADMITTED/UNMAPPED/PRIORITY/TTL/COOLDOWN/CAP ${gates?.notAdmitted ?? 0}/${gates?.unsupportedRoute ?? 0}/${gates?.belowPriority ?? 0}/${gates?.expired ?? 0}/${gates?.targetCooldown ?? 0}/${gates?.dailyCap ?? 0}`,
 					...sourceLines,
 					recent.length > 0 ? `Recent observations:\n${recent.join("\n")}` : "Recent observations: none (the first successful poll establishes a baseline).",
+					recentCandidates.length > 0 ? `Recent dry-run candidates:\n${recentCandidates.join("\n")}` : "Recent dry-run candidates: none.",
 				].join("\n"), marketScoutLastError ? "warning" : "info");
 			} catch (error) {
 				ctx.ui.notify(`Market scout unavailable: ${cleanText(error instanceof Error ? error.message : String(error)).slice(0, 220)}`, "error");

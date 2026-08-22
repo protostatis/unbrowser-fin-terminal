@@ -88,23 +88,42 @@ function eventLabelMatchesRow(label: string, row: string): boolean {
   return new RegExp(`^(?:>\\s*)?${firstWord}(?:\\s|$)`).test(row);
 }
 
-function isWideSplitPane(position: TerminalHitPosition): boolean {
-  return Boolean(
+/**
+ * Resolve the active pane geometry. Prefer the live `layout` block the
+ * extension publishes (headerRows/footerRows/width/splitPane), so clicks stay
+ * correct as chrome is reclaimed or the controller collapses. Fall back to the
+ * historical 84×24 / 5-header / 4-footer constants for older servers that do
+ * not emit `layout`.
+ */
+function paneGeometry(
+  state: TerminalFrameState | undefined,
+  position: TerminalHitPosition,
+): { splitPane: boolean; headerRows: number; footerRows: number } {
+  const layout = state?.layout;
+  if (layout && typeof layout.headerRows === "number" && typeof layout.footerRows === "number") {
+    return {
+      splitPane: layout.splitPane === true,
+      headerRows: layout.headerRows,
+      footerRows: layout.footerRows,
+    };
+  }
+  const wide = Boolean(
     position.columns !== undefined &&
       position.columns >= 84 &&
       position.rowCount !== undefined &&
       position.rowCount >= 24,
   );
+  return { splitPane: wide, headerRows: 5, footerRows: 4 };
 }
 
-function inListPane(screen: string, position: TerminalHitPosition): boolean {
-  if (!isWideSplitPane(position) || position.xFraction === undefined) return true;
+function inListPane(screen: string, position: TerminalHitPosition, geometry: { splitPane: boolean }): boolean {
+  if (!geometry.splitPane || position.xFraction === undefined) return true;
   return position.xFraction < (screen === "EVENTS" ? 0.43 : 0.59);
 }
 
-function inDetailPane(screen: string, position: TerminalHitPosition): boolean {
-  if (!isWideSplitPane(position) || position.xFraction === undefined) return true;
-  return !inListPane(screen, position);
+function inDetailPane(screen: string, position: TerminalHitPosition, geometry: { splitPane: boolean }): boolean {
+  if (!geometry.splitPane || position.xFraction === undefined) return true;
+  return !inListPane(screen, position, geometry);
 }
 
 function isScreenSelectorRow(row: string): boolean {
@@ -180,31 +199,32 @@ export function terminalRowHitTarget(
   if (!isUnlockedMarketState(state)) return undefined;
 
   const screen = state.screen.toUpperCase();
+  const geometry = paneGeometry(state, position);
 
   if (screen === "SIGNALS") {
-    if (row.includes("MARKET STORY") && inDetailPane(screen, position)) {
+    if (row.includes("MARKET STORY") && inDetailPane(screen, position, geometry)) {
       return paneTarget(state, "story");
     }
     if (
       (row.includes("HEADLINES") || row.includes("CROSS-TICKER SIGNALS")) &&
-      inListPane(screen, position)
+      inListPane(screen, position, geometry)
     ) {
       return paneTarget(state, "headlines");
     }
   }
   if (screen === "EVENTS") {
-    if (row.includes("CATALYST LANES") && inListPane(screen, position)) {
+    if (row.includes("CATALYST LANES") && inListPane(screen, position, geometry)) {
       return paneTarget(state, "lanes");
     }
     if (
       (row.includes("SELECTED BRIEFING") || row.includes("BRIEFING FOCUS")) &&
-      inDetailPane(screen, position)
+      inDetailPane(screen, position, geometry)
     ) {
       return paneTarget(state, "briefing");
     }
   }
 
-  if (screen === "MARKET" && inListPane(screen, position)) {
+  if (screen === "MARKET" && inListPane(screen, position, geometry)) {
     const selected = normalized(state.selected ?? "");
     const selectedQuoteRow = selected && (row === `> ${selected}` || row.startsWith(`> ${selected} `));
     if (selectedQuoteRow) {
@@ -220,7 +240,7 @@ export function terminalRowHitTarget(
 
   const items = selectableItems(state);
   if (screen === "MOVERS" || screen === "WATCH") {
-    if (!inListPane(screen, position)) return undefined;
+    if (!inListPane(screen, position, geometry)) return undefined;
     if (!quoteListRow(screen, row)) return undefined;
     const item = items.find((candidate) => row.includes(normalized(candidate.label)));
     if (!item) return undefined;
@@ -237,7 +257,7 @@ export function terminalRowHitTarget(
   }
 
   if (screen === "SIGNALS" || screen === "EVENTS") {
-    if (!inListPane(screen, position)) return undefined;
+    if (!inListPane(screen, position, geometry)) return undefined;
     const item = items.find((candidate) =>
       screen === "EVENTS"
         ? eventLabelMatchesRow(normalized(candidate.label), row)
@@ -276,7 +296,11 @@ export function terminalPaneAtPosition(
   xFraction: number,
 ): TerminalPane | undefined {
   if (!isUnlockedMarketState(state) || columns === undefined) return undefined;
-  if (columns < 84 || rowCount < 24 || rowIndex < 5 || rowIndex >= rowCount - 4) {
+  // Pane-body click-to-focus must exclude the header and footer. Read the live
+  // geometry from state when available; otherwise fall back to the historical
+  // 5-header / 4-footer / 84×24 constants.
+  const geometry = paneGeometry(state, { columns, rowCount });
+  if (!geometry.splitPane || rowIndex < geometry.headerRows || rowIndex >= rowCount - geometry.footerRows) {
     return undefined;
   }
 

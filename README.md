@@ -44,7 +44,7 @@ Then use:
 /market                 Open the Market Map
 /market AAPL            Open a ticker panel
 /market-history AAPL    Browse archived research
-/market-scout status    Inspect shadow event-source health and decisions
+/market-scout status    Inspect event health and no-dispatch trigger evidence
 /market-scout sync      Poll event sources that are currently due
 /market-debug market    Open deterministic debug fixtures
 ```
@@ -240,7 +240,7 @@ the singleton session and preserves its current state.
 |---|---|
 | `1`–`5` | Change chart scope (DAY / WEEK / MONTH / YEAR / TOTAL) |
 | `←` / `→` or `A` / `D` | Switch top-level screens or ticker tabs |
-| `↑` / `↓` or `W` / `S` | Select in lists, or scroll the focused research pane |
+| `↑` / `↓` or `W` / `S` | Select in lists; in a Quote opened from MOVERS or WATCH, cycle that source list; otherwise scroll the focused research pane |
 | `Tab` | Switch pane focus in SIGNALS and EVENTS. In terminal keyboard mode it stays in the app instead of tabbing through browser controls. |
 | `Enter` (or `J`) | Primary action: open a ticker, or build a source-verified factual BRIEF |
 | `K` | Secondary WHY analysis with causal channels, scenarios, and disconfirming evidence |
@@ -249,6 +249,12 @@ the singleton session and preserves its current state.
 | `C` | Cancel research for the currently selected lane, headline, or ticker context |
 | `B` / `Esc` | Return from a ticker to the Market Map |
 | `Q` | Close the UI without cancelling research |
+
+When a ticker is opened from MOVERS or WATCH, its source order is retained for
+that detail session. Press `A` to enter Quote, then `W` / `↑` for the previous
+ticker or `S` / `↓` for the next; the list wraps at either end. Research and
+wide Split keep those keys for their reading/scroll behavior, so the control
+does not change while a canvas loads.
 
 ## Movers and watchlists
 
@@ -313,9 +319,14 @@ High-confidence items are labeled `admit-shadow`; ambiguous items are retained
 as `watch`; unsupported or stale items are counted as `suppress` but not stored
 in the recent-decision list.
 
-This is intentionally observation-only. It never starts agent research, reserves
-tokens, writes research canvases, or scrapes unattended search-result pages.
-Use `/market-scout status` to inspect source health and recent decisions, and
+This is intentionally observation-only. Every new non-suppressed decision is
+also mapped into an immutable dry-run BRIEF candidate for a ticker, the macro
+EVENT lane, or SIGNALS/Market Story. A fixed simulation policy records whether
+the candidate would trigger or would be gated by disposition, route coverage,
+priority, freshness, target cooldown, or daily volume. It never starts agent
+research, reserves tokens, writes research canvases, or scrapes unattended
+search-result pages. Use `/market-scout status` to inspect source health,
+candidate volume, route coverage, and gate pressure, and
 `/market-scout sync` to poll only sources whose configured interval is due. The
 bounded atomic journal is
 `$MARKET_DATA_DIR/market-event-scout.json` (or `.pi/market-event-scout.json`).
