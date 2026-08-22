@@ -145,8 +145,12 @@ type RankedMover = {
 	dollarVolume: number;
 	/** Which session the $VOL leg measured: "pre" | "post" | "regular". */
 	volumeSource: "pre" | "post" | "regular";
-	/** True when the volume leg fell back to the regular-session figure as a liquidity proxy. */
+	/** True when the volume leg fell back to a different session as a liquidity proxy. */
 	volumeProxied: boolean;
+	/** Volume basis chosen for the whole snapshot: "live" or "proxy". */
+	volumeBasis: MoverVolumeBasis;
+	/** True when no candidate had usable volume — the score is movement-only. */
+	moveOnly: boolean;
 };
 
 type TechnicalSignal = "bullish" | "neutral" | "bearish";
@@ -803,38 +807,47 @@ function isExtendedSession(marketState: string): boolean {
 	return state.startsWith("PRE") || state.startsWith("POST");
 }
 
+/** Volume basis for an entire mover snapshot:
+ *  - "live"  → each PRE/POST quote ranks on its own extended-session volume;
+ *              quotes whose extended volume is missing rank movement-only ($VOL 0).
+ *  - "proxy" → PRE/POST quotes without extended-session volume rank on the
+ *              regular-session figure, uniformly, always labeled as a proxy.
+ * A snapshot picks ONE basis so a pre-market move is never pitted against a
+ * previous-session proxy inside the same percentile distribution. */
+export type MoverVolumeBasis = "live" | "proxy";
+
 export type MoverVolumeResolution = {
 	/** Shares used for the $VOL leg of the mover score. */
 	volume: number;
-	/** Which session the volume actually measures. */
+	/** Which session the volume figure actually measures. */
 	session: "pre" | "post" | "regular";
-	/** True when the extended-session volume was unavailable and the regular-session volume stands in as a liquidity proxy. */
+	/** True when the volume leg fell back to a different session than the one the quote trades in. */
 	proxied: boolean;
 };
 
 /**
  * Session-aware volume for mover scoring.
  *
- * - PRE → prefer live pre-market volume; fall back to regular-session volume as
- *   a liquidity proxy when Yahoo's chart meta ships no pre-market volume.
+ * - PRE → prefer live pre-market volume; under the "proxy" basis, fall back to
+ *   the regular-session volume (proxy signal) when Yahoo ships no pre-market
+ *   volume. Under the "live" basis, a missing pre-market volume resolves to 0
+ *   so the quote ranks movement-first instead of inheriting a foreign figure.
  * - POST → same, preferring post-market volume.
  * - regular → the regular-session volume, unchanged from the legacy formula.
- * - Extended sessions with no volume fields at all resolve to 0, so the quote
- *   can still rank by its (pre/post-correct) move alone.
  */
-export function moverVolume(quote: Quote): MoverVolumeResolution {
+export function moverVolume(quote: Quote, basis: MoverVolumeBasis = "proxy"): MoverVolumeResolution {
 	const state = (quote.marketState || "").toUpperCase();
 	const regular = positiveFinite(quote.volume);
 	if (state.startsWith("PRE")) {
 		const pre = positiveFinite(quote.preMarketVolume);
 		if (pre !== null) return { volume: pre, session: "pre", proxied: false };
-		if (regular !== null) return { volume: regular, session: "pre", proxied: true };
+		if (basis === "proxy" && regular !== null) return { volume: regular, session: "regular", proxied: true };
 		return { volume: 0, session: "pre", proxied: false };
 	}
 	if (state.startsWith("POST")) {
 		const post = positiveFinite(quote.postMarketVolume);
 		if (post !== null) return { volume: post, session: "post", proxied: false };
-		if (regular !== null) return { volume: regular, session: "post", proxied: true };
+		if (basis === "proxy" && regular !== null) return { volume: regular, session: "regular", proxied: true };
 		return { volume: 0, session: "post", proxied: false };
 	}
 	return { volume: regular ?? 0, session: "regular", proxied: false };
@@ -850,12 +863,30 @@ export function moverEligible(marketState: string, volume: number | null): boole
 	return positiveFinite(volume) !== null;
 }
 
-/** Short, honest volume-leg label for a mover row: "VOL 4.2M", "VOL PM 1.2M", "VOL~ 8.1M". */
-export function moverVolumeRowLabel(quote: Quote): string {
-	const resolution = moverVolume(quote);
-	const sessionLabel = resolution.session === "pre" ? "PM " : resolution.session === "post" ? "AF " : "";
+/** Compact volume always ≤ 5 chars ("1.2M", "988K", "45M", "900"), offsets the
+ *  session tag so the row label stays inside the fixed 11-char field. */
+export function compactMoverVolume(volume: number): string {
+	if (volume >= 1_000_000) {
+		const millions = volume / 1_000_000;
+		return `${millions >= 100 ? String(Math.round(millions)) : String(Math.round(millions * 10) / 10)}M`;
+	}
+	if (volume >= 1_000) {
+		const thousands = volume / 1_000;
+		return `${thousands >= 100 ? String(Math.round(thousands)) : String(Math.round(thousands * 10) / 10)}K`;
+	}
+	return String(Math.round(volume));
+}
+
+/** Short, honest volume-leg label for a mover row.
+ *  Live extended-session volume: "VOL PM 1.2M" / "VOL AF 988K".
+ *  Proxied (regular-session figure): "VOL 8.1M~" — always marked, never dressed as extended volume.
+ *  Movement-only (no usable volume): "VOL --". */
+export function moverVolumeRowLabel(quote: Quote, basis: MoverVolumeBasis = "proxy"): string {
+	const resolution = moverVolume(quote, basis);
+	if (resolution.volume <= 0) return "VOL --";
+	const sessionLabel = resolution.proxied ? "" : resolution.session === "pre" ? "PM " : resolution.session === "post" ? "AF " : "";
 	const proxyMark = resolution.proxied ? "~" : "";
-	return `VOL ${sessionLabel}${compactNumber(resolution.volume)}${proxyMark}`;
+	return `VOL ${sessionLabel}${compactMoverVolume(resolution.volume)}${proxyMark}`;
 }
 
 export function eligibleMoverQuotes(quotes: Quote[]): Quote[] {
@@ -872,23 +903,48 @@ export function eligibleMoverQuotes(quotes: Quote[]): Quote[] {
 
 export function rankMovers(quotes: Quote[], limit = MOVER_LIMIT): RankedMover[] {
 	const candidates = eligibleMoverQuotes(quotes);
-	const withVolume = candidates.map((quote) => ({ quote, volume: moverVolume(quote) }));
+	// One basis per snapshot: if ANY candidate carries a live extended-session
+	// volume figure, everyone else in an extended session ranks movement-first
+	// rather than inheriting a regular-session proxy into a mixed distribution.
+	// When NO candidate has live extended volume, extended quotes uniformly use
+	// the regular-session figure as a labeled liquidity proxy.
+	const hasLiveExtendedVolume = candidates.some(
+		(quote) => (quote.marketState || "").toUpperCase().startsWith("PRE")
+			? positiveFinite(quote.preMarketVolume) !== null
+			: (quote.marketState || "").toUpperCase().startsWith("POST")
+				? positiveFinite(quote.postMarketVolume) !== null
+				: false,
+	);
+	const basis: MoverVolumeBasis = hasLiveExtendedVolume ? "live" : "proxy";
+	const withVolume = candidates.map((quote) => ({ quote, volume: moverVolume(quote, basis) }));
 	const movements = withVolume.map((entry) => Math.abs(entry.quote.changePercent!));
 	const dollarVolumes = withVolume.map((entry) => entry.quote.price * entry.volume.volume);
+	// When no candidate has any usable volume (e.g. a pre-market move with no
+	// extended volume anywhere), the $VOL leg is meaningless; flag the snapshot
+	// as move-only so the UI stops implying 65/35 liquidity scoring.
+	const moveOnly = dollarVolumes.every((dollarVolume) => dollarVolume <= 0);
 	return withVolume
 		.map(({ quote, volume }): RankedMover => {
 			const movement = Math.abs(quote.changePercent!);
 			const dollarVolume = quote.price * volume.volume;
 			const movementPercentile = percentileScore(movements, movement);
-			const volumePercentile = percentileScore(dollarVolumes, dollarVolume);
+			const volumePercentile = moveOnly
+				? 0
+				: percentileScore(dollarVolumes, dollarVolume);
+			// Move-only snapshots score purely on movement; otherwise 65/35.
+			const score = moveOnly
+				? movementPercentile
+				: movementPercentile * MOVER_MOVEMENT_WEIGHT + volumePercentile * MOVER_VOLUME_WEIGHT;
 			return {
 				quote,
-				score: movementPercentile * MOVER_MOVEMENT_WEIGHT + volumePercentile * MOVER_VOLUME_WEIGHT,
+				score,
 				movementPercentile,
 				volumePercentile,
 				dollarVolume,
 				volumeSource: volume.session,
 				volumeProxied: volume.proxied,
+				volumeBasis: basis,
+				moveOnly,
 			};
 		})
 		.sort((a, b) => b.score - a.score
@@ -1794,31 +1850,37 @@ function renderArcadeController(lines: string[], width: number, th: Theme, fit: 
 	lines.push(fit(th.fg(opts.cancel ? "warning" : "dim", parts.join(sep))));
 }
 
-async function fetchQuote(symbol: string, scope: ChartScope = DEFAULT_CHART_SCOPE, signal?: AbortSignal): Promise<Quote> {
-	const cfg = CHART_SCOPE_CONFIGS[scope];
-	const url = new URL(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}`);
-	url.searchParams.set("range", cfg.yahooRange);
-	url.searchParams.set("interval", cfg.yahooInterval);
-	url.searchParams.set("includePrePost", String(cfg.includePrePost));
+/**
+ * Pure parser for a Yahoo chart v8 response → Quote.
+ *
+ * The chart API does not reliably ship meta.marketState / preMarketPrice /
+ * postMarketPrice (verified against the live endpoint: the current meta carries
+ * neither). The session is therefore DERIVED from the chart's own bars: each
+ * bar is tagged pre/regular/post against currentTradingPeriod, and the last
+ * bar determines the live session (REGULAR/PRE/POST). The extended price is the
+ * last close in that session's bars (the chart includes pre/post bars when
+ * includePrePost=true). meta.marketState, when present, still wins — some
+ * deployments/response variants return it.
+ */
+function normalizeMarketState(raw: string): string {
+	const upper = raw.toUpperCase().replace("PREPRE", "PRE").replace("POSTPOST", "POST");
+	if (upper === "PRE" || upper === "POST" || upper === "REGULAR" || upper === "CLOSED") return upper;
+	return "UNKNOWN";
+}
 
-	const response = await fetch(url, {
-		headers: { accept: "application/json", "user-agent": "signal-terminal-mvp/0.1" },
-		signal,
-	});
-	if (!response.ok) throw new Error(`quote request returned HTTP ${response.status}`);
-
-	const payload = (await response.json()) as {
-		chart?: { result?: Array<{
-			meta?: Record<string, unknown>;
-			timestamp?: Array<number | null>;
-			indicators?: { quote?: Array<{ close?: Array<number | null> }> };
-		}> };
-	};
-	const chart = payload.chart?.result?.[0];
+export function parseChartPayloadToQuote(
+	symbol: string,
+	payload: unknown,
+	cfg: { yahooInterval: string; includePrePost: boolean; chartScope: ChartScope },
+): Quote {
+	const chart = (payload as {
+		chart?: { result?: Array<{ meta?: Record<string, unknown>; timestamp?: Array<number | null>; indicators?: { quote?: Array<{ close?: Array<number | null>; volume?: Array<number | null> }> } }> };
+	})?.chart?.result?.[0];
 	const meta = chart?.meta;
 	if (!chart || !meta) throw new Error("quote response contained no chart data");
 
 	const rawCloses = chart.indicators?.quote?.[0]?.close ?? [];
+	const rawVolumes = chart.indicators?.quote?.[0]?.volume ?? [];
 	const rawTimes = chart.timestamp ?? [];
 	const validCloses = rawCloses.filter((value): value is number => typeof value === "number" && Number.isFinite(value));
 	const tradingPeriods = meta.currentTradingPeriod && typeof meta.currentTradingPeriod === "object"
@@ -1844,6 +1906,7 @@ async function fetchQuote(symbol: string, scope: ChartScope = DEFAULT_CHART_SCOP
 	const alignedPoints: number[] = [];
 	const alignedTimes: number[] = [];
 	const alignedSessions: ChartSession[] = [];
+	const alignedVolumes: number[] = [];
 	for (let index = 0; index < rawCloses.length; index++) {
 		const close = rawCloses[index];
 		const timestamp = rawTimes[index];
@@ -1851,24 +1914,56 @@ async function fetchQuote(symbol: string, scope: ChartScope = DEFAULT_CHART_SCOP
 		alignedPoints.push(close);
 		alignedTimes.push(timestamp * 1000);
 		alignedSessions.push(sessionAt(timestamp));
+		const volume = rawVolumes[index];
+		alignedVolumes.push(typeof volume === "number" && Number.isFinite(volume) ? volume : 0);
 	}
 	const hasTimedSeries = alignedPoints.length >= 2;
 	const closes = hasTimedSeries ? alignedPoints : validCloses;
 	const pointTimes = hasTimedSeries ? alignedTimes : [];
 	const pointSessions = hasTimedSeries ? alignedSessions : [];
 	const number = (key: string): number | null => (typeof meta[key] === "number" ? (meta[key] as number) : null);
-	const marketState = typeof meta.marketState === "string" ? meta.marketState.toUpperCase() : "UNKNOWN";
-	const extendedPrice = marketState.startsWith("POST")
-		? number("postMarketPrice")
-		: marketState.startsWith("PRE") ? number("preMarketPrice") : null;
+	const metaState = typeof meta.marketState === "string" ? normalizeMarketState(meta.marketState) : "UNKNOWN";
+	// Derive the session from the last tagged bar: includePrePost=true carries
+	// pre/post bars, so the last bar tells us which session is live without
+	// trusting meta keys that the current endpoint omits. A single valid bar
+	// (e.g. the first data point of an early pre-market refresh) is enough.
+	const lastSession = alignedPoints.length > 0 ? alignedSessions.at(-1) : undefined;
+	const derivedState = lastSession === "pre" ? "PRE" : lastSession === "post" ? "POST" : lastSession === "regular" ? "REGULAR" : "CLOSED";
+	const marketState = metaState !== "UNKNOWN" ? metaState : derivedState;
+	// Last close of the active session — the live price including pre/post bars.
+	const lastSessionClose = alignedPoints.length > 0 ? alignedPoints.at(-1) : undefined;
+	const extendedPrice = marketState === "POST"
+		? number("postMarketPrice") ?? (lastSession === "post" ? lastSessionClose : null) ?? null
+		: marketState === "PRE" ? number("preMarketPrice") ?? (lastSession === "pre" ? lastSessionClose : null) ?? null : null;
 	const price = extendedPrice ?? number("regularMarketPrice") ?? closes.at(-1);
 	if (price === undefined || price === null) throw new Error("quote response contained no market price");
 	const previousClose = number("previousClose") ?? number("chartPreviousClose");
 	const change = previousClose === null ? null : price - previousClose;
-	const extendedTime = marketState.startsWith("POST")
+	// Pre/post volume is not part of the public chart meta; the bars also tag it
+	// null there. Opportunistic capture keeps the mover volume leg honest when a
+	// future/alternate feed does ship it. Volumes are aligned with sessions at
+	// build time, so skipped invalid bars cannot misalign the sum.
+	const extendedTime = marketState === "POST"
 		? number("postMarketTime")
-		: marketState.startsWith("PRE") ? number("preMarketTime") : null;
-	const updatedAtSeconds = extendedTime ?? number("regularMarketTime");
+		: marketState === "PRE" ? number("preMarketTime") : null;
+	const lastBarTimestampMs = alignedTimes.length > 0 ? alignedTimes.at(-1) ?? null : null;
+	const regularTimeMs = number("regularMarketTime") !== null ? number("regularMarketTime")! * 1000 : null;
+	// During extended sessions prefer the latest pre/post bar time over the
+	// (stale) regular-session timestamp; otherwise prefer meta.
+	const updatedAtMs = extendedTime !== null ? extendedTime * 1000
+		: marketState === "PRE" || marketState === "POST"
+			? lastBarTimestampMs ?? regularTimeMs
+			: regularTimeMs ?? lastBarTimestampMs;
+	const barVolume = (session: ChartSession): number | null => {
+		if (alignedVolumes.length === 0) return null;
+		let sum = 0;
+		for (let index = 0; index < alignedSessions.length; index++) {
+			if (alignedSessions[index] !== session) continue;
+			const volume = alignedVolumes[index]!;
+			if (volume > 0) sum += volume;
+		}
+		return sum > 0 ? sum : null;
+	};
 
 	return {
 		symbol,
@@ -1882,18 +1977,35 @@ async function fetchQuote(symbol: string, scope: ChartScope = DEFAULT_CHART_SCOP
 		dayLow: number("regularMarketDayLow"),
 		dayHigh: number("regularMarketDayHigh"),
 		volume: number("regularMarketVolume"),
-		preMarketVolume: number("preMarketVolume"),
-		postMarketVolume: number("postMarketVolume"),
+		preMarketVolume: number("preMarketVolume") ?? barVolume("pre"),
+		postMarketVolume: number("postMarketVolume") ?? barVolume("post"),
 		marketState,
-		updatedAt: updatedAtSeconds !== null ? updatedAtSeconds * 1000 : pointTimes.at(-1) ?? null,
+		updatedAt: updatedAtMs ?? pointTimes.at(-1) ?? null,
 		points: closes,
 		pointTimes,
 		pointSessions,
 		timezone: typeof meta.exchangeTimezoneName === "string" ? meta.exchangeTimezoneName : "UTC",
 		interval: typeof meta.dataGranularity === "string" ? meta.dataGranularity : cfg.yahooInterval,
 		source: "Yahoo Finance chart API (public/delayed; verify before trading)",
-		chartScope: scope,
+		chartScope: cfg.chartScope,
 	};
+}
+
+async function fetchQuote(symbol: string, scope: ChartScope = DEFAULT_CHART_SCOPE, signal?: AbortSignal): Promise<Quote> {
+	const cfg = CHART_SCOPE_CONFIGS[scope];
+	const url = new URL(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}`);
+	url.searchParams.set("range", cfg.yahooRange);
+	url.searchParams.set("interval", cfg.yahooInterval);
+	url.searchParams.set("includePrePost", String(cfg.includePrePost));
+
+	const response = await fetch(url, {
+		headers: { accept: "application/json", "user-agent": "signal-terminal-mvp/0.1" },
+		signal,
+	});
+	if (!response.ok) throw new Error(`quote request returned HTTP ${response.status}`);
+
+	const payload = await response.json();
+	return parseChartPayloadToQuote(symbol, payload, { ...cfg, chartScope: scope });
 }
 
 export function extractSearchCandidates(samples: Array<{ text?: unknown; href?: unknown }>, limit = 8): {
@@ -6509,16 +6621,38 @@ class MarketHub {
 		const listWidth = width >= 84
 			? Math.max(32, Math.floor((width - visibleWidth(" │ ")) * 0.59))
 			: width;
-		const sessionTag = movers.some((mover) => (mover.quote.marketState || "").toUpperCase().startsWith("PRE"))
-			? "PRE-MKT"
-			: movers.some((mover) => (mover.quote.marketState || "").toUpperCase().startsWith("POST"))
-				? "POST-MKT"
-				: "";
+		// Session tag reflects the DOMINANT session across the snapshot, and shows
+		// MIXED while the market is transitioning (some quotes PRE, some REGULAR).
+		// A true bottom-up feed will report the same marketState for every quote
+		// in a refresh; a transition batch legitimately straddles two.
+		const stateCounts = movers.reduce((counts, mover) => {
+			const state = (mover.quote.marketState || "").toUpperCase();
+			if (state.startsWith("PRE")) counts.pre++;
+			else if (state.startsWith("POST")) counts.post++;
+			else counts.regular++;
+			return counts;
+		}, { pre: 0, post: 0, regular: 0 });
+		const extendedCount = stateCounts.pre + stateCounts.post;
+		let sessionTag = "";
+		if (movers.length > 0) {
+			const dominantExtended = stateCounts.pre >= stateCounts.post ? "PRE-MKT" : "POST-MKT";
+			sessionTag = extendedCount === movers.length
+				? dominantExtended
+				: extendedCount > 0 && extendedCount > stateCounts.regular
+					? dominantExtended
+					: extendedCount > 0 ? "MIXED" : "";
+		}
 		const sessionPrefix = sessionTag ? `${sessionTag} · ` : "";
+		const moveOnly = movers.length > 0 && movers.every((mover) => mover.moveOnly);
+		const scoringNote = moveOnly
+			? "MOVE-ONLY · NO VOL DATA"
+			: movers.some((mover) => mover.volumeProxied)
+				? "65% MOVE / 35% $VOL · VOL~ PROXY"
+				: "65% MOVE / 35% $VOL";
 		const title = listWidth >= 62
-			? `${sessionPrefix}AUTO MOVERS · ${movers.length}/${MOVER_LIMIT} · ${scopeState} · 65% MOVE / 35% $VOL`
+			? `${sessionPrefix}AUTO MOVERS · ${movers.length}/${MOVER_LIMIT} · ${scopeState} · ${scoringNote}`
 			: listWidth >= 45
-				? `${sessionPrefix}MOVERS ${movers.length}/${MOVER_LIMIT} · ${scopeState} · M65/V35`
+				? `${sessionPrefix}MOVERS ${movers.length}/${MOVER_LIMIT} · ${scopeState} · ${moveOnly ? "M-ONLY" : "M65/V35"}`
 				: `${sessionPrefix}MOVERS ${movers.length} · ${scopeState}`;
 		const heading = th.bold(th.fg("accent", title));
 		if (movers.length === 0) {
@@ -6536,14 +6670,26 @@ class MarketHub {
 			const tone = (quote.change ?? 0) >= 0 ? "success" : "error";
 			const watched = this.viewWatchlist.includes(quote.symbol) ? th.fg("accent", " ★") : "";
 			const prefix = selected ? th.bg("selectedBg", th.fg("accent", ">")) : " ";
-			return `${prefix} #${String(index + 1).padStart(2, "0")} ${directionGlyph(quote.change)} ${th.bold(th.fg("text", quote.symbol.padEnd(6)))} ${th.fg(tone, percent(quote.changePercent).padStart(8))} ${th.fg("dim", `${moverVolumeRowLabel(quote).padEnd(11)} · SCORE ${String(Math.round(mover.score * 100)).padStart(3)}`)}${watched}`;
+			return `${prefix} #${String(index + 1).padStart(2, "0")} ${directionGlyph(quote.change)} ${th.bold(th.fg("text", quote.symbol.padEnd(6)))} ${th.fg(tone, percent(quote.changePercent).padStart(8))} ${th.fg("dim", `${moverVolumeRowLabel(quote, mover.volumeBasis).padEnd(11)} · SCORE ${String(Math.round(mover.score * 100)).padStart(3)}`)}${watched}`;
 		};
 		const selectedMover = movers[this.selected] ?? movers[0]!;
 		const selectedQuote = selectedMover.quote;
 		const selectedTone = (selectedQuote.change ?? 0) >= 0 ? "success" : "error";
 		const chartTone = selectedQuote.points.length >= 2 ? selectedQuote.points.at(-1)! >= selectedQuote.points[0]! ? "success" : "error" : selectedTone;
 		const selectedSummary = `${th.bold(th.fg("text", selectedQuote.symbol))} ${th.fg(selectedTone, percent(selectedQuote.changePercent))} ${th.fg("dim", `· RANK SCORE ${Math.round(selectedMover.score * 100)} · ${this.viewWatchlist.includes(selectedQuote.symbol) ? "ON WATCH" : "E ADD TO WATCH"}`)}`;
-		const selectedMetrics = th.fg("dim", `${moverVolumeRowLabel(selectedQuote)} · $Vol ${compactNumber(selectedMover.dollarVolume)}${selectedMover.volumeProxied ? " (reg proxy)" : ""} · Move P${Math.round(selectedMover.movementPercentile * 100)} · Liq P${Math.round(selectedMover.volumePercentile * 100)}`);
+		const liqProvenance = selectedMover.moveOnly
+			? "no vol · MOVE-RANKED"
+			: selectedMover.volumeProxied
+				? "(reg proxy ~)"
+				: selectedMover.volumeSource === "pre"
+					? "(pre vol)"
+					: selectedMover.volumeSource === "post"
+						? "(post vol)"
+						: "";
+		const liqPercent = selectedMover.moveOnly
+			? "Liq n/a"
+			: `Liq P${Math.round(selectedMover.volumePercentile * 100)}`;
+		const selectedMetrics = th.fg("dim", `${moverVolumeRowLabel(selectedQuote, selectedMover.volumeBasis)} · $Vol ${compactNumber(selectedMover.dollarVolume)} · ${liqPercent} · Move P${Math.round(selectedMover.movementPercentile * 100)}${selectedMover.moveOnly ? "" : ` ${liqProvenance}`}`.trim());
 
 		if (width >= 84 && terminalRows(this.tui) >= 24) {
 			const reserveStatus = movers.length > Math.max(1, bodyRows - 3) ? 1 : 0;
@@ -6606,6 +6752,8 @@ class MarketHub {
 				dollarVolume: mover.dollarVolume,
 				volumeSource: mover.volumeSource,
 				volumeProxied: mover.volumeProxied,
+				volumeBasis: mover.volumeBasis,
+				moveOnly: mover.moveOnly,
 			})),
 			storyScroll: this.screen === MARKET_SCREEN.signals ? {
 				offset: this.signalStoryScroll,

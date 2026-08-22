@@ -270,13 +270,22 @@ delayed liquid-universe monitor—not an exchange-wide real-time scanner. Press
 watchlist.
 
 The mover score is session-aware. During pre-market (`PRE`) the move leg already
-uses the pre-market price vs. previous close, and the volume leg prefers live
-pre-market volume when Yahoo ships it, falling back to the regular-session
-volume as a labeled liquidity proxy (`VOL PM 1.2M~`) when it does not. Quotes
-whose extended-session move is real but whose volume has not populated remain
-eligible and rank movement-first, so the pre-market mover list never silently
-goes empty. Rows render a `PRE-MKT`/`POST-MKT` tag in the MOVERS title and mark
-the volume leg's session on each row.
+uses the pre-market price vs. previous close. The session is derived from the
+live quote bars (the public Yahoo chart API omits `marketState`), so this
+behavior only applies on the DAY scope — the only scope that fetches pre/post
+bars. The volume leg picks one basis per snapshot: if any quote has a live
+extended-session volume it uses **live** basis
+(missing extended volume ranks movement-first), otherwise it uses the
+regular-session figure as a labeled liquidity **proxy** across the whole
+snapshot, so a pre-market move is never pitted against a previous-session proxy
+inside the same percentile. Proxied figures are always marked (`VOL 8.1M~`),
+never dressed as extended volume; when no candidate has any usable volume the
+list is flagged move-only (`MOVE-ONLY · NO VOL DATA`). Quotes whose
+extended-session move is real but whose volume has not populated remain eligible
+so the pre-market mover list does not empty solely because extended volume is
+unavailable. Rows render a dominant `PRE-MKT`/`POST-MKT` tag (or `MIXED` during
+session transitions) in the MOVERS title and mark the volume leg's provenance on
+each row.
 
 Changing screens, selections, pane focus, or chart scope does not stop research.
 Each symbol/scope/BRIEF-or-WHY context gets its own job and canvas identity. The
