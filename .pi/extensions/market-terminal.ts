@@ -21,7 +21,9 @@ import {
 import {
 	CryptoPulseCache,
 	fetchCryptoPulse,
+	isCryptoPulseUsable,
 	type CryptoPulseSnapshot,
+	type CryptoScoreboardRow,
 	type FetchLike,
 } from "../../shared/crypto-pulse.js";
 import {
@@ -303,6 +305,8 @@ type MarketHubNavigationState = {
 	chartScope: ChartScope;
 	eventsFocus?: "lanes" | "briefing";
 	eventBriefingScroll?: number;
+	marketView?: "global" | "crypto";
+	cryptoSelected?: number;
 };
 type TickerNavigationSource = "movers" | "watch";
 /** Immutable list context captured when a ticker opens from MOVERS or WATCH. */
@@ -788,6 +792,21 @@ const CRYPTO_PULSE_CACHE = new CryptoPulseCache(60_000);
 let cryptoPulseFetchImpl: FetchLike | undefined;
 export function setCryptoPulseFetchImplForTest(fetchImpl: FetchLike | undefined): void {
 	cryptoPulseFetchImpl = fetchImpl;
+	// Reset the shared snapshot cache so tests never reuse another fixture's data.
+	CRYPTO_PULSE_CACHE.clear();
+}
+
+/** Monotonic request sequence so a superseded refresh can never write stale UI. */
+let cryptoPulseRequestSequence = 0;
+
+/** Env-gated kill switch for the undocumented PanicRadar frontend API. */
+function readPanicRadarEnabled(): boolean {
+	const raw = process.env.MARKET_PANIC_RADAR_ENABLED?.trim();
+	if (raw === undefined) return true;
+	const value = raw.toLowerCase();
+	if (value === "1" || value === "true" || value === "on") return true;
+	if (value === "0" || value === "false" || value === "off") return false;
+	return true;
 }
 
 function percentileScore(values: number[], value: number): number {
@@ -1622,6 +1641,7 @@ function renderArcadeController(lines: string[], width: number, th: Theme, fit: 
 		`[A/D] ${horizontal.toLowerCase()}`,
 		`[W/S] ${vertical.toLowerCase()}`,
 		...(tabMeaningful ? [`[Tab] ${tabHint}`] : []),
+		...(opts.cryptoView ? [`[G] ${opts.cryptoView === "crypto" ? "global" : "crypto"}`] : []),
 		`[J] ${jLabel.toLowerCase()}`,
 		"[K] why",
 		"[Q] quit",
@@ -5246,6 +5266,7 @@ class MarketHub {
 	private cryptoPulseState: "idle" | "loading" | "ready" | "error" = "idle";
 	private cryptoPulseError: string | undefined;
 	private cryptoPulseRequestedAt = 0;
+	private cryptoSelected = 0;
 
 	constructor(
 		private readonly tui: Tui,
@@ -5297,6 +5318,12 @@ class MarketHub {
 			this.eventsFocus = initialNavigation.eventsFocus ?? "lanes";
 			this.eventBriefingScroll = Math.max(0, initialNavigation.eventBriefingScroll ?? 0);
 			this.chartScope = initialNavigation.chartScope ?? DEFAULT_CHART_SCOPE;
+			if (this.screen === MARKET_SCREEN.market && initialNavigation.marketView === "crypto") {
+				this.marketView = "crypto";
+				if (typeof initialNavigation.cryptoSelected === "number" && Number.isFinite(initialNavigation.cryptoSelected)) {
+					this.cryptoSelected = Math.max(0, Math.floor(initialNavigation.cryptoSelected));
+				}
+			}
 			if (initialNavigation.archivedCanvas) {
 				const archivedKey = canvasResearchKey(initialNavigation.archivedCanvas);
 				const history = archivedResearchFor("MARKET", this.chartScope, archivedKey);
@@ -5417,6 +5444,7 @@ class MarketHub {
 			eventsFocus: this.eventsFocus,
 			eventBriefingScroll: this.eventBriefingScroll,
 			chartScope: this.chartScope,
+			...(this.screen === MARKET_SCREEN.market ? { marketView: this.marketView, cryptoSelected: this.cryptoSelected } : {}),
 			...(this.archivedMarketCanvas ? { archivedCanvas: this.archivedMarketCanvas } : {}),
 		};
 	}
@@ -5546,16 +5574,34 @@ class MarketHub {
 		this.selected = this.selectedByScreen[this.screen] ?? 0;
 		this.clampSelection();
 		// The GLOBAL↔CRYPTO toggle is a MARKET-screen subview, not a screen.
-		if (this.screen !== MARKET_SCREEN.market) this.marketView = "global";
+		if (this.screen !== MARKET_SCREEN.market) {
+			this.marketView = "global";
+			this.cryptoSelected = 0;
+		}
 		this.status = `${MARKET_SCREEN_NAMES[this.screen]} · W/S SELECT · A/D SWITCH SCREENS`;
+	}
+
+	/** Visible HOT+COLD rows in render order (all interactive, all openable). */
+	private cryptoRows(): Array<{ section: "hot" | "cold"; row: CryptoScoreboardRow }> {
+		const pulse = this.cryptoPulse;
+		if (!pulse) return [];
+		return [
+			...pulse.hot.map((row) => ({ section: "hot" as const, row })),
+			...pulse.cold.map((row) => ({ section: "cold" as const, row })),
+		];
 	}
 
 	/**
 	 * Load the crypto pulse snapshot through the shared cache (fresh hit, stale
 	 * fallback, or background refresh). Deterministic; no model dispatch.
+	 *
+	 * A refresh that comes back unusable (all providers down) never replaces a
+	 * previously good snapshot and never poisons the shared cache. Supersession
+	 * uses a module-wide monotonic sequence so same-tick and cross-instance
+	 * requests cannot race the UI.
 	 */
 	private async loadCryptoPulse(force = false): Promise<void> {
-		const requestedAt = Date.now();
+		const requestedAt = ++cryptoPulseRequestSequence;
 		this.cryptoPulseRequestedAt = requestedAt;
 		if (!force) {
 			const cached = CRYPTO_PULSE_CACHE.getFresh<CryptoPulseSnapshot>("crypto-pulse");
@@ -5577,15 +5623,29 @@ class MarketHub {
 			this.tui.requestRender();
 		}
 		try {
-			const { snapshot, errors } = await fetchCryptoPulse({ fetchImpl: cryptoPulseFetchImpl ?? fetch }, undefined);
+			const { snapshot, errors } = await fetchCryptoPulse(
+				{ fetchImpl: cryptoPulseFetchImpl ?? fetch, panicRadarEnabled: readPanicRadarEnabled() },
+				undefined,
+			);
 			if (this.cryptoPulseRequestedAt !== requestedAt) return; // superseded
-			this.cryptoPulse = snapshot;
-			CRYPTO_PULSE_CACHE.set("crypto-pulse", snapshot);
-			this.cryptoPulseState = snapshot.mood || snapshot.listings.length > 0 ? "ready" : "error";
+			const usable = isCryptoPulseUsable(snapshot);
+			if (usable) {
+				this.cryptoPulse = snapshot;
+				CRYPTO_PULSE_CACHE.set("crypto-pulse", snapshot);
+			} else if (!this.cryptoPulse) {
+				this.cryptoPulse = snapshot;
+			}
+			this.cryptoPulseState = usable || this.cryptoPulse ? "ready" : "error";
 			this.cryptoPulseError = errors.length > 0 ? errors.join(" · ") : undefined;
+			const partial = usable && errors.length > 0;
+			const retainedPrior = !usable && Boolean(this.cryptoPulse);
 			this.status = this.cryptoPulseState === "error"
 				? `CRYPTO PULSE · UNAVAILABLE · R RETRY · ${this.cryptoPulseError ?? ""}`
-				: "CRYPTO PULSE · G GLOBAL · R SYNC · J OPEN";
+				: retainedPrior
+					? `CRYPTO PULSE · PRIOR DATA RETAINED · ${this.cryptoPulseError ?? "PROVIDER FAILURE"} · R RETRY`
+					: partial
+						? `CRYPTO PULSE · PARTIAL SOURCES · ${this.cryptoPulseError ?? ""} · R SYNC`
+						: "CRYPTO PULSE · G GLOBAL · R SYNC · W/S SELECT · J OPEN";
 			this.tui.requestRender();
 		} catch (error) {
 			if (this.cryptoPulseRequestedAt !== requestedAt) return;
@@ -5600,6 +5660,17 @@ class MarketHub {
 	private selectIndex(index: number): void {
 		this.selected = Math.max(0, Math.min(index, Math.max(0, this.entries().length - 1)));
 		this.selectedByScreen[this.screen] = this.selected;
+	}
+
+	private selectCryptoRow(index: number): void {
+		const rows = this.cryptoRows();
+		if (rows.length === 0) {
+			this.status = "CRYPTO PULSE · NO MOVERS YET · R SYNC";
+			return;
+		}
+		this.cryptoSelected = Math.max(0, Math.min(rows.length - 1, index));
+		const row = rows[this.cryptoSelected]!;
+		this.status = `${row.section === "hot" ? "HOT" : "COLD"} ${row.row.symbol} ${percent(row.row.change24h)} · J OPEN · K WHY · E WATCH`;
 	}
 
 	private snapshotStatus(): string {
@@ -5872,21 +5943,29 @@ class MarketHub {
 		} else if (this.screen === MARKET_SCREEN.events && this.eventsFocus === "briefing" && matchesKey(data, "end")) {
 			if (this.displayedEventCanvas()) this.eventBriefingScroll = Number.MAX_SAFE_INTEGER;
 		} else if (matchesKey(data, "up") || data === "w" || data === "W") {
-			this.selectIndex(this.selected - 1);
-			if (this.screen === MARKET_SCREEN.events) {
-				this.eventBriefingScroll = 0;
-				if (this.archivedMarketCanvas && isEventResearchKey(canvasResearchKey(this.archivedMarketCanvas))) {
-					this.archivedMarketCanvas = undefined;
-					this.archivePosition = undefined;
+			if (this.screen === MARKET_SCREEN.market && this.marketView === "crypto") {
+				this.selectCryptoRow(this.cryptoSelected - 1);
+			} else {
+				this.selectIndex(this.selected - 1);
+				if (this.screen === MARKET_SCREEN.events) {
+					this.eventBriefingScroll = 0;
+					if (this.archivedMarketCanvas && isEventResearchKey(canvasResearchKey(this.archivedMarketCanvas))) {
+						this.archivedMarketCanvas = undefined;
+						this.archivePosition = undefined;
+					}
 				}
 			}
 		} else if (matchesKey(data, "down") || data === "s" || data === "S") {
-			this.selectIndex(this.selected + 1);
-			if (this.screen === MARKET_SCREEN.events) {
-				this.eventBriefingScroll = 0;
-				if (this.archivedMarketCanvas && isEventResearchKey(canvasResearchKey(this.archivedMarketCanvas))) {
-					this.archivedMarketCanvas = undefined;
-					this.archivePosition = undefined;
+			if (this.screen === MARKET_SCREEN.market && this.marketView === "crypto") {
+				this.selectCryptoRow(this.cryptoSelected + 1);
+			} else {
+				this.selectIndex(this.selected + 1);
+				if (this.screen === MARKET_SCREEN.events) {
+					this.eventBriefingScroll = 0;
+					if (this.archivedMarketCanvas && isEventResearchKey(canvasResearchKey(this.archivedMarketCanvas))) {
+						this.archivedMarketCanvas = undefined;
+						this.archivePosition = undefined;
+					}
 				}
 			}
 		} else if (this.screen === MARKET_SCREEN.signals && data === "[") {
@@ -5899,8 +5978,36 @@ class MarketHub {
 		} else if (data === "c" || data === "C") {
 			this.cancelResearch();
 		} else if (data === "k" || data === "K") {
+			if (this.screen === MARKET_SCREEN.market && this.marketView === "crypto") {
+				const row = this.cryptoRows()[this.cryptoSelected];
+				if (row?.row.yahooSymbol) {
+					this.requestResearch({
+						action: "research",
+						symbol: row.row.yahooSymbol,
+						question: tickerWhyQuestion(row.row.yahooSymbol),
+						returnTo: "quote",
+						chartScope: this.chartScope,
+						...tickerResearchIdentity(row.row.yahooSymbol, "why"),
+					});
+					this.tui.requestRender();
+					return;
+				}
+			}
 			this.why();
 		} else if (data === "j" || data === "J" || matchesKey(data, "enter") || matchesKey(data, "space")) {
+			if (this.screen === MARKET_SCREEN.market && this.marketView === "crypto") {
+				const row = this.cryptoRows()[this.cryptoSelected];
+				if (row?.row.yahooSymbol) {
+					this.done({
+						action: "quote",
+						symbol: row.row.yahooSymbol,
+						returnState: this.navigationState(),
+						chartScope: this.chartScope,
+					});
+					this.tui.requestRender();
+					return;
+				}
+			}
 			if (this.screen === MARKET_SCREEN.signals && this.signalsFocus === "story") {
 				this.research(PRECACHE_MARKET_STORY_QUESTION, marketStoryIdentity("brief"));
 				this.tui.requestRender();
@@ -5924,6 +6031,22 @@ class MarketHub {
 			this.searching = true;
 			this.searchQuery = "";
 		} else if (data === "e" || data === "E") {
+			if (this.screen === MARKET_SCREEN.market && this.marketView === "crypto") {
+				const row = this.cryptoRows()[this.cryptoSelected];
+				const sym = row?.row.yahooSymbol;
+				if (sym) {
+					const idx = this.viewWatchlist.indexOf(sym);
+					if (idx >= 0) {
+						this.viewWatchlist.splice(idx, 1);
+						this.status = `${sym} REMOVED FROM WATCH`;
+					} else {
+						this.viewWatchlist.push(sym);
+						this.status = `${sym} ADDED TO WATCH`;
+					}
+					this.tui.requestRender();
+					return;
+				}
+			}
 			const entry = this.entries()[this.selected];
 			if (entry?.type === "quote") {
 				const sym = entry.quote.symbol;
@@ -5968,7 +6091,12 @@ class MarketHub {
 		let screenTabs = MARKET_SCREEN_NAMES.map((name, index) => index === this.screen ? th.bg("selectedBg", th.bold(th.fg("accent", ` ${name} `))) : th.fg("dim", ` ${name} `)).join(" ");
 		if (totalRows < 22) screenTabs += th.fg("dim", `  CHART ${CHART_SCOPE_CONFIGS[this.chartScope].label} [1–5]`);
 		const headerLead = `${th.bold(th.fg("accent", " SIGNAL "))}${screenTabs}`;
-		if (usQuote) {
+		if (this.screen === MARKET_SCREEN.market && this.marketView === "crypto") {
+			// Crypto is 24/7 — never imply a US session badge describes it.
+			const badge = th.fg("accent", "● 24/7 CRYPTO") + th.fg("dim", " · DELAYED");
+			const gap = Math.max(1, width - visibleWidth(headerLead) - visibleWidth(badge));
+			header.push(fit(`${headerLead}${" ".repeat(gap)}${badge}`));
+		} else if (usQuote) {
 			const sessionMeta = marketStateMeta(usQuote.marketState);
 			const badge = `${th.fg(sessionMeta.tone, `● ${sessionMeta.label}`)} ${th.fg("dim", `DELAYED ${relativeAge(usQuote.updatedAt)}`)}`;
 			const gap = Math.max(1, width - visibleWidth(headerLead) - visibleWidth(badge));
@@ -6105,30 +6233,40 @@ class MarketHub {
 	private renderCryptoPulse(lines: string[], width: number, th: Theme, fit: (text: string) => string, bodyRows: number): void {
 		const pulse = this.cryptoPulse;
 		const mood = pulse?.mood;
+		const rows = this.cryptoRows();
 		if (this.cryptoPulseState === "loading" && !pulse) {
 			lines.push(...stretchBlocks([[fit(th.fg("dim", "CRYPTO PULSE · SYNCING CMC · PANIC RADAR"))], [fit(th.fg("dim", "· G GLOBAL"))]], bodyRows, "", 1));
 			return;
 		}
-		if (!mood) {
+		if (!pulse || (pulse.listings.length === 0 && !mood)) {
 			const reason = this.cryptoPulseState === "error" && this.cryptoPulseError ? ` · ${this.cryptoPulseError}` : "";
 			lines.push(...stretchBlocks([[fit(th.fg("warning", `CRYPTO PULSE · UNAVAILABLE${reason}`))], [fit(th.fg("dim", "· R RETRY · G GLOBAL"))]], bodyRows, "", 1));
 			return;
 		}
-		const bar = "█".repeat(mood.barFill) + "░".repeat(Math.max(0, 10 - mood.barFill));
-		const moodLine = `MOOD [${bar}] ${mood.value} ${mood.label}`
-			+ (mood.panicScore !== null ? ` · PANIC ${mood.panicScore} ${mood.panicLabel ?? ""}` : "")
-			+ (mood.btcDominancePercent !== null ? ` · BTC.D ${mood.btcDominancePercent.toFixed(1)}%` : "")
-			+ (mood.totalMarketCapUsd !== null ? ` · TOTAL ${dollars(mood.totalMarketCapUsd)}` : "");
-		const head = [
-			fit(th.bold(th.fg("accent", "CRYPTO PULSE"))),
-			fit(th.fg("text", moodLine)),
-			fit(th.fg("dim", `AS OF ${quoteTimestampLabel(pulse.fetchedAt, "UTC")} · [G] global · [R] sync · [J] open`)),
-		];
+		const head: string[] = [fit(th.bold(th.fg("accent", "CRYPTO PULSE")))];
+		if (mood) {
+			const bar = "█".repeat(mood.barFill) + "░".repeat(Math.max(0, 10 - mood.barFill));
+			const moodLine = `MOOD [${bar}] ${mood.value} ${mood.label}`
+				+ (mood.panicScore !== null ? ` · PANIC ${mood.panicScore} ${mood.panicLabel ?? ""}` : "")
+				+ (mood.btcDominancePercent !== null ? ` · BTC.D ${mood.btcDominancePercent.toFixed(1)}%` : "")
+				+ (mood.totalMarketCapUsd !== null ? ` · TOTAL ${dollars(mood.totalMarketCapUsd)}` : "");
+			head.push(fit(th.fg("text", moodLine)));
+		} else {
+			head.push(fit(th.fg("dim", "MOOD UNAVAILABLE · CMC F&G OFFLINE")));
+		}
+		const synced = pulse.fetchedAt > 0 ? quoteTimestampLabel(pulse.fetchedAt, "UTC") : "UNKNOWN";
+		head.push(fit(th.fg("dim", `SYNCED ${synced} · [G] global · [R] sync · [W/S] select · [J] open`)));
+
+		const rowLine = (row: CryptoScoreboardRow, selected: boolean) => {
+			const glyph = selected ? th.fg("accent", "►") : th.fg("dim", "·");
+			const tone = row.change24h >= 0 ? "success" : "error";
+			return fit(`${glyph} ${row.symbol.padEnd(5)} ${row.price !== null ? dollars(row.price, "USD") : "--".padStart(8)} ${th.fg(tone, percent(row.change24h))}`);
+		};
 		const hotBlock = [fit(th.bold(th.fg("success", "HOT"))), ...(pulse.hot.length > 0
-			? pulse.hot.map((row) => fit(`${row.symbol.padEnd(5)} ${row.price !== null ? dollars(row.price, "USD") : "--".padStart(8)} ${th.fg("success", percent(row.change24h))}`))
+			? pulse.hot.map((row, index) => rowLine(row, rows[index] !== undefined && this.cryptoSelected === index && rows[index]!.section === "hot"))
 			: [fit(th.fg("dim", "no gainers in universe"))])];
 		const coldBlock = [fit(th.bold(th.fg("error", "COLD"))), ...(pulse.cold.length > 0
-			? pulse.cold.map((row) => fit(`${row.symbol.padEnd(5)} ${row.price !== null ? dollars(row.price, "USD") : "--".padStart(8)} ${th.fg("error", percent(row.change24h))}`))
+			? pulse.cold.map((row, index) => rowLine(row, rows[pulse.hot.length + index] !== undefined && this.cryptoSelected === pulse.hot.length + index && rows[pulse.hot.length + index]!.section === "cold"))
 			: [fit(th.fg("dim", "no losers in universe"))])];
 		if (width >= 84 && terminalRows(this.tui) >= 24) {
 			lines.push(...twoColumn([...head, ...hotBlock], coldBlock, width, bodyRows));
@@ -6529,6 +6667,8 @@ class MarketHub {
 			marketView: this.marketView,
 			cryptoPulse: this.screen === MARKET_SCREEN.market ? {
 				state: this.cryptoPulseState,
+				selectedIndex: this.cryptoSelected,
+				selectedSymbol: this.cryptoRows()[this.cryptoSelected]?.row.yahooSymbol ?? null,
 				moodValue: this.cryptoPulse?.mood?.value ?? null,
 				moodLabel: this.cryptoPulse?.mood?.label ?? null,
 				panicScore: this.cryptoPulse?.mood?.panicScore ?? null,

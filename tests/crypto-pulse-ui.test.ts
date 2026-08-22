@@ -85,6 +85,31 @@ async function waitForState(uiTest: TestTool, predicate: (state: any) => boolean
   }
 }
 
+type FixtureMode = "full" | "all-fail" | "listings-only";
+
+/** Mutable fixture fetch so a test can flip providers between refreshes. */
+function fixtureFetch(mode: FixtureMode): (url: string) => Response {
+  return (url: string): Response => {
+    if (mode === "all-fail") return new Response("down", { status: 503 });
+    if (mode === "listings-only") {
+      if (url.includes("/listings/")) {
+        const listing = (id: number, symbol: string, name: string, rank: number, price: number, change24h: number, dominance: number) => ({
+          id, symbol, name, slug: symbol.toLowerCase(), cmc_rank: rank,
+          quote: [{ symbol: "USD", price, volume_24h: 1e9, market_cap: 1e11, market_cap_dominance: dominance, percent_change_24h: change24h, percent_change_7d: change24h * 2 }],
+        });
+        return jsonResponse({ data: [
+          listing(1, "BTC", "Bitcoin", 1, 76959, 0.41, 59.24),
+          listing(1027, "ETH", "Ethereum", 2, 2427, 1.8, 11.4),
+          listing(74, "DOGE", "Dogecoin", 9, 0.108, 8.5, 0.2),
+          listing(52, "XRP", "XRP", 4, 0.62, -3.1, 1.2),
+        ] });
+      }
+      return new Response("down", { status: 503 });
+    }
+    return cryptoPulseFixtureFetch(url);
+  };
+}
+
 test.after(() => {
   setCryptoPulseFetchImplForTest(undefined);
 });
@@ -164,4 +189,94 @@ test("leaving the MARKET screen resets the crypto subview to GLOBAL", async () =
   const moved = await uiTest.execute("state", { action: "state", width: 110, height: 30 });
   assert.notEqual(moved.details.state.screen, "MARKET");
   assert.equal(moved.details.state.marketView, "global");
+});
+
+test("J opens the visible crypto row and preserves the subview in return state", async () => {
+  setCryptoPulseFetchImplForTest((url) => fixtureFetch("full")(url));
+  const uiTest = registeredTools().get("market_ui_test");
+  assert.ok(uiTest);
+
+  await uiTest.execute("reset", { action: "reset" });
+  await uiTest.execute("open_market", { action: "open_market" });
+  await uiTest.execute("press", { action: "press", button: "button_g" });
+  await waitForState(uiTest, (state: any) => state.cryptoPulse?.state === "ready");
+
+  // Default selection is the first HOT row (DOGE).
+  await uiTest.execute("press", { action: "press", button: "button_j" });
+  const opened = await uiTest.execute("state", { action: "state", width: 110, height: 30 });
+  assert.equal(opened.details.lastAction?.action, "quote");
+  assert.equal(opened.details.lastAction?.symbol, "DOGE-USD");
+  assert.equal(opened.details.lastAction?.returnState?.marketView, "crypto");
+
+  // Move selection down to ETH and open that row.
+  await uiTest.execute("press", { action: "press", button: "button_g" });
+  await uiTest.execute("press", { action: "press", button: "button_g" });
+  await waitForState(uiTest, (state: any) => state.marketView === "crypto");
+  await uiTest.execute("press", { action: "press", button: "dpad_down" });
+  await uiTest.execute("press", { action: "press", button: "button_j" });
+  const second = await uiTest.execute("state", { action: "state", width: 110, height: 30 });
+  assert.equal(second.details.lastAction?.action, "quote");
+  assert.equal(second.details.lastAction?.symbol, "ETH-USD");
+  assert.equal(second.details.state.cryptoPulse?.selectedIndex, 1);
+  assert.equal(second.details.state.cryptoPulse?.selectedSymbol, "ETH-USD");
+});
+
+test("failed refresh preserves previously good data instead of blanking it", async () => {
+  let mode: FixtureMode = "full";
+  setCryptoPulseFetchImplForTest((url) => fixtureFetch(mode)(url));
+  const uiTest = registeredTools().get("market_ui_test");
+  assert.ok(uiTest);
+
+  await uiTest.execute("reset", { action: "reset" });
+  await uiTest.execute("open_market", { action: "open_market" });
+  await uiTest.execute("press", { action: "press", button: "button_g" });
+  await waitForState(uiTest, (state: any) => state.cryptoPulse?.state === "ready" && state.cryptoPulse?.moodValue === 76);
+
+  // All providers go down; a forced refresh must retain the good snapshot.
+  mode = "all-fail";
+  await uiTest.execute("press", { action: "press", button: "button_r" });
+  const after = await waitForState(uiTest, (state: any) => state.cryptoPulse?.state === "ready");
+  assert.equal(after.cryptoPulse.moodValue, 76, "mood should be retained on provider failure");
+  assert.equal(after.cryptoPulse.hot.length, 3);
+  assert.equal(after.cryptoPulse.cold.length, 1);
+});
+
+test("listings-only partial source renders the scoreboard with MOOD UNAVAILABLE", async () => {
+  setCryptoPulseFetchImplForTest((url) => fixtureFetch("listings-only")(url));
+  const uiTest = registeredTools().get("market_ui_test");
+  assert.ok(uiTest);
+
+  await uiTest.execute("reset", { action: "reset" });
+  await uiTest.execute("open_market", { action: "open_market" });
+  await uiTest.execute("press", { action: "press", button: "button_g" });
+  await waitForState(uiTest, (state: any) => state.cryptoPulse?.state === "ready");
+
+  const st = await uiTest.execute("state", { action: "state", width: 110, height: 30 });
+  assert.equal(st.details.state.cryptoPulse.moodValue, null);
+  assert.ok(st.details.state.cryptoPulse.hot.length >= 2, "scoreboard survives a mood-only outage");
+  const lines: string[] = st.details.screen;
+  assert.ok(lines.some((line: string) => line.includes("MOOD UNAVAILABLE")), "mood outage should be labeled");
+  assert.ok(lines.some((line: string) => line.includes("HOT")), "HOT scoreboard should still render");
+});
+
+test("PanicRadar kill switch disables the provider end to end", async () => {
+  const previous = process.env.MARKET_PANIC_RADAR_ENABLED;
+  process.env.MARKET_PANIC_RADAR_ENABLED = "0";
+  try {
+    setCryptoPulseFetchImplForTest((url) => fixtureFetch("full")(url));
+    const uiTest = registeredTools().get("market_ui_test");
+    assert.ok(uiTest);
+
+    await uiTest.execute("reset", { action: "reset" });
+    await uiTest.execute("open_market", { action: "open_market" });
+    await uiTest.execute("press", { action: "press", button: "button_g" });
+    await waitForState(uiTest, (state: any) => state.cryptoPulse?.state === "ready");
+
+    const st = await uiTest.execute("state", { action: "state", width: 110, height: 30 });
+    assert.equal(st.details.state.cryptoPulse.panicScore, null, "panic score should be absent when disabled");
+    assert.equal(st.details.state.cryptoPulse.moodValue, 76, "CMC mood should still be present");
+  } finally {
+    if (previous === undefined) delete process.env.MARKET_PANIC_RADAR_ENABLED;
+    else process.env.MARKET_PANIC_RADAR_ENABLED = previous;
+  }
 });

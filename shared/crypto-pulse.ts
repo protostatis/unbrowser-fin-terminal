@@ -20,7 +20,8 @@ export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>
 
 // ── Provider endpoints ──────────────────────────────────────────────────────
 
-const CMC_BASE_URL = "https://pro-api.coinmarketcap.com/public-api";const CMC_GLOBAL_METRICS_URL = `${CMC_BASE_URL}/v1/global-metrics/quotes/latest?convert=USD`;
+const CMC_BASE_URL = "https://pro-api.coinmarketcap.com/public-api";
+const CMC_GLOBAL_METRICS_URL = `${CMC_BASE_URL}/v1/global-metrics/quotes/latest?convert=USD`;
 const CMC_FEAR_GREED_URL = `${CMC_BASE_URL}/v3/fear-and-greed/latest`;
 const CMC_LISTINGS_URL = (limit: number) =>
   `${CMC_BASE_URL}/v3/cryptocurrency/listings/latest?start=1&limit=${limit}&convert=USD`;
@@ -32,11 +33,16 @@ const PANIC_RADAR_PANIC_SCORE_URL = `${PANIC_RADAR_BASE_URL}/api/dashboard/panic
 // ── Bounds ──────────────────────────────────────────────────────────────────
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 12_000;
+/**
+ * PanicRadar is opportunistic enrichment: give it a short, independent latency
+ * budget so a hung PanicRadar endpoint can never delay healthy CMC data.
+ */
+const DEFAULT_PANIC_RADAR_TIMEOUT_MS = 4_000;
 const MAX_RESPONSE_BYTES = 512 * 1024;
 const MAX_LISTINGS = 20;
 /** Stablecoins are excluded from the HOT/COLD scoreboard. */
 const STABLECOIN_SYMBOLS = new Set([
-  "USDT", "USDC", "DAI", "BUSD", "TUSD", "USDP", "PYUSD", "FDUSD", "USDe", "USDY", "RLUSD", "USDS",
+  "USDT", "USDC", "DAI", "BUSD", "TUSD", "USDP", "PYUSD", "FDUSD", "USDE", "USDY", "RLUSD", "USDS",
 ]);
 
 /**
@@ -180,6 +186,10 @@ export interface CryptoPulseFetchOptions {
   requestTimeoutMs?: number;
   maxResponseBytes?: number;
   now?: () => number;
+  /** Kill switch for the undocumented PanicRadar frontend API. Defaults to on. */
+  panicRadarEnabled?: boolean;
+  /** Independent latency budget for PanicRadar so it never blocks CMC. */
+  panicRadarTimeoutMs?: number;
 }
 
 function timeoutSignal(parent: AbortSignal | undefined, timeoutMs: number): {
@@ -494,6 +504,8 @@ export async function fetchCryptoPulse(
 ): Promise<FetchCryptoPulseResult> {
   const fetchImpl = options.fetchImpl ?? fetch;
   const requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+  const panicRadarTimeoutMs = options.panicRadarTimeoutMs ?? DEFAULT_PANIC_RADAR_TIMEOUT_MS;
+  const panicRadarEnabled = options.panicRadarEnabled !== false;
   const maxResponseBytes = options.maxResponseBytes ?? MAX_RESPONSE_BYTES;
   const now = options.now ?? Date.now;
   const fetchedAt = now();
@@ -508,7 +520,7 @@ export async function fetchCryptoPulse(
     }
   };
 
-  const [globalMetrics, fearGreed, listings, panicRadarSummary, panicScore] = await Promise.all([
+  const [globalMetrics, fearGreed, listings] = await Promise.all([
     guard("cmc.global-metrics", async () => {
       const raw = await fetchJson(CMC_GLOBAL_METRICS_URL, fetchImpl, requestTimeoutMs, maxResponseBytes, signal);
       return parseCmcGlobalMetrics(raw, fetchedAt);
@@ -521,15 +533,24 @@ export async function fetchCryptoPulse(
       const raw = await fetchJson(CMC_LISTINGS_URL(MAX_LISTINGS), fetchImpl, requestTimeoutMs, maxResponseBytes, signal);
       return parseCmcListings(raw, fetchedAt, MAX_LISTINGS);
     }),
-    guard("panicRadar.summary", async () => {
-      const raw = await fetchJson(PANIC_RADAR_SUMMARY_URL, fetchImpl, requestTimeoutMs, maxResponseBytes, signal);
-      return parsePanicRadarSummary(raw, fetchedAt);
-    }),
-    guard("panicRadar.panic-score", async () => {
-      const raw = await fetchJson(PANIC_RADAR_PANIC_SCORE_URL, fetchImpl, requestTimeoutMs, maxResponseBytes, signal);
-      return parsePanicRadarPanicScore(raw, fetchedAt);
-    }),
   ]);
+
+  // PanicRadar is opportunistic: a disabled kill switch or a slow endpoint
+  // must never delay CMC data, so it runs after CMC with its own short budget.
+  let panicRadarSummary: PanicRadarSummary | null = null;
+  let panicScore: PanicRadarPanicScore | null = null;
+  if (panicRadarEnabled) {
+    [panicRadarSummary, panicScore] = await Promise.all([
+      guard("panicRadar.summary", async () => {
+        const raw = await fetchJson(PANIC_RADAR_SUMMARY_URL, fetchImpl, panicRadarTimeoutMs, maxResponseBytes, signal);
+        return parsePanicRadarSummary(raw, fetchedAt);
+      }),
+      guard("panicRadar.panic-score", async () => {
+        const raw = await fetchJson(PANIC_RADAR_PANIC_SCORE_URL, fetchImpl, panicRadarTimeoutMs, maxResponseBytes, signal);
+        return parsePanicRadarPanicScore(raw, fetchedAt);
+      }),
+    ]);
+  }
 
   const parsedListings = listings ?? [];
   const mood = deriveCryptoMood(fearGreed, globalMetrics, panicRadarSummary, panicScore, parsedListings, fetchedAt);
@@ -552,12 +573,22 @@ export async function fetchCryptoPulse(
   };
 }
 
-// ── Freshness (per-dataset TTL + stale fallback) ────────────────────────────
+// ── Freshness (snapshot TTL + stale fallback) ───────────────────────────────
 
 /**
- * Simple in-memory cache keyed by dataset. Each dataset carries its own TTL so
- * the different provider cadences (F&G vs listings vs PanicRadar) are respected
- * instead of forcing one snapshot-wide stale rule.
+ * A snapshot is "usable" when it carries at least one renderable dataset
+ * (a mood or any listings). Unusable snapshots must never be cached or used to
+ * replace a previously good snapshot — they represent a provider outage, not a
+ * real state change.
+ */
+export function isCryptoPulseUsable(snapshot: CryptoPulseSnapshot): boolean {
+  return snapshot.mood !== null || snapshot.listings.length > 0;
+}
+
+/**
+ * Simple in-memory snapshot cache. Callers today store one snapshot under one
+ * TTL (provider cadences are not yet per-dataset). The stale-while-revalidate
+ * fallback returns the last value even when expired, with no maximum stale age.
  */
 export class CryptoPulseCache {
   private readonly entries = new Map<string, { fetchedAt: number; value: unknown }>();

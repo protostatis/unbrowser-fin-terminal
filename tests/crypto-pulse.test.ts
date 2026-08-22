@@ -6,6 +6,7 @@ import {
   deriveCryptoMood,
   fetchCryptoPulse,
   interactiveUniverseIndex,
+  isCryptoPulseUsable,
   isStablecoinSymbol,
   type CryptoListing,
 } from "../shared/crypto-pulse.js";
@@ -279,8 +280,67 @@ test("stablecoin and universe helpers behave deterministically", () => {
   assert.equal(isStablecoinSymbol("USDT"), true);
   assert.equal(isStablecoinSymbol("usdc"), true);
   assert.equal(isStablecoinSymbol("BTC"), false);
+  assert.equal(isStablecoinSymbol("USDE"), true);
   const universe = interactiveUniverseIndex();
   assert.equal(universe.get(1)?.yahooSymbol, "BTC-USD");
   assert.equal(universe.get(1027)?.yahooSymbol, "ETH-USD");
   assert.equal(CRYPTO_INTERACTIVE_UNIVERSE.length >= 10, true);
+});
+
+test("panicRadarEnabled=false skips PanicRadar entirely", async () => {
+  const requested: string[] = [];
+  const fetchImpl = async (url: string) => {
+    requested.push(url);
+    if (url.includes("/global-metrics/")) return jsonResponse(CMC_GLOBAL_METRICS);
+    if (url.includes("/fear-and-greed/")) return jsonResponse(CMC_FEAR_GREED);
+    if (url.includes("/listings/")) return jsonResponse(CMC_LISTINGS);
+    return new Response("not found", { status: 404 });
+  };
+
+  const { snapshot, errors } = await fetchCryptoPulse({ fetchImpl, panicRadarEnabled: false });
+
+  assert.deepEqual(errors, []);
+  assert.deepEqual(snapshot.providers, { cmc: true, panicRadar: false });
+  assert.equal(snapshot.panicRadarSummary, null);
+  assert.equal(snapshot.panicScore, null);
+  assert.ok(snapshot.mood);
+  assert.equal(requested.some((url) => url.includes("panicradar.ai")), false);
+  assert.equal(requested.length, 3);
+});
+
+test("a hanging PanicRadar endpoint never blocks CMC data", async () => {
+  const fetchImpl = async (url: string, init?: RequestInit): Promise<Response> => {
+    if (url.includes("panicradar.ai")) {
+      // Resolve only when the caller aborts (simulates a hung upstream).
+      return new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+      });
+    }
+    if (url.includes("/global-metrics/")) return jsonResponse(CMC_GLOBAL_METRICS);
+    if (url.includes("/fear-and-greed/")) return jsonResponse(CMC_FEAR_GREED);
+    if (url.includes("/listings/")) return jsonResponse(CMC_LISTINGS);
+    return new Response("not found", { status: 404 });
+  };
+
+  const started = Date.now();
+  const { snapshot, errors } = await fetchCryptoPulse({ fetchImpl, panicRadarTimeoutMs: 10, requestTimeoutMs: 10_000 });
+
+  // CMC came back intact; PanicRadar was cut off by its own short budget.
+  assert.ok(snapshot.fearGreed, "CMC fear/greed should be present");
+  assert.equal(snapshot.panicRadarSummary, null);
+  assert.equal(snapshot.panicScore, null);
+  assert.deepEqual(snapshot.providers, { cmc: true, panicRadar: false });
+  assert.equal(errors.length, 2);
+  assert.ok(errors.every((error) => error.startsWith("panicRadar.")));
+  assert.ok(Date.now() - started < 1_000, "hanging PanicRadar should not add a long tail");
+});
+
+test("isCryptoPulseUsable rejects provider-outage snapshots", async () => {
+  const { snapshot: empty, errors: emptyErrors } = await fetchCryptoPulse({
+    fetchImpl: async () => new Response("down", { status: 503 }),
+  });
+  assert.equal(isCryptoPulseUsable(empty), false);
+  assert.equal(emptyErrors.length, 5);
+  assert.equal(empty.mood, null);
+  assert.deepEqual(empty.hot, []);
 });
