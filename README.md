@@ -269,6 +269,24 @@ delayed liquid-universe monitor—not an exchange-wide real-time scanner. Press
 `R` to rescore and `E` to add or remove the selected mover from the session
 watchlist.
 
+The mover score is session-aware. During pre-market (`PRE`) the move leg already
+uses the pre-market price vs. previous close. The session is derived from the
+live quote bars (the public Yahoo chart API omits `marketState`), so this
+behavior only applies on the DAY scope — the only scope that fetches pre/post
+bars. The volume leg picks one basis per snapshot: if any quote has a live
+extended-session volume it uses **live** basis
+(missing extended volume ranks movement-first), otherwise it uses the
+regular-session figure as a labeled liquidity **proxy** across the whole
+snapshot, so a pre-market move is never pitted against a previous-session proxy
+inside the same percentile. Proxied figures are always marked (`VOL 8.1M~`),
+never dressed as extended volume; when no candidate has any usable volume the
+list is flagged move-only (`MOVE-ONLY · NO VOL DATA`). Quotes whose
+extended-session move is real but whose volume has not populated remain eligible
+so the pre-market mover list does not empty solely because extended volume is
+unavailable. Rows render a dominant `PRE-MKT`/`POST-MKT` tag (or `MIXED` during
+session transitions) in the MOVERS title and mark the volume leg's provenance on
+each row.
+
 Changing screens, selections, pane focus, or chart scope does not stop research.
 Each symbol/scope/BRIEF-or-WHY context gets its own job and canvas identity. The
 terminal dispatches up to six FIFO jobs to isolated one-shot Pi worker sessions,
@@ -379,6 +397,7 @@ Configure it with environment variables:
 | `MARKET_PRECACHE_QUALITY_GATE` | `1` | A/B switch for the quality gates. When on (default): a pre-warm identity is fresh only when the archive holds a **usable** same-day canvas (complete, fetched-evidence, item-level sourced read, no scenarios in a BRIEF) — evidence-blocked or unsupported canvases never satisfy the cache and are re-warmed; and a missing `UNBROWSER_MCP_URL` skips the source pre-warm entirely (extraction has no local fallback, so it would only produce degraded TA-only canvases). Set to `0` to restore the baseline date-only freshness and fan-out. |
 | `MARKET_PRECACHE_BUDGET` | `2000000` | UTC-day total Pi-reported token budget for pre-cache runs (10 000–10 000 000). See `market-precache-ledger.json`. |
 | `MARKET_PRECACHE_RUN_LIMIT` | `100000` | Conservative reservation per run; at most ~20 attempts/day at defaults (5 000–500 000). |
+| `MARKET_MOCK_MONDAY` | `0` | Dev/testing only. `1` serves deterministic Monday-pre-market fixtures instead of the live quote feed (DAY scope), so the PRE session path and mover labels can be verified on any day of the week — the public Yahoo API only exposes a live PRE state Mon–Fri 04:00–09:30 ET. Never set in production. |
 
 With the `paired` strategy, the synthetic `v1/paired/*` worker identity is never
 archived or exposed as a cache hit. With `single`, jobs carry the exact
