@@ -139,6 +139,10 @@ type Quote = {
 	points: number[];
 	pointTimes: number[];
 	pointSessions: ChartSession[];
+	pointVolumes: number[];
+	pointOpens: number[];
+	pointHighs: number[];
+	pointLows: number[];
 	timezone: string;
 	interval: string;
 	source: string;
@@ -1483,6 +1487,47 @@ function cleanText(value: unknown): string {
 		.replace(/\r\n?/g, "\n");
 }
 
+/**
+ * Reduce a raw research-worker error to one calm, user-facing line.
+ *
+ * Worker failures often arrive as protocol payloads like
+ * `market_canvas:{"content":"[{"type":"text","text":"All candidate sources
+ * failed retrieval; ..."}]"}`. Dumping that into the status line leaks JSON
+ * and truncates mid-word. This unwraps `toolName:{json}` envelopes, pulls the
+ * human text out of content strings, and collapses to a single bounded line.
+ */
+function summarizeResearchError(error: string | undefined): string | undefined {
+	const text = cleanText(error ?? "").trim();
+	if (!text) return undefined;
+	// Unwrap `toolName:{"content":"...","message":"..."}` envelopes.
+	const envelope = /^[A-Za-z0-9_]+:\s*(\{[\s\S]*\})$/.exec(text);
+	if (envelope) {
+		try {
+			const parsed = JSON.parse(envelope[1]!) as { content?: unknown; message?: unknown };
+			const inner = typeof parsed.message === "string"
+				? parsed.message
+				: typeof parsed.content === "string" ? parsed.content
+				: Array.isArray(parsed.content)
+					? parsed.content.map((item: unknown) => {
+						if (typeof item === "string") return item;
+						if (item && typeof item === "object" && "text" in (item as { text?: unknown }) && typeof (item as { text: unknown }).text === "string") {
+							return (item as { text: string }).text;
+						}
+						return "";
+					}).filter(Boolean).join(" ")
+				: undefined;
+			if (inner?.trim()) return collapseErrorLine(inner);
+		} catch {
+			// Fall through to the raw-text path.
+		}
+	}
+	return collapseErrorLine(text);
+}
+
+function collapseErrorLine(text: string): string {
+	return truncateToWidth(cleanText(text).replace(/\s+/g, " ").trim(), 120);
+}
+
 function parseCanvasSections(content: string): CanvasSection[] {
 	const text = cleanText(content);
 	if (!text.trim()) return [];
@@ -1913,12 +1958,15 @@ export function parseChartPayloadToQuote(
 	cfg: { yahooInterval: string; includePrePost: boolean; chartScope: ChartScope },
 ): Quote {
 	const chart = (payload as {
-		chart?: { result?: Array<{ meta?: Record<string, unknown>; timestamp?: Array<number | null>; indicators?: { quote?: Array<{ close?: Array<number | null>; volume?: Array<number | null> }> } }> };
+		chart?: { result?: Array<{ meta?: Record<string, unknown>; timestamp?: Array<number | null>; indicators?: { quote?: Array<{ close?: Array<number | null>; open?: Array<number | null>; high?: Array<number | null>; low?: Array<number | null>; volume?: Array<number | null> }> } }> };
 	})?.chart?.result?.[0];
 	const meta = chart?.meta;
 	if (!chart || !meta) throw new Error("quote response contained no chart data");
 
 	const rawCloses = chart.indicators?.quote?.[0]?.close ?? [];
+	const rawOpens = chart.indicators?.quote?.[0]?.open ?? [];
+	const rawHighs = chart.indicators?.quote?.[0]?.high ?? [];
+	const rawLows = chart.indicators?.quote?.[0]?.low ?? [];
 	const rawVolumes = chart.indicators?.quote?.[0]?.volume ?? [];
 	const rawTimes = chart.timestamp ?? [];
 	const validCloses = rawCloses.filter((value): value is number => typeof value === "number" && Number.isFinite(value));
@@ -1946,6 +1994,9 @@ export function parseChartPayloadToQuote(
 	const alignedTimes: number[] = [];
 	const alignedSessions: ChartSession[] = [];
 	const alignedVolumes: number[] = [];
+	const alignedOpens: number[] = [];
+	const alignedHighs: number[] = [];
+	const alignedLows: number[] = [];
 	for (let index = 0; index < rawCloses.length; index++) {
 		const close = rawCloses[index];
 		const timestamp = rawTimes[index];
@@ -1955,6 +2006,12 @@ export function parseChartPayloadToQuote(
 		alignedSessions.push(sessionAt(timestamp));
 		const volume = rawVolumes[index];
 		alignedVolumes.push(typeof volume === "number" && Number.isFinite(volume) ? volume : 0);
+		const open = rawOpens[index];
+		const high = rawHighs[index];
+		const low = rawLows[index];
+		alignedOpens.push(typeof open === "number" && Number.isFinite(open) ? open : close);
+		alignedHighs.push(typeof high === "number" && Number.isFinite(high) ? high : close);
+		alignedLows.push(typeof low === "number" && Number.isFinite(low) ? low : close);
 	}
 	const hasTimedSeries = alignedPoints.length >= 2;
 	const closes = hasTimedSeries ? alignedPoints : validCloses;
@@ -2023,6 +2080,10 @@ export function parseChartPayloadToQuote(
 		points: closes,
 		pointTimes,
 		pointSessions,
+		pointVolumes: hasTimedSeries && alignedVolumes.length === closes.length ? alignedVolumes : [],
+		pointOpens: hasTimedSeries && alignedOpens.length === closes.length ? alignedOpens : [],
+		pointHighs: hasTimedSeries && alignedHighs.length === closes.length ? alignedHighs : [],
+		pointLows: hasTimedSeries && alignedLows.length === closes.length ? alignedLows : [],
 		timezone: typeof meta.exchangeTimezoneName === "string" ? meta.exchangeTimezoneName : "UTC",
 		interval: typeof meta.dataGranularity === "string" ? meta.dataGranularity : cfg.yahooInterval,
 		source: "Yahoo Finance chart API (public/delayed; verify before trading)",
@@ -2498,15 +2559,38 @@ function chartLines(
 	minValue?: number,
 	maxValue?: number,
 	chartScope: ChartScope = DEFAULT_CHART_SCOPE,
-	chartStyle: "points" | "line" | "histogram" = "points",
+	chartStyle: "points" | "line" | "histogram" | "candles" = "points",
 	guideValues: ChartGuide[] = [],
 	negative: (text: string) => string = positive,
+	pointVolumes: number[] = [],
+	percentBase: number | null = null,
+	pointOpens: number[] = [],
+	pointHighs: number[] = [],
+	pointLows: number[] = [],
 ): string[] {
 	const chartWidth = Math.max(18, Math.min(64, width - 12));
 	if (points.length < 2) return [muted("  Chart unavailable for this interval.")];
 	const sampledIndices = Array.from({ length: chartWidth }, (_, index) => Math.min(points.length - 1, Math.floor((index / (chartWidth - 1)) * (points.length - 1))));
 	const sampled = sampledIndices.map((index) => points[index]!);
 	const sampledSessions = sampledIndices.map((index) => pointSessions.length === points.length ? pointSessions[index] ?? "unknown" : "unknown");
+	const sampledVolumes = pointVolumes.length === points.length
+		? sampledIndices.map((index) => Math.max(0, pointVolumes[index] ?? 0))
+		: [];
+	const sampledOpens = pointOpens.length === points.length ? sampledIndices.map((index) => pointOpens[index]!) : undefined;
+	const sampledHighs = pointHighs.length === points.length ? sampledIndices.map((index) => pointHighs[index]!) : undefined;
+	const sampledLows = pointLows.length === points.length ? sampledIndices.map((index) => pointLows[index]!) : undefined;
+	// Per-column candle direction: "up" | "down" | "ext-up" | "ext-down".
+	const candleTone: Array<"up" | "down" | "ext-up" | "ext-down"> = [];
+	// Δ% axis: when a base value is supplied, row labels read as percent deltas
+	// against it instead of truncated absolute prices (the old `$7,69...` cut).
+	const deltaLabel = (value: number): string => {
+		if (percentBase === null || !Number.isFinite(percentBase) || percentBase === 0) return valueFormatter(value);
+		const pct = ((value - percentBase) / percentBase) * 100;
+		const sign = pct > 0 ? "+" : pct < 0 ? "-" : "";
+		const digits = Math.abs(pct) >= 100 ? 0 : Math.abs(pct) >= 10 ? 1 : 2;
+		return `${sign}${Math.abs(pct).toFixed(digits)}%`;
+	};
+	const axisLabel = (value: number): string => truncateToWidth(deltaLabel(value), 8).padStart(8);
 	const fixedDomain = minValue !== undefined && maxValue !== undefined && Number.isFinite(minValue) && Number.isFinite(maxValue) && maxValue > minValue;
 	const min = fixedDomain ? minValue : Math.min(...sampled);
 	const max = fixedDomain ? maxValue : Math.max(...sampled);
@@ -2540,6 +2624,27 @@ function chartLines(
 			previousY = y;
 		}
 		rows[rowFor(sampled.at(-1)!)]![sampled.length - 1] = "●";
+	} else if (chartStyle === "candles") {
+		// Compact 1-cell-per-bar candles: slim body ▌ colored per direction
+		// (green up / red down), wicks │, extended-session bars dimmed. Falls
+		// back to flat bodies when OHLC arrays are unavailable.
+		for (let x = 0; x < sampled.length; x++) {
+			const close = sampled[x]!;
+			const open = sampledOpens?.[x] ?? close;
+			const high = sampledHighs?.[x] ?? Math.max(open, close);
+			const low = sampledLows?.[x] ?? Math.min(open, close);
+			const up = close >= open;
+			candleTone[x] = sampledSessions[x] === "pre" || sampledSessions[x] === "post" ? (up ? "ext-up" : "ext-down") : up ? "up" : "down";
+			const bodyTop = rowFor(Math.max(open, close));
+			const bodyBottom = rowFor(Math.min(open, close));
+			const wickTop = rowFor(high);
+			const wickBottom = rowFor(low);
+			for (let row = wickTop; row < bodyTop; row++) rows[row]![x] = "│";
+			for (let row = bodyBottom + 1; row <= wickBottom; row++) rows[row]![x] = "│";
+			// Slim half-width body: reads narrower next to the centered wick and
+			// keeps adjacent candles visually separated.
+			for (let row = bodyTop; row <= bodyBottom; row++) rows[row]![x] = "▌";
+		}
 	} else if (chartStyle === "histogram") {
 		const baseline = reference !== null && reference !== undefined && Number.isFinite(reference) ? reference : 0;
 		const baselineRow = rowFor(Math.max(min, Math.min(max, baseline)));
@@ -2564,13 +2669,13 @@ function chartLines(
 	}
 	const rendered = rows.map((row, index) => {
 		let label: string;
-		if (index === refRow) label = truncateToWidth(valueFormatter(reference!), 8).padStart(8);
+		if (index === refRow) label = axisLabel(reference!);
 		else if (guideRows.has(index)) {
 			const guide = guideRows.get(index)!;
-			label = truncateToWidth(`${guide.label ? `${guide.label} ` : ""}${valueFormatter(guide.value)}`, 8).padStart(8);
+			label = truncateToWidth(`${guide.label ? `${guide.label} ` : ""}${deltaLabel(guide.value)}`, 8).padStart(8);
 		}
-		else if (index === 0) label = truncateToWidth(valueFormatter(max), 8).padStart(8);
-		else if (index === height - 1) label = truncateToWidth(valueFormatter(min), 8).padStart(8);
+		else if (index === 0) label = axisLabel(max);
+		else if (index === height - 1) label = axisLabel(min);
 		else label = "        ";
 		const line = row.join("");
 		if (chartStyle === "histogram" && index !== refRow) {
@@ -2593,6 +2698,22 @@ function chartLines(
 			flush();
 			return `${muted(label)} ${styled}`;
 		}
+		if (chartStyle === "candles") {
+			// Color each candle column by its own direction; extended-session
+			// bars stay on the dim channel so PRE/POST reads as "off-hours".
+			let styled = "";
+			for (let x = 0; x < line.length; x++) {
+				const char = line[x]!;
+				if (char === " ") {
+					styled += char;
+					continue;
+				}
+				const tone = candleTone[x] ?? "up";
+				const applier = tone === "up" ? positive : tone === "down" ? negative : muted;
+				styled += applier(char);
+			}
+			return `${muted(label)} ${styled}`;
+		}
 		const guide = guideRows.get(index);
 		const renderLine = index === refRow ? muted : guide?.render ?? positive;
 		return `${guide?.render ? guide.render(label) : muted(label)} ${renderLine(line)}`;
@@ -2600,8 +2721,28 @@ function chartLines(
 
 	const intervalLabel = truncateToWidth(interval.toUpperCase(), 8).padStart(8);
 
+	// Compact volume strip: one row of block glyphs sampled to the same columns.
+	// Kept visually subordinate (muted) so price movement stays the primary channel.
+	if (sampledVolumes.length === chartWidth && sampledVolumes.some((volume) => volume > 0)) {
+		const maxVolume = Math.max(...sampledVolumes, 1);
+		const glyphs = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+		const strip = sampledVolumes.map((volume) => {
+			// sqrt scale keeps small bars visible next to a dominant spike,
+			// and any positive volume renders at least ▁.
+			if (volume <= 0) return " ";
+			const bucket = Math.max(1, Math.round(Math.sqrt(volume / maxVolume) * (glyphs.length - 1)));
+			return glyphs[Math.max(0, Math.min(glyphs.length - 1, bucket))]!;
+		}).join("");
+		rendered.push(`${muted(truncateToWidth("VOL", 8).padStart(8))} ${muted(strip)}`);
+	}
+
 	if (chartStyle === "line") {
-		rendered.unshift(`${muted(intervalLabel)} ${muted(guideRows.size > 0 ? "LINE  ┄GUIDES  ─REFERENCE" : "LINE  ─REFERENCE")}`);
+		const origin = percentBase !== null ? "Δ% AXIS" : "";
+		rendered.unshift(`${muted(intervalLabel)} ${muted(`LINE ${origin}${guideRows.size > 0 ? "  ┄GUIDES" : ""}  ─REFERENCE`)}`);
+	} else if (chartStyle === "candles") {
+		const origin = percentBase !== null ? "Δ% AXIS" : "";
+		const sessionNote = pointSessions.length === points.length && sampledSessions.some((session) => session === "pre" || session === "post") ? "  ◦PRE ·POST DIMMED" : "";
+		rendered.unshift(`${muted(intervalLabel)} ${muted(`CANDLE${origin ? ` ${origin}` : ""} ▌UP ▌DOWN${sessionNote}  ─REFERENCE`)}`);
 	} else if (chartStyle === "histogram") {
 		rendered.unshift(`${muted(intervalLabel)} ${muted("+POSITIVE  -NEGATIVE  ─ZERO")}`);
 	// Session legend: only for point charts at day scope
@@ -4118,9 +4259,9 @@ function researchStatusLine(job: ResearchJob | undefined): string | undefined {
 		if (evidenceStatus === "blocked") return `${label} EVIDENCE BLOCKED${scope}${blocks}`;
 		return `${label} COMPLETE${scope}${blocks}`;
 	}
-	if (job.outcome === "partial") return `${label} PARTIAL${scope}${blocks}${job.error ? ` · ${job.error}` : ""}`;
+	if (job.outcome === "partial") return `${label} PARTIAL${scope}${blocks}${job.error ? ` · ${summarizeResearchError(job.error) ?? "retryable failure"}` : ""}`;
 	if (job.outcome === "cancelled") return `${label} CANCELLED${scope}`;
-	if (job.outcome === "failed") return `${label} FAILED${scope}${job.error ? ` · ${job.error}` : ""}`;
+	if (job.outcome === "failed") return `${label} FAILED${scope}${job.error ? ` · ${summarizeResearchError(job.error) ?? "worker failed"}` : ""}`;
 	return `${label} ${job.outcome.toUpperCase()}${scope}${blocks}`;
 }
 
@@ -5039,7 +5180,7 @@ class MarketTerminal {
 		if (bodyRows >= 8) {
 			const chartHg = Math.max(2, Math.min(26, bodyRows - 12));
 			const chartRows: string[] = [];
-			for (const row of chartLines(quote.points, width, (text) => th.fg(chartDirection, text), (text) => th.fg("dim", text), quote.chartScope === "day" ? quote.previousClose : undefined, chartHg, quote.pointTimes, quote.pointSessions, quote.timezone, quote.interval, (value) => dollars(value, quote.currency), undefined, undefined, quote.chartScope)) {
+			for (const row of chartLines(quote.points, width, (text) => th.fg("success", text), (text) => th.fg("dim", text), quote.chartScope === "day" ? quote.previousClose : undefined, chartHg, quote.pointTimes, quote.pointSessions, quote.timezone, quote.interval, (value) => dollars(value, quote.currency), undefined, undefined, quote.chartScope, "candles", undefined, (text) => th.fg("error", text), quote.pointVolumes, quote.chartScope === "day" ? quote.previousClose ?? null : quote.points[0] ?? null, quote.pointOpens, quote.pointHighs, quote.pointLows)) {
 				chartRows.push(fit(row));
 			}
 			blocks.push(chartRows);
@@ -5642,6 +5783,10 @@ class MarketHub {
 	private cryptoPulseError: string | undefined;
 	private cryptoPulseRequestedAt = 0;
 	private cryptoSelected = 0;
+	/** Per-symbol quote cache for the crypto pulse right-pane chart, keyed `${scope}:${symbol}`. */
+	private cryptoQuotes = new Map<string, Quote>();
+	private cryptoQuoteAttempted = new Set<string>();
+	private cryptoQuoteLoading = false;
 
 	constructor(
 		private readonly tui: Tui,
@@ -6013,6 +6158,8 @@ class MarketHub {
 			}
 			this.cryptoPulseState = usable || this.cryptoPulse ? "ready" : "error";
 			this.cryptoPulseError = errors.length > 0 ? errors.join(" · ") : undefined;
+			const row = this.cryptoRows()[this.cryptoSelected];
+			void this.ensureCryptoChart(row?.row.yahooSymbol);
 			const partial = usable && errors.length > 0;
 			const retainedPrior = !usable && Boolean(this.cryptoPulse);
 			this.status = this.cryptoPulseState === "error"
@@ -6051,6 +6198,34 @@ class MarketHub {
 		const row = rows[this.cryptoSelected]!;
 		const sectionLabel = row.section === "unranked" ? "UNRANKED" : row.section === "hot" ? "HOTTEST" : "COLDEST";
 		this.status = `${sectionLabel} ${row.row.symbol}${row.section !== "unranked" ? ` ${percent(row.row.change24h)}` : " · NO QUOTE"} · J OPEN · K WHY · E WATCH`;
+		void this.ensureCryptoChart(row.row.yahooSymbol);
+	}
+
+	/**
+	 * Load the candle chart quote for the selected crypto row on demand.
+	 * Independent of the CMC scoreboard: pulls Yahoo bars for the ACTIVE chart
+	 * scope so the right-pane chart follows the 1–5 scope selector.
+	 */
+	private async ensureCryptoChart(yahooSymbol: string | null | undefined, scope: ChartScope = this.chartScope): Promise<void> {
+		if (!yahooSymbol) return;
+		const cacheKey = `${scope}:${yahooSymbol}`;
+		if (this.cryptoQuotes.has(cacheKey) || this.cryptoQuoteAttempted.has(cacheKey)) {
+			this.tui.requestRender();
+			return;
+		}
+		if (this.cryptoQuoteLoading) return;
+		this.cryptoQuoteLoading = true;
+		this.cryptoQuoteAttempted.add(cacheKey);
+		try {
+			const quote = await fetchQuote(yahooSymbol, scope);
+			this.cryptoQuotes.set(cacheKey, quote);
+		} catch {
+			// Chart stays unavailable for this symbol; the right pane shows a
+			// quiet "no bars" note instead of an error wall.
+		} finally {
+			this.cryptoQuoteLoading = false;
+			this.tui.requestRender();
+		}
 	}
 
 	private snapshotStatus(): string {
@@ -6082,6 +6257,10 @@ class MarketHub {
 		this.signalStoryScroll = 0;
 		this.eventBriefingScroll = 0;
 		this.status = `CHART SCOPE · ${CHART_SCOPE_CONFIGS[scope].label}`;
+		if (this.screen === MARKET_SCREEN.market && this.marketView === "crypto") {
+			const row = this.cryptoRows()[this.cryptoSelected];
+			void this.ensureCryptoChart(row?.row.yahooSymbol, scope);
+		}
 		void this.refresh();
 	}
 
@@ -6271,10 +6450,19 @@ class MarketHub {
 			this.tui.requestRender();
 			return;
 		}
-		if ((data === "g" || data === "G") && this.screen === MARKET_SCREEN.market) {
+		if (data === "g" || data === "G") {
+			if (this.screen !== MARKET_SCREEN.market) {
+				// G is now a shortcut from any screen: jump to the Market map so the
+				// toggle is never a silent no-op, then switch to crypto/global.
+				this.screen = MARKET_SCREEN.market;
+			}
 			this.marketView = this.marketView === "global" ? "crypto" : "global";
 			this.status = this.marketView === "crypto" ? "CRYPTO PULSE · G GLOBAL · R SYNC · J OPEN" : "MARKET MAP · G CRYPTO PULSE";
-			if (this.marketView === "crypto") void this.loadCryptoPulse();
+			if (this.marketView === "crypto") {
+				void this.loadCryptoPulse();
+				const row = this.cryptoRows()[this.cryptoSelected];
+				void this.ensureCryptoChart(row?.row.yahooSymbol);
+			}
 			this.tui.requestRender();
 			return;
 		}
@@ -6535,7 +6723,7 @@ class MarketHub {
 			horizontalLabel: "SCREEN",
 			verticalLabel: scrolling ? "SCROLL" : "SELECT",
 			tabLabel,
-			cryptoView: this.screen === MARKET_SCREEN.market ? this.marketView : undefined,
+			cryptoView: this.screen === MARKET_SCREEN.market ? this.marketView : this.marketView === "crypto" ? "crypto" : "global",
 			expanded: this.helpExpanded,
 		});
 
@@ -6575,8 +6763,9 @@ class MarketHub {
 			if (entry?.type === "quote") {
 				const direction = (entry.quote.change ?? 0) >= 0 ? "success" : "error";
 				const chartDirection = entry.quote.points.length >= 2 ? entry.quote.points.at(-1)! >= entry.quote.points[0]! ? "success" : "error" : direction;
+				const deltaBase = entry.quote.chartScope === "day" ? entry.quote.previousClose ?? null : entry.quote.points[0] ?? null;
 				left.push(`${th.bold(th.fg(direction, `> ${entry.quote.symbol}`))} ${th.fg("muted", entry.quote.name)} ${th.bold(th.fg(direction, percent(entry.quote.changePercent)))}`);
-				left.push(...chartLines(entry.quote.points, Math.floor(width * 0.59), (text) => th.fg(chartDirection, text), (text) => th.fg("dim", text), entry.quote.chartScope === "day" ? entry.quote.previousClose : undefined, Math.max(2, Math.min(18, bodyRows - 8)), entry.quote.pointTimes, entry.quote.pointSessions, entry.quote.timezone, entry.quote.interval, (value) => dollars(value, entry.quote.currency), undefined, undefined, entry.quote.chartScope));
+				left.push(...chartLines(entry.quote.points, Math.floor(width * 0.59), (text) => th.fg("success", text), (text) => th.fg("dim", text), entry.quote.chartScope === "day" ? entry.quote.previousClose : undefined, Math.max(2, Math.min(18, bodyRows - 8)), entry.quote.pointTimes, entry.quote.pointSessions, entry.quote.timezone, entry.quote.interval, (value) => dollars(value, entry.quote.currency), undefined, undefined, entry.quote.chartScope, "candles", undefined, (text) => th.fg("error", text), entry.quote.pointVolumes, deltaBase, entry.quote.pointOpens, entry.quote.pointHighs, entry.quote.pointLows));
 			}
 			const movers = this.snapshot.movers.slice(0, 6);
 			const right = [th.bold(th.fg("accent", "ON THE MOVE")), ...movers.map(({ quote }) => `${directionGlyph(quote.change)} ${th.bold(th.fg("text", quote.symbol.padEnd(6)))} ${th.fg((quote.change ?? 0) >= 0 ? "success" : "error", percent(quote.changePercent))}`), "", th.bold(th.fg("accent", "LEAD SIGNAL"))];
@@ -6594,7 +6783,8 @@ class MarketHub {
 			const direction = (quote.change ?? 0) >= 0 ? "success" : "error";
 			const chartDirection = quote.points.length >= 2 ? quote.points.at(-1)! >= quote.points[0]! ? "success" : "error" : direction;
 			const selectedBlock = [fit(`${th.bold(th.fg(direction, `> ${quote.symbol}`))} ${th.fg("muted", quote.name)} ${th.bold(th.fg(direction, percent(quote.changePercent)))}`)];
-			for (const row of chartLines(quote.points, width, (text) => th.fg(chartDirection, text), (text) => th.fg("dim", text), quote.chartScope === "day" ? quote.previousClose : undefined, Math.max(2, Math.min(26, bodyRows - 12)), quote.pointTimes, quote.pointSessions, quote.timezone, quote.interval, (value) => dollars(value, quote.currency), undefined, undefined, quote.chartScope)) selectedBlock.push(fit(row));
+			const deltaBase = quote.chartScope === "day" ? quote.previousClose ?? null : quote.points[0] ?? null;
+			for (const row of chartLines(quote.points, width, (text) => th.fg("success", text), (text) => th.fg("dim", text), quote.chartScope === "day" ? quote.previousClose : undefined, Math.max(2, Math.min(26, bodyRows - 12)), quote.pointTimes, quote.pointSessions, quote.timezone, quote.interval, (value) => dollars(value, quote.currency), undefined, undefined, quote.chartScope, "candles", undefined, (text) => th.fg("error", text), quote.pointVolumes, deltaBase, quote.pointOpens, quote.pointHighs, quote.pointLows)) selectedBlock.push(fit(row));
 			blocks.push(selectedBlock);
 		}
 		const movers = this.snapshot.movers.slice(0, 4);
@@ -6673,13 +6863,42 @@ class MarketHub {
 			stripBlock.push(fit(`${th.fg("dim", "TOP-20 MOVERS · DISPLAY ONLY")}  ${leaders}${laggards ? `  │  ${laggards}` : ""}`));
 		}
 
+		// Right pane: candle chart for the selected crypto row. Fills the dead
+		// space that previously held only the COLDEST list, and keeps the
+		// layout animated when the selection changes.
+		const chartBlock: string[] = [];
+		const selectedRow = rows[this.cryptoSelected]?.row;
+		const chartSymbol = selectedRow?.yahooSymbol ?? null;
+		const chartQuote = chartSymbol ? this.cryptoQuotes.get(`${this.chartScope}:${chartSymbol}`) : undefined;
+		if (chartSymbol && !chartQuote) {
+			chartBlock.push(fit(th.bold(th.fg("accent", "PRICE CHART"))));
+			chartBlock.push(fit(th.fg("dim", `  ${chartSymbol} · syncing chart…`)));
+			chartBlock.push(fit(th.fg("dim", "  J opens the full ticker · K why · E watch")));
+		} else if (chartQuote) {
+			const direction = (chartQuote.change ?? 0) >= 0 ? "success" : "error";
+			const deltaBase = chartQuote.chartScope === "day" ? chartQuote.previousClose ?? null : chartQuote.points[0] ?? null;
+			chartBlock.push(fit(`${th.bold(th.fg("accent", "PRICE CHART"))}  ${th.bold(th.fg("text", chartQuote.symbol))} ${th.bold(th.fg(direction, `${dollars(chartQuote.price, chartQuote.currency)} ${percent(chartQuote.changePercent)}`))}`));
+			chartBlock.push(fit(th.fg("dim", `  ${CHART_SCOPE_CONFIGS[this.chartScope].label} · ${chartQuote.chartScope === "day" ? `${chartQuote.interval} · PRE/REG/POST` : chartQuote.interval} · J open · K why · E watch`)));
+			if (chartQuote.points.length >= 2) {
+				for (const row of chartLines(chartQuote.points, Math.floor(width * 0.39), (text) => th.fg("success", text), (text) => th.fg("dim", text), chartQuote.chartScope === "day" ? chartQuote.previousClose : undefined, Math.max(2, Math.min(16, bodyRows - 6)), chartQuote.pointTimes, chartQuote.pointSessions, chartQuote.timezone, chartQuote.interval, (value) => dollars(value, chartQuote.currency), undefined, undefined, chartQuote.chartScope, "candles", undefined, (text) => th.fg("error", text), chartQuote.pointVolumes, deltaBase, chartQuote.pointOpens, chartQuote.pointHighs, chartQuote.pointLows)) chartBlock.push(fit(row));
+			} else {
+				chartBlock.push(fit(th.fg("dim", "  No intraday bars from the delayed feed for this symbol.")));
+			}
+			if (chartQuote.dayLow !== null || chartQuote.dayHigh !== null || chartQuote.volume !== null) {
+				chartBlock.push(fit(th.fg("dim", `  Range ${dollars(chartQuote.dayLow, chartQuote.currency)} – ${dollars(chartQuote.dayHigh, chartQuote.currency)} · Vol ${compactNumber(chartQuote.volume)}`)));
+			}
+		} else {
+			chartBlock.push(fit(th.bold(th.fg("accent", "PRICE CHART"))));
+			chartBlock.push(fit(th.fg("dim", "  Select a mover to see its chart here.")));
+		}
+
 		if (width >= 84 && terminalRows(this.tui) >= 24) {
 			// Natural-height two-column board; the full-width strip sits right
 			// under it and composeScreen pads any remaining rows at the bottom.
-			lines.push(...twoColumn([...head, ...hotBlock], coldBlock, width, 0));
+			lines.push(...twoColumn([...head, ...hotBlock], [...chartBlock, "", ...coldBlock], width, 0));
 			lines.push(...stripBlock);
 		} else {
-			lines.push(...stretchBlocks([head, hotBlock, coldBlock, stripBlock], bodyRows, "", 1));
+			lines.push(...stretchBlocks([head, hotBlock, coldBlock, chartBlock, stripBlock], bodyRows, "", 1));
 		}
 	}
 
@@ -7086,7 +7305,7 @@ class MarketHub {
 			const left = [heading, "", ...window.items.map((mover, offset) => moverRow(mover, window.start + offset))];
 			if (window.items.length < movers.length) left.push(th.fg("dim", `MOVERS ${window.start + 1}–${window.start + window.items.length} / ${movers.length}`));
 			const right = [th.bold(th.fg("accent", "SELECTED MOVER")), selectedSummary, selectedMetrics, ""];
-			right.push(...chartLines(selectedQuote.points, Math.floor(width * 0.39), (text) => th.fg(chartTone, text), (text) => th.fg("dim", text), selectedQuote.chartScope === "day" ? selectedQuote.previousClose : undefined, Math.max(2, Math.min(18, bodyRows - right.length - 2)), selectedQuote.pointTimes, selectedQuote.pointSessions, selectedQuote.timezone, selectedQuote.interval, (value) => dollars(value, selectedQuote.currency), undefined, undefined, selectedQuote.chartScope));
+			right.push(...chartLines(selectedQuote.points, Math.floor(width * 0.39), (text) => th.fg("success", text), (text) => th.fg("dim", text), selectedQuote.chartScope === "day" ? selectedQuote.previousClose : undefined, Math.max(2, Math.min(18, bodyRows - right.length - 2)), selectedQuote.pointTimes, selectedQuote.pointSessions, selectedQuote.timezone, selectedQuote.interval, (value) => dollars(value, selectedQuote.currency), undefined, undefined, selectedQuote.chartScope, "candles", undefined, (text) => th.fg("error", text), selectedQuote.pointVolumes, selectedQuote.chartScope === "day" ? selectedQuote.previousClose ?? null : selectedQuote.points[0] ?? null, selectedQuote.pointOpens, selectedQuote.pointHighs, selectedQuote.pointLows));
 			lines.push(...twoColumn(left, right, width, bodyRows));
 			return;
 		}
@@ -7097,7 +7316,7 @@ class MarketHub {
 		if (window.items.length < movers.length) listBlock.push(fit(th.fg("dim", `MOVERS ${window.start + 1}–${window.start + window.items.length} / ${movers.length}`)));
 		const detailBlock = [fit(selectedSummary), fit(selectedMetrics)];
 		if (bodyRows >= 18) {
-			for (const row of chartLines(selectedQuote.points, width, (text) => th.fg(chartTone, text), (text) => th.fg("dim", text), selectedQuote.chartScope === "day" ? selectedQuote.previousClose : undefined, Math.max(2, Math.min(10, bodyRows - listBlock.length - 6)), selectedQuote.pointTimes, selectedQuote.pointSessions, selectedQuote.timezone, selectedQuote.interval, (value) => dollars(value, selectedQuote.currency), undefined, undefined, selectedQuote.chartScope)) detailBlock.push(fit(row));
+			for (const row of chartLines(selectedQuote.points, width, (text) => th.fg("success", text), (text) => th.fg("dim", text), selectedQuote.chartScope === "day" ? selectedQuote.previousClose : undefined, Math.max(2, Math.min(10, bodyRows - listBlock.length - 6)), selectedQuote.pointTimes, selectedQuote.pointSessions, selectedQuote.timezone, selectedQuote.interval, (value) => dollars(value, selectedQuote.currency), undefined, undefined, selectedQuote.chartScope, "candles", undefined, (text) => th.fg("error", text), selectedQuote.pointVolumes, selectedQuote.chartScope === "day" ? selectedQuote.previousClose ?? null : selectedQuote.points[0] ?? null, selectedQuote.pointOpens, selectedQuote.pointHighs, selectedQuote.pointLows)) detailBlock.push(fit(row));
 		}
 		lines.push(...stretchBlocks([listBlock, detailBlock], bodyRows, th.fg("borderMuted", "  │"), 1));
 	}
@@ -7243,7 +7462,7 @@ class MarketHub {
 				const chartDirection = selected.quote.points.length >= 2 ? selected.quote.points.at(-1)! >= selected.quote.points[0]! ? "success" : "error" : direction;
 				right.push(`${th.bold(th.fg("text", selected.quote.symbol))} ${th.bold(th.fg("text", dollars(selected.quote.price, selected.quote.currency)))} ${th.fg(direction, percent(selected.quote.changePercent))}`);
 				right.push(th.fg("dim", `Day range ${dollars(selected.quote.dayLow, selected.quote.currency)} – ${dollars(selected.quote.dayHigh, selected.quote.currency)} · Volume ${compactNumber(selected.quote.volume)} · Quote ${relativeAge(selected.quote.updatedAt)}`), "");
-				right.push(...chartLines(selected.quote.points, Math.floor(width * 0.39), (text) => th.fg(chartDirection, text), (text) => th.fg("dim", text), selected.quote.chartScope === "day" ? selected.quote.previousClose : undefined, Math.max(2, Math.min(18, bodyRows - 7)), selected.quote.pointTimes, selected.quote.pointSessions, selected.quote.timezone, selected.quote.interval, (value) => dollars(value, selected.quote.currency), undefined, undefined, selected.quote.chartScope));
+				right.push(...chartLines(selected.quote.points, Math.floor(width * 0.39), (text) => th.fg("success", text), (text) => th.fg("dim", text), selected.quote.chartScope === "day" ? selected.quote.previousClose : undefined, Math.max(2, Math.min(18, bodyRows - 7)), selected.quote.pointTimes, selected.quote.pointSessions, selected.quote.timezone, selected.quote.interval, (value) => dollars(value, selected.quote.currency), undefined, undefined, selected.quote.chartScope, "candles", undefined, (text) => th.fg("error", text), selected.quote.pointVolumes, selected.quote.chartScope === "day" ? selected.quote.previousClose ?? null : selected.quote.points[0] ?? null, selected.quote.pointOpens, selected.quote.pointHighs, selected.quote.pointLows));
 			}
 			lines.push(...twoColumn(left, right, width, bodyRows));
 			return;
@@ -7263,7 +7482,7 @@ class MarketHub {
 			const direction = (selected.quote.change ?? 0) >= 0 ? "success" : "error";
 			const chartDirection = selected.quote.points.length >= 2 ? selected.quote.points.at(-1)! >= selected.quote.points[0]! ? "success" : "error" : direction;
 			const detailBlock: string[] = [fit(`${th.bold(th.fg("text", selected.quote.symbol))} ${th.bold(th.fg("text", dollars(selected.quote.price, selected.quote.currency)))} ${th.fg(direction, percent(selected.quote.changePercent))}`)];
-			for (const row of chartLines(selected.quote.points, width, (text) => th.fg(chartDirection, text), (text) => th.fg("dim", text), selected.quote.chartScope === "day" ? selected.quote.previousClose : undefined, Math.max(2, Math.min(18, bodyRows - listBlock.length - 7)), selected.quote.pointTimes, selected.quote.pointSessions, selected.quote.timezone, selected.quote.interval, (value) => dollars(value, selected.quote.currency), undefined, undefined, selected.quote.chartScope)) detailBlock.push(fit(row));
+			for (const row of chartLines(selected.quote.points, width, (text) => th.fg("success", text), (text) => th.fg("dim", text), selected.quote.chartScope === "day" ? selected.quote.previousClose : undefined, Math.max(2, Math.min(18, bodyRows - listBlock.length - 7)), selected.quote.pointTimes, selected.quote.pointSessions, selected.quote.timezone, selected.quote.interval, (value) => dollars(value, selected.quote.currency), undefined, undefined, selected.quote.chartScope, "candles", undefined, (text) => th.fg("error", text), selected.quote.pointVolumes, selected.quote.chartScope === "day" ? selected.quote.previousClose ?? null : selected.quote.points[0] ?? null, selected.quote.pointOpens, selected.quote.pointHighs, selected.quote.pointLows)) detailBlock.push(fit(row));
 			if (selected.quote.dayLow !== null || selected.quote.dayHigh !== null || selected.quote.volume !== null) {
 				detailBlock.push(fit(th.fg("dim", `Day range ${dollars(selected.quote.dayLow, selected.quote.currency)} – ${dollars(selected.quote.dayHigh, selected.quote.currency)} · Volume ${compactNumber(selected.quote.volume)} · Quote ${relativeAge(selected.quote.updatedAt)}`)));
 			}
@@ -7310,6 +7529,10 @@ function makeTestQuote(symbol: string, index: number, updatedAt = 1_700_000_000_
 		points: Array.from({ length: pointCount }, (_, point) => price * (0.99 + point / 4_800 + ((point % 5) - 2) / 1_000)),
 		pointTimes: Array.from({ length: pointCount }, (_, point) => updatedAt - (pointCount - 1 - point) * scopeBarMilliseconds(scope)),
 		pointSessions: Array.from({ length: pointCount }, (_, point): ChartSession => scope === "day" ? point < 8 ? "pre" : point >= 52 ? "post" : "regular" : "regular"),
+		pointVolumes: Array.from({ length: pointCount }, (_, point) => 100_000 + ((point * 37) % 5) * 60_000),
+		pointOpens: Array.from({ length: pointCount }, (_, point) => price * (0.99 + point / 4_800 + (((point + 3) % 5) - 2) / 1_000)),
+		pointHighs: Array.from({ length: pointCount }, (_, point) => price * (0.991 + point / 4_800 + ((point % 5) - 1) / 1_000)),
+		pointLows: Array.from({ length: pointCount }, (_, point) => price * (0.989 + point / 4_800 + ((point % 5) - 3) / 1_000)),
 		timezone: "America/New_York",
 		interval: cfg.yahooInterval,
 		source: "deterministic UI test fixture",
