@@ -194,7 +194,9 @@ test("Crypto Pulse renders the mood strip and HOT/COLD scoreboard in char cells"
   assert.ok(lines.some((line: string) => /DOGE/.test(line) && /8\.5/.test(line)), "HOTTEST row should show DOGE +8.50%");
   assert.ok(lines.some((line: string) => /XRP/.test(line) && /-3\.1/.test(line)), "COLDEST row should show XRP -3.10%");
   // Display-only broad-market strip renders and is labeled.
-  assert.ok(lines.some((line: string) => line.includes("TOP-20 MOVERS")), "movers strip should render");
+  const stripIdx = lines.findIndex((line: string) => line.includes("TOP-20 MOVERS"));
+  assert.ok(stripIdx >= 0, "movers strip should render");
+  assert.ok(stripIdx < 20, `movers strip must sit under the board, not be stranded at the bottom (index ${stripIdx})`);
 
   // Narrow layout: blocks stack, so HOTTEST/COLDEST become standalone headers.
   const narrow = await uiTest.execute("state", { action: "state", width: 80, height: 30 });

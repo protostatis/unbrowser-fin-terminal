@@ -6287,24 +6287,24 @@ class MarketHub {
 
 		// Display-only surfaces: UNRANKED universe assets and the TOP-20 MOVERS
 		// strip. Neither participates in W/S selection or J/K/E.
-		const extra: string[] = [];
+		const stripBlock: string[] = [];
 		if (pulse.unranked.length > 0) {
-			extra.push(fit(`${th.fg("dim", "UNRANKED · NO QUOTE")}  ${pulse.unranked.map((row) => row.symbol).join(" ")}`));
+			stripBlock.push(fit(`${th.fg("dim", "UNRANKED · NO QUOTE")}  ${pulse.unranked.map((row) => row.symbol).join(" ")}`));
 		}
 		if (pulse.movers) {
 			const tone = (row: CryptoScoreboardRow) => (row.change24h >= 0 ? "success" : "error");
 			const leaders = pulse.movers.leaders.map((row) => th.fg(tone(row), `▲ ${row.symbol} ${percent(row.change24h)}`)).join("  ");
 			const laggards = pulse.movers.laggards.map((row) => th.fg(tone(row), `▼ ${row.symbol} ${percent(row.change24h)}`)).join("  ");
-			extra.push(fit(`${th.fg("dim", "TOP-20 MOVERS · DISPLAY ONLY")}  ${leaders}${laggards ? `  │  ${laggards}` : ""}`));
+			stripBlock.push(fit(`${th.fg("dim", "TOP-20 MOVERS · DISPLAY ONLY")}  ${leaders}${laggards ? `  │  ${laggards}` : ""}`));
 		}
 
-		const reserved = extra.length;
 		if (width >= 84 && terminalRows(this.tui) >= 24) {
-			lines.push(...twoColumn([...head, ...hotBlock], coldBlock, width, Math.max(1, bodyRows - reserved)));
-			lines.push(...extra);
+			// Natural-height two-column board; the full-width strip sits right
+			// under it and composeScreen pads any remaining rows at the bottom.
+			lines.push(...twoColumn([...head, ...hotBlock], coldBlock, width, 0));
+			lines.push(...stripBlock);
 		} else {
-			lines.push(...stretchBlocks([head, hotBlock, coldBlock], Math.max(1, bodyRows - reserved), "", 1));
-			lines.push(...extra);
+			lines.push(...stretchBlocks([head, hotBlock, coldBlock, stripBlock], bodyRows, "", 1));
 		}
 	}
 
