@@ -117,9 +117,12 @@ Provider adapters (CMC / DefiLlama / CoinGecko / PanicRadar)
 ```
 
 - **One durable polling owner.** Crypto polling must not run in disposable public workers (scouts are already disabled there; [`docs/deployment.md`](deployment.md)). Public workers consume cached snapshots; they never independently poll.
+- **Two universes, explicitly.** The interactive board is the fixed 14-asset universe fetched **by stable CMC ID** (`quotes/latest?id=...`), so it never depends on CMC rank churn. The CMC top-N listings feed only the **display-only TOP-20 MOVERS strip** (leaders/laggards + breadth), which is never selectable and never opens. This replaces the earlier intersection contract ("universe ∩ top-N"), which silently dropped universe assets ranked below the top-N.
+- **Relative, not sign-based.** The board ranks the 14 by signed 24h change into relative **HOTTEST** (top half) and **COLDEST** (bottom half, ascending). Both columns stay populated in one-directional markets; COLDEST rows carry signed percentages. Assets without a finite 24h change go to an `UNRANKED · NO QUOTE` section (still selectable/openable, never falsely classified).
+- **Stablecoin detection is tag-first** (CMC `stablecoin` tag) with an uppercased-symbol denylist as a defensive fallback — not a primary classifier.
 - **Bounded payloads.** DefiLlama `/protocols` and CMC `/map` are large — require field projection, response-size limits, timeouts, and schema validation on every adapter.
 - **Fallback discipline.** A CMC/DefiLlama failure degrades only the crypto enrichment. It must never take down the existing Yahoo charts, watchlist, or research.
-- **Shared-IP rate discipline.** CMC keyless and CoinGecko keyless are IP-pooled. For a public deployment behind NAT, one noisy poll loop can exhaust the pool for every user. Mitigate: central cache, request jitter, `stale-while-revalidate`, honor `Retry-After`, and a circuit breaker per provider.
+- **Shared-IP rate discipline.** CMC keyless and CoinGecko keyless are IP-pooled. For a public deployment behind NAT, one noisy poll loop can exhaust the pool for every user. Phase 1 ships **deferred** on this: request jitter, `Retry-After` honoring, and a per-provider circuit breaker are documented requirements but not implemented — the single-user terminal relies on timeouts + byte caps + the 60s stale-while-revalidate cache. The **deploy topology** phase (single durable poller + shared cache) must add them before this reaches the public-worker topology.
 
 ## 9. Freshness & Anomaly Semantics
 

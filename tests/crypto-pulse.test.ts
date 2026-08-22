@@ -2,11 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   CRYPTO_INTERACTIVE_UNIVERSE,
-  buildHotColdScoreboard,
+  buildMoversStrip,
+  buildUniverseScoreboard,
   deriveCryptoMood,
   fetchCryptoPulse,
   interactiveUniverseIndex,
   isCryptoPulseUsable,
+  isStablecoinListing,
   isStablecoinSymbol,
   type CryptoListing,
 } from "../shared/crypto-pulse.js";
@@ -40,6 +42,7 @@ const CMC_LISTING = (overrides: Partial<Record<string, unknown>>) => ({
   slug: "bitcoin",
   cmc_rank: 1,
   circulating_supply: 20071518,
+  tags: ["mineable", "pow"],
   last_updated: "2026-08-22T14:18:00.000Z",
   quote: [{
     symbol: "USD",
@@ -62,21 +65,66 @@ const CMC_LISTINGS = {
       id: 1027, symbol: "ETH", name: "Ethereum", slug: "ethereum", cmc_rank: 2,
       quote: [{ symbol: "USD", price: 2427.15, volume_24h: 2e10, market_cap: 2.9e11, market_cap_dominance: 11.4, percent_change_24h: 2.9, percent_change_7d: 8.1 }],
     }),
+    // Stablecoin (tag-classified) excluded from the movers strip.
+    CMC_LISTING({
+      id: 825, symbol: "USDT", name: "Tether", slug: "tether", cmc_rank: 3, tags: ["stablecoin", "asset-backed-stablecoin"],
+      quote: [{ symbol: "USD", price: 1.0, volume_24h: 5e10, market_cap: 1.2e11, market_cap_dominance: 4.6, percent_change_24h: 0.01, percent_change_7d: 0.0 }],
+    }),
     CMC_LISTING({
       id: 5426, symbol: "SOL", name: "Solana", slug: "solana", cmc_rank: 5,
       quote: [{ symbol: "USD", price: 144.8, volume_24h: 8e9, market_cap: 6.6e10, market_cap_dominance: 2.5, percent_change_24h: 7.8, percent_change_7d: 15.0 }],
     }),
-    // Stablecoin excluded from scoreboard.
-    CMC_LISTING({
-      id: 825, symbol: "USDT", name: "Tether", slug: "tether", cmc_rank: 3,
-      quote: [{ symbol: "USD", price: 1.0, volume_24h: 5e10, market_cap: 1.2e11, market_cap_dominance: 4.6, percent_change_24h: 0.01, percent_change_7d: 0.0 }],
-    }),
-    // Losing asset, not in interactive universe (render-only).
+    // Non-universe mover appears in the display-only strip only.
     CMC_LISTING({
       id: 99999, symbol: "BOGUS", name: "BogusCoin", slug: "boguscoin", cmc_rank: 40,
       quote: [{ symbol: "USD", price: 0.5, volume_24h: 1e6, market_cap: 5e6, market_cap_dominance: 0.0, percent_change_24h: -12.0, percent_change_7d: -30.0 }],
     }),
   ],
+};
+
+/**
+ * quotes/latest fixture for the 14 universe assets with deterministic 24h
+ * changes (verified CMC IDs; name reflects the corrected registry).
+ */
+const UNIVERSE_CHANGES: ReadonlyArray<[number, string, number]> = [
+  [1, 0.02],       // BTC
+  [1027, 0.81],    // ETH
+  [5426, 2.93],    // SOL
+  [52, 5.94],      // XRP
+  [1839, 2.61],    // BNB
+  [74, 9.97],      // DOGE
+  [2010, 4.56],    // ADA
+  [5805, -0.54],   // AVAX
+  [6636, 4.42],    // DOT
+  [1975, 2.25],    // LINK
+  [28321, 25.08],  // POL
+  [2, 2.21],       // LTC
+  [7083, 7.67],    // UNI
+  [21794, 2.03],   // APT
+];
+
+function universeQuote(cmcId: number, change24h: number | null): Record<string, unknown> {
+  const universe = interactiveUniverseIndex().get(cmcId)!;
+  return CMC_LISTING({
+    id: cmcId,
+    symbol: universe.label,
+    name: universe.label,
+    slug: universe.label.toLowerCase(),
+    cmc_rank: cmcId,
+    quote: [{
+      symbol: "USD",
+      price: 100 + cmcId,
+      volume_24h: 1e9,
+      market_cap: 1e11,
+      market_cap_dominance: cmcId === 1 ? 59.24 : 0.1,
+      percent_change_24h: change24h,
+      percent_change_7d: (change24h ?? 0) * 2,
+    }],
+  });
+}
+
+const CMC_QUOTES = {
+  data: UNIVERSE_CHANGES.map(([cmcId, change]) => universeQuote(cmcId, change)),
 };
 
 const PANIC_RADAR_SUMMARY = {
@@ -112,43 +160,47 @@ function mockFetchFor(route: (url: string) => Response) {
   return async (url: string) => route(url);
 }
 
+function allProvidersMock(url: string): Response {
+  if (url.includes("/global-metrics/")) return jsonResponse(CMC_GLOBAL_METRICS);
+  if (url.includes("/fear-and-greed/")) return jsonResponse(CMC_FEAR_GREED);
+  if (url.includes("/listings/")) return jsonResponse(CMC_LISTINGS);
+  if (url.includes("/quotes/latest")) return jsonResponse(CMC_QUOTES);
+  if (url.includes("/dashboard/summary")) return jsonResponse(PANIC_RADAR_SUMMARY);
+  if (url.includes("/dashboard/panic-score")) return jsonResponse(PANIC_RADAR_PANIC_SCORE);
+  return new Response("not found", { status: 404 });
+}
+
 test("fetches a normalized crypto pulse snapshot from all providers", async () => {
-  const fetchImpl = mockFetchFor((url) => {
-    if (url.includes("/global-metrics/")) return jsonResponse(CMC_GLOBAL_METRICS);
-    if (url.includes("/fear-and-greed/")) return jsonResponse(CMC_FEAR_GREED);
-    if (url.includes("/listings/")) return jsonResponse(CMC_LISTINGS);
-    if (url.includes("/dashboard/summary")) return jsonResponse(PANIC_RADAR_SUMMARY);
-    if (url.includes("/dashboard/panic-score")) return jsonResponse(PANIC_RADAR_PANIC_SCORE);
-    return new Response("not found", { status: 404 });
-  });
   const now = Date.parse("2026-08-22T14:20:00Z");
 
-  const { snapshot, errors } = await fetchCryptoPulse({ fetchImpl, now: () => now });
+  const { snapshot, errors } = await fetchCryptoPulse({ fetchImpl: mockFetchFor(allProvidersMock), now: () => now });
 
   assert.deepEqual(errors, []);
   assert.deepEqual(snapshot.providers, { cmc: true, panicRadar: true });
   assert.ok(snapshot.globalMetrics);
   assert.equal(snapshot.globalMetrics.totalMarketCap, 2607236260883.6235);
-  assert.equal(snapshot.globalMetrics.changeYesterdayPercent, 2.13);
   assert.ok(snapshot.fearGreed);
   assert.equal(snapshot.fearGreed.value, 76);
   assert.equal(snapshot.fearGreed.label, "GREED");
   assert.equal(snapshot.listings.length, 5);
+  assert.equal(snapshot.hot.length, 7);
+  assert.equal(snapshot.cold.length, 7);
+  assert.equal(snapshot.unranked.length, 0);
+  assert.ok(snapshot.movers);
+  assert.equal(snapshot.movers.leaders.length, 3);
+  assert.equal(snapshot.movers.laggards.length, 3);
   assert.ok(snapshot.panicRadarSummary);
-  assert.equal(snapshot.panicRadarSummary.fearGreedIndex, 71);
   assert.equal(snapshot.panicRadarSummary.volatilityState, "High");
-  assert.ok(snapshot.panicScore);
-  assert.equal(snapshot.panicScore.panicScore, 15.5);
+  assert.equal(snapshot.panicScore?.panicScore, 15.5);
 });
 
 test("mood derivation merges CMC primary with PanicRadar secondary", () => {
-  const listings = snapshotListings();
   const mood = deriveCryptoMood(
     { value: 76, label: "GREED", asOf: { provider: "cmc", fetchedAt: 1 } },
     { totalMarketCap: 2.6e12, totalVolume24h: 1.6e11, altcoinMarketCap: 1e12, stablecoinMarketCap: 2.8e11, changeYesterdayPercent: 2.13, asOf: { provider: "cmc", fetchedAt: 1 } },
     { sentimentScore: -0.006, sentimentState: "Neutral", fearGreedIndex: 71, fearGreedLabel: "GREED", volatility24h: 4.53, volatilityState: "High", btcPrice: 77044, btcChange24h: 5.47, btcChange7d: 22.32, asOf: { provider: "panicRadar", fetchedAt: 1 } },
     { panicScore: 15.5, totalPosts: 228, bearishPosts: 25, bullishPosts: 27, avgSentiment: 0.006, sentimentLabel: "CALM", asOf: { provider: "panicRadar", fetchedAt: 1 } },
-    listings,
+    parseQuotes(CMC_QUOTES),
     1000,
   );
 
@@ -189,12 +241,12 @@ test("provider failure isolates and degrades only its own datasets", async () =>
     if (url.includes("/global-metrics/")) return jsonResponse(CMC_GLOBAL_METRICS);
     if (url.includes("/fear-and-greed/")) return jsonResponse(CMC_FEAR_GREED);
     if (url.includes("/listings/")) return jsonResponse(CMC_LISTINGS);
+    if (url.includes("/quotes/latest")) return jsonResponse(CMC_QUOTES);
     return new Response("not found", { status: 404 });
   });
 
   const { snapshot, errors } = await fetchCryptoPulse({ fetchImpl });
 
-  // PanicRadar down: both its datasets null, CMC intact.
   assert.equal(snapshot.panicRadarSummary, null);
   assert.equal(snapshot.panicScore, null);
   assert.ok(snapshot.fearGreed);
@@ -203,44 +255,91 @@ test("provider failure isolates and degrades only its own datasets", async () =>
   assert.equal(errors.length, 2);
   assert.ok(errors.some((error) => error.startsWith("panicRadar.summary")));
   assert.ok(errors.some((error) => error.startsWith("panicRadar.panic-score")));
-  // Mood still derivable from CMC alone.
-  assert.ok(snapshot.mood);
-  assert.equal(snapshot.mood.value, 76);
+  // Board still derives from the CMC quotes source.
+  assert.equal(snapshot.hot.length, 7);
+  assert.equal(snapshot.cold.length, 7);
+  assert.equal(snapshot.mood?.value, 76);
 });
 
-test("scoreboard ranks interactive universe, excludes stablecoins", () => {
-  const listings = snapshotListings();
-  const { hot, cold } = buildHotColdScoreboard(listings, 5);
+test("universe board ranks all 14 into relative HOTTEST/COLDEST halves", () => {
+  const { hot, cold, unranked } = buildUniverseScoreboard(parseQuotes(CMC_QUOTES));
 
-  assert.deepEqual(hot.map((row) => row.symbol), ["SOL", "BTC", "ETH"]);
-  assert.equal(hot[0]!.change24h, 7.8);
-  assert.equal(hot[0]!.yahooSymbol, "SOL-USD");
-  // BogusCoin is not in the interactive universe; USDT is a stablecoin.
-  assert.deepEqual(cold, []);
+  assert.equal(hot.length, 7);
+  assert.equal(cold.length, 7);
+  assert.equal(unranked.length, 0);
+  assert.deepEqual(hot.map((row) => row.symbol), ["POL", "DOGE", "UNI", "XRP", "ADA", "DOT", "SOL"]);
+  assert.equal(hot[0]!.change24h, 25.08);
+  // COLDEST is ascending (worst first) and can contain positive returns.
+  assert.deepEqual(cold.map((row) => row.symbol), ["AVAX", "BTC", "ETH", "APT", "LTC", "LINK", "BNB"]);
+  assert.ok(cold[0]!.change24h <= cold.at(-1)!.change24h);
+  // Every universe asset appears exactly once across the board.
+  const seen = new Set([...hot, ...cold, ...unranked].map((row) => row.cmcId));
+  assert.equal(seen.size, CRYPTO_INTERACTIVE_UNIVERSE.length);
+  for (const asset of CRYPTO_INTERACTIVE_UNIVERSE) assert.ok(seen.has(asset.cmcId), `missing ${asset.label}`);
 });
 
-test("scoreboard splits a losing interactive asset into COLD", () => {
-  const listings = [
-    ...snapshotListings(),
-    listing(2, "LTC", 2, -4.2),
+test("a one-directional (all-positive) market still fills both columns", () => {
+  const quotes = UNIVERSE_CHANGES.map(([cmcId]) => universeQuote(cmcId, 1 + cmcId % 7));
+  const { hot, cold } = buildUniverseScoreboard(parseQuotes({ data: quotes }));
+  assert.equal(hot.length, 7);
+  assert.equal(cold.length, 7);
+  assert.ok(cold.every((row) => row.change24h > 0), "COLDEST is relative, not sign-based");
+  assert.ok(cold[0]!.change24h <= cold.at(-1)!.change24h);
+});
+
+test("missing-change universe assets land in unranked and remain mapped", () => {
+  const quotes = [
+    ...UNIVERSE_CHANGES.slice(0, 13).map(([cmcId, change]) => universeQuote(cmcId, change)),
+    universeQuote(21794, null), // APT without a finite 24h change
   ];
-  const { hot, cold } = buildHotColdScoreboard(listings, 5);
-  assert.deepEqual(cold.map((row) => row.symbol), ["LTC"]);
-  assert.equal(cold[0]!.yahooSymbol, "LTC-USD");
+  const { hot, cold, unranked } = buildUniverseScoreboard(parseQuotes({ data: quotes }));
+  assert.equal(hot.length, 7);
+  assert.equal(cold.length, 6);
+  assert.equal(unranked.length, 1);
+  assert.equal(unranked[0]!.symbol, "APT");
+  assert.equal(unranked[0]!.yahooSymbol, "APT-USD");
 });
 
-function snapshotListings(): CryptoListing[] {
-  return parseListings(CMC_LISTINGS);
-}
+test("movers strip excludes stablecoins, reports breadth, and is display-only", () => {
+  const strip = buildMoversStrip(parseListings(CMC_LISTINGS), 3);
+  assert.ok(strip);
+  assert.deepEqual(strip.leaders.map((row) => row.symbol), ["SOL", "BTC", "ETH"]);
+  assert.deepEqual(strip.laggards.map((row) => row.symbol), ["BOGUS", "ETH", "BTC"]);
+  assert.deepEqual(strip.breadth, { advancing: 3, declining: 1, measured: 4 });
+  assert.ok(strip.leaders.every((row) => row.yahooSymbol === null), "strip rows are display-only");
+});
+
+test("stablecoin helpers prefer the CMC tag over the symbol denylist", () => {
+  assert.equal(isStablecoinSymbol("USDT"), true);
+  assert.equal(isStablecoinSymbol("usdc"), true);
+  assert.equal(isStablecoinSymbol("USDE"), true);
+  assert.equal(isStablecoinSymbol("BTC"), false);
+  // Tag-classified even when the symbol would not match the denylist.
+  const tagged = parseListings(CMC_LISTINGS).find((listing) => listing.symbol === "USDT")!;
+  assert.equal(isStablecoinListing(tagged), true);
+  const untagged = parseListings(CMC_LISTINGS).find((listing) => listing.symbol === "ETH")!;
+  assert.equal(isStablecoinListing(untagged), false);
+});
+
+test("registry uses the verified stable CMC IDs for every universe asset", () => {
+  const ids = CRYPTO_INTERACTIVE_UNIVERSE.map((asset) => asset.cmcId);
+  assert.equal(new Set(ids).size, ids.length, "CMC IDs must be unique");
+  const known: Record<number, string> = {
+    1: "BTC", 1027: "ETH", 5426: "SOL", 52: "XRP", 1839: "BNB", 74: "DOGE", 2010: "ADA",
+    5805: "AVAX", 6636: "DOT", 1975: "LINK", 28321: "POL", 2: "LTC", 7083: "UNI", 21794: "APT",
+  };
+  for (const asset of CRYPTO_INTERACTIVE_UNIVERSE) {
+    assert.equal(asset.label, known[asset.cmcId], `CMC id ${asset.cmcId} must be ${known[asset.cmcId]}`);
+  }
+});
 
 function parseListings(raw: { data: unknown[] }): CryptoListing[] {
   const fetchedAt = Date.parse("2026-08-22T14:18:00Z");
   return raw.data.flatMap((item) => {
     const r = item as Record<string, unknown>;
     const quote = (r.quote as unknown[])[0] as Record<string, number>;
-    const id = r.id as number;
     return [{
-      cmcId: id,
+      cmcId: r.id as number,
       symbol: r.symbol as string,
       name: r.name as string,
       slug: r.slug as string,
@@ -252,95 +351,23 @@ function parseListings(raw: { data: unknown[] }): CryptoListing[] {
       change1h: quote.percent_change_1h,
       change24h: quote.percent_change_24h,
       change7d: quote.percent_change_7d,
+      tags: Array.isArray(r.tags) ? r.tags as string[] : [],
       asOf: { provider: "cmc", fetchedAt },
     }];
   });
 }
 
-function listing(cmcId: number, symbol: string, rank: number, change24h: number): CryptoListing {
-  const yahoo = CRYPTO_INTERACTIVE_UNIVERSE.find((asset) => asset.cmcId === cmcId);
-  return {
-    cmcId,
-    symbol: yahoo?.label ?? symbol,
-    name: symbol,
-    slug: symbol.toLowerCase(),
-    rank,
-    price: 100,
-    marketCap: 1e9,
-    marketCapDominance: 0.1,
-    volume24h: 1e8,
-    change1h: 0,
-    change24h,
-    change7d: 0,
-    asOf: { provider: "cmc", fetchedAt: 1 },
-  };
+function parseQuotes(raw: { data: unknown[] }): CryptoListing[] {
+  return parseListings(raw);
 }
-
-test("stablecoin and universe helpers behave deterministically", () => {
-  assert.equal(isStablecoinSymbol("USDT"), true);
-  assert.equal(isStablecoinSymbol("usdc"), true);
-  assert.equal(isStablecoinSymbol("BTC"), false);
-  assert.equal(isStablecoinSymbol("USDE"), true);
-  const universe = interactiveUniverseIndex();
-  assert.equal(universe.get(1)?.yahooSymbol, "BTC-USD");
-  assert.equal(universe.get(1027)?.yahooSymbol, "ETH-USD");
-  assert.equal(CRYPTO_INTERACTIVE_UNIVERSE.length >= 10, true);
-});
-
-test("panicRadarEnabled=false skips PanicRadar entirely", async () => {
-  const requested: string[] = [];
-  const fetchImpl = async (url: string) => {
-    requested.push(url);
-    if (url.includes("/global-metrics/")) return jsonResponse(CMC_GLOBAL_METRICS);
-    if (url.includes("/fear-and-greed/")) return jsonResponse(CMC_FEAR_GREED);
-    if (url.includes("/listings/")) return jsonResponse(CMC_LISTINGS);
-    return new Response("not found", { status: 404 });
-  };
-
-  const { snapshot, errors } = await fetchCryptoPulse({ fetchImpl, panicRadarEnabled: false });
-
-  assert.deepEqual(errors, []);
-  assert.deepEqual(snapshot.providers, { cmc: true, panicRadar: false });
-  assert.equal(snapshot.panicRadarSummary, null);
-  assert.equal(snapshot.panicScore, null);
-  assert.ok(snapshot.mood);
-  assert.equal(requested.some((url) => url.includes("panicradar.ai")), false);
-  assert.equal(requested.length, 3);
-});
-
-test("a hanging PanicRadar endpoint never blocks CMC data", async () => {
-  const fetchImpl = async (url: string, init?: RequestInit): Promise<Response> => {
-    if (url.includes("panicradar.ai")) {
-      // Resolve only when the caller aborts (simulates a hung upstream).
-      return new Promise((_resolve, reject) => {
-        init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
-      });
-    }
-    if (url.includes("/global-metrics/")) return jsonResponse(CMC_GLOBAL_METRICS);
-    if (url.includes("/fear-and-greed/")) return jsonResponse(CMC_FEAR_GREED);
-    if (url.includes("/listings/")) return jsonResponse(CMC_LISTINGS);
-    return new Response("not found", { status: 404 });
-  };
-
-  const started = Date.now();
-  const { snapshot, errors } = await fetchCryptoPulse({ fetchImpl, panicRadarTimeoutMs: 10, requestTimeoutMs: 10_000 });
-
-  // CMC came back intact; PanicRadar was cut off by its own short budget.
-  assert.ok(snapshot.fearGreed, "CMC fear/greed should be present");
-  assert.equal(snapshot.panicRadarSummary, null);
-  assert.equal(snapshot.panicScore, null);
-  assert.deepEqual(snapshot.providers, { cmc: true, panicRadar: false });
-  assert.equal(errors.length, 2);
-  assert.ok(errors.every((error) => error.startsWith("panicRadar.")));
-  assert.ok(Date.now() - started < 1_000, "hanging PanicRadar should not add a long tail");
-});
 
 test("isCryptoPulseUsable rejects provider-outage snapshots", async () => {
   const { snapshot: empty, errors: emptyErrors } = await fetchCryptoPulse({
     fetchImpl: async () => new Response("down", { status: 503 }),
   });
   assert.equal(isCryptoPulseUsable(empty), false);
-  assert.equal(emptyErrors.length, 5);
+  assert.equal(emptyErrors.length, 6);
   assert.equal(empty.mood, null);
-  assert.deepEqual(empty.hot, []);
+  assert.equal(empty.hot.length + empty.cold.length + empty.unranked.length, 0);
+  assert.equal(empty.movers, null);
 });

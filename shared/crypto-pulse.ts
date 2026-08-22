@@ -25,6 +25,9 @@ const CMC_GLOBAL_METRICS_URL = `${CMC_BASE_URL}/v1/global-metrics/quotes/latest?
 const CMC_FEAR_GREED_URL = `${CMC_BASE_URL}/v3/fear-and-greed/latest`;
 const CMC_LISTINGS_URL = (limit: number) =>
   `${CMC_BASE_URL}/v3/cryptocurrency/listings/latest?start=1&limit=${limit}&convert=USD`;
+/** Stable board source: the 14 curated universe assets fetched by stable CMC ID. */
+const CMC_QUOTES_URL = (ids: readonly number[]) =>
+  `${CMC_BASE_URL}/v3/cryptocurrency/quotes/latest?id=${ids.join(",")}&convert=USD`;
 
 const PANIC_RADAR_BASE_URL = "https://panicradar.ai";
 const PANIC_RADAR_SUMMARY_URL = `${PANIC_RADAR_BASE_URL}/api/dashboard/summary`;
@@ -47,25 +50,31 @@ const STABLECOIN_SYMBOLS = new Set([
 
 /**
  * Interactive drill-down universe: the small, curated set of crypto assets that
- * can open an existing quote view (Yahoo pair + TA). Display rows outside this
- * universe are render-only and must be visibly marked as such.
+ * can open an existing quote view (Yahoo pair + TA). Every row is selectable
+ * and openable; there is no render-only membership here (the TOP-20 MOVERS
+ * strip is the display-only surface).
+ *
+ * CMC IDs are the stable key (verified against the live quotes endpoint
+ * 2026-08-22). POL intentionally maps to the MATIC-USD Yahoo pair: Yahoo quotes
+ * Polygon as "MATIC-USD", and "POL-USD" resolves to a different token
+ * (Proof Of Liquidity) — a known symbol collision.
  */
 export const CRYPTO_INTERACTIVE_UNIVERSE: ReadonlyArray<{ cmcId: number; yahooSymbol: string; label: string }> =
   Object.freeze([
-    { cmcId: 1, yahooSymbol: "BTC-USD", label: "BTC" },
-    { cmcId: 1027, yahooSymbol: "ETH-USD", label: "ETH" },
-    { cmcId: 5426, yahooSymbol: "SOL-USD", label: "SOL" },
-    { cmcId: 52, yahooSymbol: "XRP-USD", label: "XRP" },
-    { cmcId: 1839, yahooSymbol: "BNB-USD", label: "BNB" },
-    { cmcId: 74, yahooSymbol: "DOGE-USD", label: "DOGE" },
-    { cmcId: 2010, yahooSymbol: "ADA-USD", label: "ADA" },
-    { cmcId: 5805, yahooSymbol: "AVAX-USD", label: "AVAX" },
-    { cmcId: 6636, yahooSymbol: "DOT-USD", label: "DOT" },
-    { cmcId: 8308, yahooSymbol: "LINK-USD", label: "LINK" },
-    { cmcId: 3890, yahooSymbol: "MATIC-USD", label: "POL" },
-    { cmcId: 2, yahooSymbol: "LTC-USD", label: "LTC" },
-    { cmcId: 24478, yahooSymbol: "UNI-USD", label: "UNI" },
-    { cmcId: 11127, yahooSymbol: "APT-USD", label: "APT" },
+    { cmcId: 1, yahooSymbol: "BTC-USD", label: "BTC" },       // Bitcoin
+    { cmcId: 1027, yahooSymbol: "ETH-USD", label: "ETH" },    // Ethereum
+    { cmcId: 5426, yahooSymbol: "SOL-USD", label: "SOL" },    // Solana
+    { cmcId: 52, yahooSymbol: "XRP-USD", label: "XRP" },      // XRP
+    { cmcId: 1839, yahooSymbol: "BNB-USD", label: "BNB" },    // BNB
+    { cmcId: 74, yahooSymbol: "DOGE-USD", label: "DOGE" },    // Dogecoin
+    { cmcId: 2010, yahooSymbol: "ADA-USD", label: "ADA" },    // Cardano
+    { cmcId: 5805, yahooSymbol: "AVAX-USD", label: "AVAX" },  // Avalanche
+    { cmcId: 6636, yahooSymbol: "DOT-USD", label: "DOT" },    // Polkadot
+    { cmcId: 1975, yahooSymbol: "LINK-USD", label: "LINK" },  // Chainlink
+    { cmcId: 28321, yahooSymbol: "MATIC-USD", label: "POL" }, // Polygon (prev. MATIC); Yahoo pair is MATIC-USD
+    { cmcId: 2, yahooSymbol: "LTC-USD", label: "LTC" },       // Litecoin
+    { cmcId: 7083, yahooSymbol: "UNI-USD", label: "UNI" },    // Uniswap
+    { cmcId: 21794, yahooSymbol: "APT-USD", label: "APT" },   // Aptos
   ]);
 
 // ── Typed datasets ──────────────────────────────────────────────────────────
@@ -102,6 +111,8 @@ export interface CryptoListing {
   change1h: number | null;
   change24h: number | null;
   change7d: number | null;
+  /** CMC-provided tags; `stablecoin` distinguishes stables from their ticker. */
+  tags: readonly string[];
   asOf: ProviderSource;
 }
 
@@ -151,15 +162,26 @@ export interface CryptoMood {
   sources: ReadonlyArray<"cmc" | "panicRadar">;
 }
 
-/** HOT/COLD scoreboard row for the interactive drill-down universe. */
+/** HOTTEST/COLDEST scoreboard row for the interactive drill-down universe. */
 export interface CryptoScoreboardRow {
   cmcId: number;
   symbol: string;
   yahooSymbol: string | null;
   rank: number;
   price: number | null;
+  /** Signed 24h % change. COLDEST rows may be positive in broad rallies. */
   change24h: number;
   volume24h: number | null;
+}
+
+/** Broad-market display-only strip derived from the CMC top-N listings. */
+export interface CryptoMoversStrip {
+  /** Top leaders by 24h % (descending). */
+  leaders: CryptoScoreboardRow[];
+  /** Worst laggards by 24h % (ascending, worst first). */
+  laggards: CryptoScoreboardRow[];
+  /** Advance/decline breadth over the measured non-stable listings. */
+  breadth: { advancing: number; declining: number; measured: number };
 }
 
 export interface CryptoPulseSnapshot {
@@ -170,13 +192,22 @@ export interface CryptoPulseSnapshot {
   };
   globalMetrics: CryptoGlobalMetrics | null;
   fearGreed: CryptoFearGreed | null;
+  /** CMC top-N listings (display-only movers strip + breadth source). */
   listings: CryptoListing[];
   panicRadarSummary: PanicRadarSummary | null;
   panicScore: PanicRadarPanicScore | null;
   mood: CryptoMood | null;
-  /** HOT (largest positive 24h move) and COLD (largest negative), interactive universe only. */
+  /**
+   * HOTTEST (top half of the 14-asset universe by signed 24h move) and
+   * COLDEST (bottom half, ascending). Both are relative rankings, so both
+   * columns stay populated even in one-directional markets.
+   */
   hot: CryptoScoreboardRow[];
   cold: CryptoScoreboardRow[];
+  /** Universe assets with no finite 24h change; still selectable/openable. */
+  unranked: CryptoScoreboardRow[];
+  /** Broad-market display-only strip (never selectable). */
+  movers: CryptoMoversStrip | null;
 }
 
 // ── Bounded fetch ───────────────────────────────────────────────────────────
@@ -329,6 +360,7 @@ function parseCmcListing(raw: unknown, fetchedAt: number): CryptoListing | null 
   if (cmcId === null || rank === null || !symbol || !name) return null;
   const quote = Array.isArray(item.quote) ? asRecord(item.quote[0]) : null;
   if (!quote) return null;
+  const tags = Array.isArray(item.tags) ? item.tags.filter((tag): tag is string => typeof tag === "string").slice(0, 40) : [];
   return {
     cmcId,
     symbol,
@@ -342,6 +374,7 @@ function parseCmcListing(raw: unknown, fetchedAt: number): CryptoListing | null 
     change1h: finiteNumber(quote.percent_change_1h),
     change24h: finiteNumber(quote.percent_change_24h),
     change7d: finiteNumber(quote.percent_change_7d),
+    tags,
     asOf: providerSource("cmc", fetchedAt, quote.last_updated),
   };
 }
@@ -354,6 +387,16 @@ function parseCmcListings(raw: unknown, fetchedAt: number, limit: number): Crypt
     .map((item) => parseCmcListing(item, fetchedAt))
     .filter((listing): listing is CryptoListing => listing !== null)
     .slice(0, limit);
+}
+
+/** Same item shape as listings; used for the by-ID quotes/latest board source. */
+function parseCmcQuotes(raw: unknown, fetchedAt: number): CryptoListing[] {
+  const root = asRecord(raw);
+  const data = root ? root.data : null;
+  if (!Array.isArray(data)) return [];
+  return data
+    .map((item) => parseCmcListing(item, fetchedAt))
+    .filter((listing): listing is CryptoListing => listing !== null);
 }
 
 function parsePanicRadarSummary(raw: unknown, fetchedAt: number): PanicRadarSummary | null {
@@ -455,22 +498,26 @@ export function deriveCryptoMood(
 }
 
 /**
- * Rank the interactive drill-down universe by absolute 24h move into HOT/COLD
- * scoreboard rows (stablecoins excluded). Mirrors the MOVERS scoring ethos:
- * transparent, deterministic, universe-bounded.
+ * Stablecoin detection: prefer the CMC `stablecoin` tag, fall back to an
+ * uppercased symbol denylist for providers that omit tags. The tag is the
+ * primary signal; the denylist is a defensive fallback, not the classifier.
  */
-export function buildHotColdScoreboard(
-  listings: CryptoListing[],
-  limit: number,
-): { hot: CryptoScoreboardRow[]; cold: CryptoScoreboardRow[] } {
+export function isStablecoinListing(listing: CryptoListing): boolean {
+  if (listing.tags.some((tag) => tag.toLowerCase() === "stablecoin")) return true;
+  return isStablecoinSymbol(listing.symbol);
+}
+
+/**
+ * Rank the interactive 14-asset universe by signed 24h move into relative
+ * HOTTEST (top half) / COLDEST (bottom half, ascending). Both columns stay
+ * populated in one-directional markets; signed percentages make a positive
+ * COLDEST row legible. Assets without a finite 24h change land in `unranked`
+ * (still selectable/openable, never falsely classified).
+ */
+export function buildUniverseScoreboard(
+  quotes: CryptoListing[],
+): { hot: CryptoScoreboardRow[]; cold: CryptoScoreboardRow[]; unranked: CryptoScoreboardRow[] } {
   const universe = interactiveUniverseIndex();
-  const eligible = listings.filter(
-    (listing) => !isStablecoinSymbol(listing.symbol)
-      && universe.has(listing.cmcId)
-      && listing.change24h !== null
-      && Number.isFinite(listing.change24h),
-  );
-  const ranked = eligible.sort((a, b) => b.change24h! - a.change24h!);
   const toRow = (listing: CryptoListing): CryptoScoreboardRow => ({
     cmcId: listing.cmcId,
     symbol: universe.get(listing.cmcId)?.label ?? listing.symbol,
@@ -480,9 +527,49 @@ export function buildHotColdScoreboard(
     change24h: listing.change24h!,
     volume24h: listing.volume24h,
   });
-  const hot = ranked.filter((listing) => listing.change24h! > 0).slice(0, limit).map(toRow);
-  const cold = ranked.filter((listing) => listing.change24h! < 0).reverse().slice(0, limit).map(toRow);
-  return { hot, cold };
+  const universeQuotes = quotes.filter((listing) => universe.has(listing.cmcId));
+  const ranked = universeQuotes
+    .filter((listing) => listing.change24h !== null && Number.isFinite(listing.change24h))
+    .sort((a, b) => b.change24h! - a.change24h!);
+  const unranked = universeQuotes
+    .filter((listing) => listing.change24h === null || !Number.isFinite(listing.change24h))
+    .map(toRow);
+  const hotCount = Math.ceil(ranked.length / 2);
+  const hot = ranked.slice(0, hotCount).map(toRow);
+  const cold = ranked.slice(hotCount).reverse().map(toRow);
+  return { hot, cold, unranked };
+}
+
+/**
+ * Broad-market display-only strip: leaders/laggards from the CMC top-N listings
+ * (stablecoins excluded) plus advance/decline breadth. Never selectable; it is
+ * a glance surface, not a drill-down list.
+ */
+export function buildMoversStrip(
+  listings: CryptoListing[],
+  leaderLimit: number,
+): CryptoMoversStrip | null {
+  const measured = listings
+    .filter((listing) => !isStablecoinListing(listing)
+      && listing.change24h !== null && Number.isFinite(listing.change24h))
+    .sort((a, b) => b.change24h! - a.change24h!);
+  if (measured.length === 0) return null;
+  const toRow = (listing: CryptoListing): CryptoScoreboardRow => ({
+    cmcId: listing.cmcId,
+    symbol: listing.symbol,
+    yahooSymbol: null, // display-only: no drill-down
+    rank: listing.rank,
+    price: listing.price,
+    change24h: listing.change24h!,
+    volume24h: listing.volume24h,
+  });
+  const advancing = measured.filter((listing) => listing.change24h! > 0).length;
+  const declining = measured.filter((listing) => listing.change24h! < 0).length;
+  return {
+    leaders: measured.slice(0, leaderLimit).map(toRow),
+    laggards: measured.slice(-leaderLimit).reverse().map(toRow),
+    breadth: { advancing, declining, measured: measured.length },
+  };
 }
 
 // ── Snapshot fetch (per-provider isolation) ─────────────────────────────────
@@ -497,6 +584,12 @@ export interface FetchCryptoPulseResult {
  * A provider failure records an error and yields null datasets for its groups —
  * it never rejects the whole snapshot, so enrichment degrades while the rest
  * of the terminal stays healthy.
+ *
+ * CMC and PanicRadar run concurrently: PanicRadar's own short budget (4s) means
+ * a hung endpoint adds at most that budget once — it never stacks on CMC's
+ * latency. CMC's board source is the by-ID quotes fetch, so the 14-asset board
+ * is stable across CMC rank churn; the top-N listings feed only the display-only
+ * movers strip and breadth.
  */
 export async function fetchCryptoPulse(
   options: CryptoPulseFetchOptions = {},
@@ -520,7 +613,7 @@ export async function fetchCryptoPulse(
     }
   };
 
-  const [globalMetrics, fearGreed, listings] = await Promise.all([
+  const cmcTask = Promise.all([
     guard("cmc.global-metrics", async () => {
       const raw = await fetchJson(CMC_GLOBAL_METRICS_URL, fetchImpl, requestTimeoutMs, maxResponseBytes, signal);
       return parseCmcGlobalMetrics(raw, fetchedAt);
@@ -533,33 +626,49 @@ export async function fetchCryptoPulse(
       const raw = await fetchJson(CMC_LISTINGS_URL(MAX_LISTINGS), fetchImpl, requestTimeoutMs, maxResponseBytes, signal);
       return parseCmcListings(raw, fetchedAt, MAX_LISTINGS);
     }),
+    guard("cmc.quotes", async () => {
+      const raw = await fetchJson(
+        CMC_QUOTES_URL(CRYPTO_INTERACTIVE_UNIVERSE.map((asset) => asset.cmcId)),
+        fetchImpl,
+        requestTimeoutMs,
+        maxResponseBytes,
+        signal,
+      );
+      return parseCmcQuotes(raw, fetchedAt);
+    }),
   ]);
 
-  // PanicRadar is opportunistic: a disabled kill switch or a slow endpoint
-  // must never delay CMC data, so it runs after CMC with its own short budget.
-  let panicRadarSummary: PanicRadarSummary | null = null;
-  let panicScore: PanicRadarPanicScore | null = null;
-  if (panicRadarEnabled) {
-    [panicRadarSummary, panicScore] = await Promise.all([
-      guard("panicRadar.summary", async () => {
-        const raw = await fetchJson(PANIC_RADAR_SUMMARY_URL, fetchImpl, panicRadarTimeoutMs, maxResponseBytes, signal);
-        return parsePanicRadarSummary(raw, fetchedAt);
-      }),
-      guard("panicRadar.panic-score", async () => {
-        const raw = await fetchJson(PANIC_RADAR_PANIC_SCORE_URL, fetchImpl, panicRadarTimeoutMs, maxResponseBytes, signal);
-        return parsePanicRadarPanicScore(raw, fetchedAt);
-      }),
-    ]);
-  }
+  const panicTask = panicRadarEnabled
+    ? Promise.all([
+        guard("panicRadar.summary", async () => {
+          const raw = await fetchJson(PANIC_RADAR_SUMMARY_URL, fetchImpl, panicRadarTimeoutMs, maxResponseBytes, signal);
+          return parsePanicRadarSummary(raw, fetchedAt);
+        }),
+        guard("panicRadar.panic-score", async () => {
+          const raw = await fetchJson(PANIC_RADAR_PANIC_SCORE_URL, fetchImpl, panicRadarTimeoutMs, maxResponseBytes, signal);
+          return parsePanicRadarPanicScore(raw, fetchedAt);
+        }),
+      ])
+    : Promise.resolve([null, null] as const);
+
+  const [[globalMetrics, fearGreed, listings, quotes], [panicRadarSummary, panicScore]] = await Promise.all([
+    cmcTask,
+    panicTask,
+  ]);
 
   const parsedListings = listings ?? [];
-  const mood = deriveCryptoMood(fearGreed, globalMetrics, panicRadarSummary, panicScore, parsedListings, fetchedAt);
-  const { hot, cold } = buildHotColdScoreboard(parsedListings, 5);
+  const parsedQuotes = quotes ?? [];
+  const mood = deriveCryptoMood(fearGreed, globalMetrics, panicRadarSummary, panicScore, parsedQuotes, fetchedAt);
+  const { hot, cold, unranked } = buildUniverseScoreboard(parsedQuotes);
+  const movers = buildMoversStrip(parsedListings, 3);
 
   return {
     snapshot: {
       fetchedAt,
-      providers: { cmc: Boolean(globalMetrics || fearGreed || parsedListings.length > 0), panicRadar: Boolean(panicRadarSummary || panicScore) },
+      providers: {
+        cmc: Boolean(globalMetrics || fearGreed || parsedListings.length > 0 || parsedQuotes.length > 0),
+        panicRadar: Boolean(panicRadarSummary || panicScore),
+      },
       globalMetrics,
       fearGreed,
       listings: parsedListings,
@@ -568,6 +677,8 @@ export async function fetchCryptoPulse(
       mood,
       hot,
       cold,
+      unranked,
+      movers,
     },
     errors,
   };
@@ -577,12 +688,15 @@ export async function fetchCryptoPulse(
 
 /**
  * A snapshot is "usable" when it carries at least one renderable dataset
- * (a mood or any listings). Unusable snapshots must never be cached or used to
+ * (a mood or any board rows). Unusable snapshots must never be cached or used to
  * replace a previously good snapshot — they represent a provider outage, not a
  * real state change.
  */
 export function isCryptoPulseUsable(snapshot: CryptoPulseSnapshot): boolean {
-  return snapshot.mood !== null || snapshot.listings.length > 0;
+  return snapshot.mood !== null
+    || snapshot.hot.length > 0
+    || snapshot.cold.length > 0
+    || snapshot.unranked.length > 0;
 }
 
 /**

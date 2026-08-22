@@ -5581,13 +5581,14 @@ class MarketHub {
 		this.status = `${MARKET_SCREEN_NAMES[this.screen]} · W/S SELECT · A/D SWITCH SCREENS`;
 	}
 
-	/** Visible HOT+COLD rows in render order (all interactive, all openable). */
-	private cryptoRows(): Array<{ section: "hot" | "cold"; row: CryptoScoreboardRow }> {
+	/** Visible interactive rows in render order (all openable; the strip is not). */
+	private cryptoRows(): Array<{ section: "hot" | "cold" | "unranked"; row: CryptoScoreboardRow }> {
 		const pulse = this.cryptoPulse;
 		if (!pulse) return [];
 		return [
 			...pulse.hot.map((row) => ({ section: "hot" as const, row })),
 			...pulse.cold.map((row) => ({ section: "cold" as const, row })),
+			...pulse.unranked.map((row) => ({ section: "unranked" as const, row })),
 		];
 	}
 
@@ -5649,7 +5650,10 @@ class MarketHub {
 			this.tui.requestRender();
 		} catch (error) {
 			if (this.cryptoPulseRequestedAt !== requestedAt) return;
-			if (!this.cryptoPulse) {
+			if (this.cryptoPulse) {
+				this.cryptoPulseState = "ready";
+				this.status = `CRYPTO PULSE · PRIOR DATA RETAINED · ${error instanceof Error ? error.message : String(error)} · R RETRY`;
+			} else {
 				this.cryptoPulseState = "error";
 				this.cryptoPulseError = error instanceof Error ? error.message : String(error);
 			}
@@ -5670,7 +5674,8 @@ class MarketHub {
 		}
 		this.cryptoSelected = Math.max(0, Math.min(rows.length - 1, index));
 		const row = rows[this.cryptoSelected]!;
-		this.status = `${row.section === "hot" ? "HOT" : "COLD"} ${row.row.symbol} ${percent(row.row.change24h)} · J OPEN · K WHY · E WATCH`;
+		const sectionLabel = row.section === "unranked" ? "UNRANKED" : row.section === "hot" ? "HOTTEST" : "COLDEST";
+		this.status = `${sectionLabel} ${row.row.symbol}${row.section !== "unranked" ? ` ${percent(row.row.change24h)}` : " · NO QUOTE"} · J OPEN · K WHY · E WATCH`;
 	}
 
 	private snapshotStatus(): string {
@@ -6229,28 +6234,39 @@ class MarketHub {
 		lines.push(...stretchBlocks(blocks, bodyRows, "", 1));
 	}
 
-	/** Crypto Pulse: deterministic mood strip + HOT/COLD scoreboard (G toggle). */
+	/** Crypto Pulse: deterministic mood strip + relative board + movers strip (G toggle). */
 	private renderCryptoPulse(lines: string[], width: number, th: Theme, fit: (text: string) => string, bodyRows: number): void {
 		const pulse = this.cryptoPulse;
 		const mood = pulse?.mood;
 		const rows = this.cryptoRows();
+		const boardEmpty = pulse ? pulse.hot.length + pulse.cold.length + pulse.unranked.length === 0 : true;
 		if (this.cryptoPulseState === "loading" && !pulse) {
 			lines.push(...stretchBlocks([[fit(th.fg("dim", "CRYPTO PULSE · SYNCING CMC · PANIC RADAR"))], [fit(th.fg("dim", "· G GLOBAL"))]], bodyRows, "", 1));
 			return;
 		}
-		if (!pulse || (pulse.listings.length === 0 && !mood)) {
+		if (!pulse || (boardEmpty && !mood)) {
 			const reason = this.cryptoPulseState === "error" && this.cryptoPulseError ? ` · ${this.cryptoPulseError}` : "";
 			lines.push(...stretchBlocks([[fit(th.fg("warning", `CRYPTO PULSE · UNAVAILABLE${reason}`))], [fit(th.fg("dim", "· R RETRY · G GLOBAL"))]], bodyRows, "", 1));
 			return;
 		}
+
 		const head: string[] = [fit(th.bold(th.fg("accent", "CRYPTO PULSE")))];
 		if (mood) {
 			const bar = "█".repeat(mood.barFill) + "░".repeat(Math.max(0, 10 - mood.barFill));
-			const moodLine = `MOOD [${bar}] ${mood.value} ${mood.label}`
-				+ (mood.panicScore !== null ? ` · PANIC ${mood.panicScore} ${mood.panicLabel ?? ""}` : "")
-				+ (mood.btcDominancePercent !== null ? ` · BTC.D ${mood.btcDominancePercent.toFixed(1)}%` : "")
-				+ (mood.totalMarketCapUsd !== null ? ` · TOTAL ${dollars(mood.totalMarketCapUsd)}` : "");
+			let moodLine = `MOOD [${bar}] ${mood.value} ${mood.label}`;
+			if (mood.panicScore !== null) moodLine += ` · PANIC ${mood.panicScore} ${mood.panicLabel ?? ""}`;
+			if (mood.volatilityLabel) moodLine += ` · VOL ${mood.volatilityLabel.toUpperCase()}`;
 			head.push(fit(th.fg("text", moodLine)));
+			// Compact second line so the strip survives the narrower two-column pane.
+			const context: string[] = [];
+			if (pulse.movers?.breadth) {
+				context.push(`BREADTH ${pulse.movers.breadth.advancing}▲ ${pulse.movers.breadth.declining}▼`);
+			}
+			if (mood.btcDominancePercent !== null) context.push(`BTC.D ${mood.btcDominancePercent.toFixed(1)}%`);
+			if (mood.totalMarketCapUsd !== null) {
+				context.push(`TOTAL $${compactNumber(mood.totalMarketCapUsd)}${mood.totalMarketCapChangePercent !== null ? ` ${percent(mood.totalMarketCapChangePercent)}` : ""}`);
+			}
+			if (context.length > 0) head.push(fit(th.fg("dim", context.join(" · "))));
 		} else {
 			head.push(fit(th.fg("dim", "MOOD UNAVAILABLE · CMC F&G OFFLINE")));
 		}
@@ -6262,16 +6278,33 @@ class MarketHub {
 			const tone = row.change24h >= 0 ? "success" : "error";
 			return fit(`${glyph} ${row.symbol.padEnd(5)} ${row.price !== null ? dollars(row.price, "USD") : "--".padStart(8)} ${th.fg(tone, percent(row.change24h))}`);
 		};
-		const hotBlock = [fit(th.bold(th.fg("success", "HOT"))), ...(pulse.hot.length > 0
+		const hotBlock = [fit(th.bold(th.fg("success", "HOTTEST · RELATIVE 24H"))), ...(pulse.hot.length > 0
 			? pulse.hot.map((row, index) => rowLine(row, rows[index] !== undefined && this.cryptoSelected === index && rows[index]!.section === "hot"))
-			: [fit(th.fg("dim", "no gainers in universe"))])];
-		const coldBlock = [fit(th.bold(th.fg("error", "COLD"))), ...(pulse.cold.length > 0
+			: [fit(th.fg("dim", "no ranked gainers"))])];
+		const coldBlock = [fit(th.bold(th.fg("error", "COLDEST · RELATIVE 24H"))), ...(pulse.cold.length > 0
 			? pulse.cold.map((row, index) => rowLine(row, rows[pulse.hot.length + index] !== undefined && this.cryptoSelected === pulse.hot.length + index && rows[pulse.hot.length + index]!.section === "cold"))
-			: [fit(th.fg("dim", "no losers in universe"))])];
+			: [fit(th.fg("dim", "no ranked laggards"))])];
+
+		// Display-only surfaces: UNRANKED universe assets and the TOP-20 MOVERS
+		// strip. Neither participates in W/S selection or J/K/E.
+		const extra: string[] = [];
+		if (pulse.unranked.length > 0) {
+			extra.push(fit(`${th.fg("dim", "UNRANKED · NO QUOTE")}  ${pulse.unranked.map((row) => row.symbol).join(" ")}`));
+		}
+		if (pulse.movers) {
+			const tone = (row: CryptoScoreboardRow) => (row.change24h >= 0 ? "success" : "error");
+			const leaders = pulse.movers.leaders.map((row) => th.fg(tone(row), `▲ ${row.symbol} ${percent(row.change24h)}`)).join("  ");
+			const laggards = pulse.movers.laggards.map((row) => th.fg(tone(row), `▼ ${row.symbol} ${percent(row.change24h)}`)).join("  ");
+			extra.push(fit(`${th.fg("dim", "TOP-20 MOVERS · DISPLAY ONLY")}  ${leaders}${laggards ? `  │  ${laggards}` : ""}`));
+		}
+
+		const reserved = extra.length;
 		if (width >= 84 && terminalRows(this.tui) >= 24) {
-			lines.push(...twoColumn([...head, ...hotBlock], coldBlock, width, bodyRows));
+			lines.push(...twoColumn([...head, ...hotBlock], coldBlock, width, Math.max(1, bodyRows - reserved)));
+			lines.push(...extra);
 		} else {
-			lines.push(...stretchBlocks([head, hotBlock, coldBlock], bodyRows, "", 1));
+			lines.push(...stretchBlocks([head, hotBlock, coldBlock], Math.max(1, bodyRows - reserved), "", 1));
+			lines.push(...extra);
 		}
 	}
 
@@ -6674,6 +6707,12 @@ class MarketHub {
 				panicScore: this.cryptoPulse?.mood?.panicScore ?? null,
 				hot: (this.cryptoPulse?.hot ?? []).map((row) => ({ symbol: row.symbol, yahooSymbol: row.yahooSymbol, change24h: row.change24h })),
 				cold: (this.cryptoPulse?.cold ?? []).map((row) => ({ symbol: row.symbol, yahooSymbol: row.yahooSymbol, change24h: row.change24h })),
+				unranked: (this.cryptoPulse?.unranked ?? []).map((row) => row.symbol),
+				movers: this.cryptoPulse?.movers ? {
+					leaders: this.cryptoPulse.movers.leaders.map((row) => row.symbol),
+					laggards: this.cryptoPulse.movers.laggards.map((row) => row.symbol),
+					breadth: this.cryptoPulse.movers.breadth,
+				} : undefined,
 			} : undefined,
 			selectedIndex: this.selected,
 			selectedByScreen: [...this.selectedByScreen],
