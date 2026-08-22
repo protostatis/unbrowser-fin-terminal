@@ -106,6 +106,8 @@ export interface WorkerSettledEvent extends WorkerEventHeader {
   outcome: "complete" | "failed" | "cancelled";
   error?: string;
   usage?: WorkerUsage;
+  /** True when the per-run token guard aborted this run (telemetry only). */
+  tokenGuard?: boolean;
 }
 
 /** Bootstrap or protocol failure. Worker will exit after this. */
@@ -246,8 +248,17 @@ export function isValidResearchRequest(
     const pairedTarget = pt as PairedTarget;
     const expected = pairedPairKey(String(s), String(cs), pairedTarget.brief.researchKey, pairedTarget.why.researchKey);
     if (rk !== `v1/paired/${expected.slice("pair-".length)}`) return false;
-  } else if (origin !== undefined || tokenLimit !== undefined || String(rk).startsWith("v1/paired/")) {
-    return false;
+  } else {
+    // Single-strategy pre-cache jobs carry origin=precache and a token limit
+    // with the exact interactive research key (never the synthetic v1/paired/
+    // identity). Interactive jobs carry neither.
+    const precacheSingle = origin === "precache";
+    if (String(rk).startsWith("v1/paired/")) return false;
+    if (precacheSingle && (
+      typeof tokenLimit !== "number" || !Number.isFinite(tokenLimit)
+      || tokenLimit < 5_000 || tokenLimit > 500_000 || !Number.isInteger(tokenLimit)
+    )) return false;
+    if (!precacheSingle && (origin !== undefined || tokenLimit !== undefined)) return false;
   }
   return true;
 }
@@ -325,7 +336,8 @@ export function isWorkerSettledEvent(
   const rec = value as unknown as Record<string, unknown>;
   const o = rec.outcome;
   const baseValid = typeof o === "string" && SETTLED_OUTCOMES.has(o)
-    && (rec.error === undefined || isBoundedString(rec.error, 500));
+    && (rec.error === undefined || isBoundedString(rec.error, 500))
+    && (rec.tokenGuard === undefined || typeof rec.tokenGuard === "boolean");
   if (!baseValid) return false;
   const usage = rec.usage;
   if (usage !== undefined && !isValidWorkerUsage(usage)) return false;

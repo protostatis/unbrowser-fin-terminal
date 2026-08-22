@@ -22,8 +22,27 @@ import { createHash } from "node:crypto";
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
+/**
+ * Bounded, structured failure telemetry attached to a settled pre-cache entry.
+ * The code is a stable machine classification; the message is a redacted,
+ * bounded copy of the worker error so operators can diagnose without the
+ * in-memory job map or worker stdout (which is discarded in production).
+ */
+export interface PrecacheFailureTelemetry {
+  /** Machine classification of the settlement failure. */
+  code: string;
+  /** Final scheduler phase when the run settled (queued/dispatched/running/...). */
+  phase?: string;
+  /** Last tool attempted before the failure, when known. */
+  lastTool?: string;
+  /** True when the per-run token guard aborted the run. */
+  tokenGuard?: boolean;
+  /** Redacted, bounded worker error message. */
+  message?: string;
+}
+
 export interface PrecacheDayEntry {
-  /** Stable key derived from the exact brief+why research keys. */
+  /** Stable key derived from the exact research identity (pair or single). */
   pairKey: string;
   /** Monotonic attempt number for this pair within the UTC day. */
   attempt: number;
@@ -36,6 +55,8 @@ export interface PrecacheDayEntry {
   /** Total cost from the worker (if reported). */
   actualCost?: number;
   outcome?: "complete" | "failed" | "cancelled";
+  /** Structured failure telemetry for non-complete settlements. */
+  failure?: PrecacheFailureTelemetry;
 }
 
 export interface PrecacheLedgerDay {
@@ -101,6 +122,28 @@ export function pairedPairKey(
   return `pair-${digest}`;
 }
 
+/**
+ * Stable key for a single (non-paired) pre-cache identity, used by the
+ * `single` pre-cache strategy where BRIEF and WHY run as independent jobs.
+ * Reuses the same `pair-` prefix and format so the ledger schema is unchanged.
+ */
+export function singlePrecacheKey(
+  symbol: string,
+  chartScope: string,
+  researchKey: string,
+): string {
+  const digest = createHash("sha256")
+    .update("precache-single-v1\0")
+    .update(symbol.trim().toUpperCase())
+    .update("\0")
+    .update(chartScope.trim().toLowerCase())
+    .update("\0")
+    .update(researchKey.trim().toLowerCase())
+    .digest("hex")
+    .slice(0, 32);
+  return `pair-${digest}`;
+}
+
 // ── UTC day key ───────────────────────────────────────────────────────────
 
 export function utcDayKey(now: number = Date.now()): string {
@@ -130,6 +173,17 @@ function isFiniteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
 }
 
+function validateFailureTelemetry(raw: unknown): raw is PrecacheFailureTelemetry {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
+  const f = raw as Record<string, unknown>;
+  if (typeof f.code !== "string" || !/^[a-z0-9-]{1,80}$/.test(f.code)) return false;
+  if (f.phase !== undefined && (typeof f.phase !== "string" || f.phase.length > 40)) return false;
+  if (f.lastTool !== undefined && (typeof f.lastTool !== "string" || f.lastTool.length > 160)) return false;
+  if (f.tokenGuard !== undefined && typeof f.tokenGuard !== "boolean") return false;
+  if (f.message !== undefined && (typeof f.message !== "string" || f.message.length > 400)) return false;
+  return true;
+}
+
 function validateEntry(raw: unknown): raw is PrecacheDayEntry {
   if (!raw || typeof raw !== "object") return false;
   const e = raw as Record<string, unknown>;
@@ -140,7 +194,8 @@ function validateEntry(raw: unknown): raw is PrecacheDayEntry {
     isFiniteInteger(e.reservedAt) && e.reservedAt > 0 && e.reservedAt <= 9_000_000_000_000_000 &&
     (e.actualTokens === undefined || (isFiniteInteger(e.actualTokens) && e.actualTokens >= 0 && e.actualTokens <= 1_000_000_000)) &&
     (e.actualCost === undefined || (isFiniteNumber(e.actualCost) && e.actualCost >= 0 && e.actualCost <= 1_000_000)) &&
-    (e.outcome === undefined || e.outcome === "complete" || e.outcome === "failed" || e.outcome === "cancelled")
+    (e.outcome === undefined || e.outcome === "complete" || e.outcome === "failed" || e.outcome === "cancelled") &&
+    (e.failure === undefined || validateFailureTelemetry(e.failure))
   );
 }
 
@@ -305,6 +360,7 @@ export function settlePrecacheEntry(
   outcome: "complete" | "failed" | "cancelled",
   actualTokens?: number,
   actualCost?: number,
+  failure?: PrecacheFailureTelemetry,
 ): boolean {
   const entry = day.entries.find((e) => e.pairKey === pairKey && e.attempt === attempt);
   if (!entry) return false;
@@ -319,11 +375,15 @@ export function settlePrecacheEntry(
       throw new Error("Pre-cache actual cost is invalid");
     }
   }
+  if (failure !== undefined && !validateFailureTelemetry(failure)) {
+    throw new Error("Pre-cache failure telemetry is invalid");
+  }
   entry.outcome = outcome;
   if (actualTokens !== undefined) entry.actualTokens = actualTokens;
   if (actualCost !== undefined) {
     entry.actualCost = actualCost;
   }
+  if (failure !== undefined) entry.failure = failure;
   return true;
 }
 

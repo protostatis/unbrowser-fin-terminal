@@ -113,26 +113,30 @@ fail-closed:
 | Env | Default | Production guidance |
 |---|---|---|
 | `MARKET_PRECACHE_ENABLED` | on (non-public) | Leave on; `0` disables pre-warming entirely. Disposable public workers remain cold even if enabled |
+| `MARKET_PRECACHE_STRATEGY` | `single` | **Use `single`.** Runs each exact interactive identity independently through the compact path; `paired` (one shared evidence pass + strict partition split) can reject flash-model output and previously burned the entire daily budget with no usable cache. Keep `paired` only for A/B |
 | `MARKET_PRECACHE_QUALITY_GATE` | `1` | Leave on. Prevents evidence-blocked canvases from being cached as warm and runs the extraction canary + identity cooldown |
-| `MARKET_PRECACHE_MAX_JOBS` | `24` | Cap the warm paired-context plan (story, headline, events, movers). Secondary to budget ceiling |
-| `MARKET_PRECACHE_BUDGET` | `2000000` | UTC-day total Pi-reported token budget for paired pre-cache runs (10 000–10 000 000) |
-| `MARKET_PRECACHE_RUN_LIMIT` | `100000` | Conservative reservation per paired run; at most ~20 attempts/day at defaults (5 000–500 000) |
-| `MARKET_RESEARCH_PROMPT` | `legacy` | **Recommended: `compact`** for interactive/unpaired research. Paired warm jobs always use their strict `paired-v1` partition contract |
+| `MARKET_PRECACHE_MAX_JOBS` | `24` | Cap the warm plan (story, headline, events, movers). Secondary to budget ceiling |
+| `MARKET_PRECACHE_BUDGET` | `2000000` | UTC-day total Pi-reported token budget for pre-cache runs (10 000–10 000 000) |
+| `MARKET_PRECACHE_RUN_LIMIT` | `100000` | Conservative reservation per run; at most ~20 attempts/day at defaults (5 000–500 000) |
+| `MARKET_RESEARCH_PROMPT` | `legacy` | **Recommended: `compact`** for interactive research; `single`-strategy warm jobs use the same compact path |
 
-Pre-cache pairing:
+Pre-cache strategies:
 
-- Paired contexts run one research/evidence extraction for both BRIEF and WHY,
+- **`single` (default):** every exact interactive identity (BRIEF and WHY) is its
+  own job through the same compact research path interactive users hit. Order is
+  deterministic: Market Story BRIEF → lead SIGNALS headline BRIEF → all three
+  EVENT_LANES BRIEF → mover ticker BRIEFs, then the matching WHYs. An identity
+  is skipped when it already has a usable same-day archive. No synthetic
+  identity is introduced; results are archived under the exact interactive keys.
+- **`paired` (opt-in):** one research/evidence extraction for both BRIEF and WHY,
   then split into two independently validated canvases with the exact
   interactive identities. The synthetic `v1/paired/*` identity is never
-  archived or exposed as a cache hit.
-- Plan order is deterministic: Market Story, the bootstrap snapshot's lead
-  SIGNALS headline, all three EVENT_LANES, then ticker pairs strictly by mover
-  rank. There is no watchlist fallback.
-- A context is skipped only when both exact BRIEF and WHY identities are
-  same-day usable. If only one half is fresh, the pair still runs, but the
-  host must not overwrite the fresh half.
-- With the quality gate enabled, degraded halves remain in archive history for
-  cooldown telemetry but are not cache-eligible; a usable sibling half remains
+  archived or exposed as a cache hit. Token-efficient, but the strict
+  block-partition contract (`splitPairedCanvas`) rejects model output that the
+  interactive compact path produces successfully — observed in production as
+  every daily attempt failing after token spend.
+- With the quality gate enabled, degraded results remain in archive history for
+  cooldown telemetry but are not cache-eligible; a usable sibling remains
   independently eligible.
 - The budget ledger lives under `MARKET_DATA_DIR` as
   `market-precache-ledger.json`. Reservations are permanent for the UTC day
@@ -150,6 +154,12 @@ Behavior to expect in production:
 - Identities whose recent attempts all failed with infrastructure-class codes
   enter a bounded cooldown (default 2h) and are then re-probed, so a fixed
   extractor or un-blocked source recovers without wasting workers.
+- Failed settlements persist **bounded failure telemetry** on the ledger entry:
+  a machine classification code, final phase, last tool, an explicit
+  `tokenGuard` flag when the per-run token guard aborted, and a redacted worker
+  error message — so a failed warm run can be diagnosed from
+  `market-precache-ledger.json` alone (worker stdout/stderr is discarded in
+  production).
 - Completed canvases are archived to `$MARKET_DATA_DIR/market-research-archive.json`
   with typed quality telemetry (`quality`, `generation`), and are shared across
   sessions. One parent process writes both archive and pre-cache ledger per data
