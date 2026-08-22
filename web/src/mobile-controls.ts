@@ -85,6 +85,8 @@ export interface TerminalFrameState {
   tickerLayout?: "quote" | "research" | "split";
   /** Whether the current terminal dimensions can render the ticker split. */
   tickerSplitAvailable?: boolean;
+  /** MARKET-screen GLOBAL↔CRYPTO subview emitted by the canonical extension. */
+  marketView?: "global" | "crypto";
   /** Frozen source-list context when a ticker was opened from MOVERS or WATCH. */
   tickerNavigation?: {
     source: "movers" | "watch";
@@ -232,6 +234,15 @@ export function mobileActions(state?: TerminalFrameState): MobileAction[] {
     // instead of duplicating the legacy J/K pair in the touch deck.
     { id: "why", label: "Why", keyHint: "K", input: "k" },
     contextualAction,
+    ...(screen === "MARKET"
+      ? [{
+          id: "crypto",
+          label: state?.marketView === "crypto" ? "Global" : "Crypto",
+          keyHint: "G",
+          input: "g",
+          tone: "accent" as const,
+        }]
+      : []),
     { id: "sync", label: "Sync", keyHint: "R", input: "r" },
     { id: "search", label: "Symbol", keyHint: "/", tone: "accent" },
   ];
