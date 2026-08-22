@@ -269,6 +269,15 @@ delayed liquid-universe monitor—not an exchange-wide real-time scanner. Press
 `R` to rescore and `E` to add or remove the selected mover from the session
 watchlist.
 
+The mover score is session-aware. During pre-market (`PRE`) the move leg already
+uses the pre-market price vs. previous close, and the volume leg prefers live
+pre-market volume when Yahoo ships it, falling back to the regular-session
+volume as a labeled liquidity proxy (`VOL PM 1.2M~`) when it does not. Quotes
+whose extended-session move is real but whose volume has not populated remain
+eligible and rank movement-first, so the pre-market mover list never silently
+goes empty. Rows render a `PRE-MKT`/`POST-MKT` tag in the MOVERS title and mark
+the volume leg's session on each row.
+
 Changing screens, selections, pane focus, or chart scope does not stop research.
 Each symbol/scope/BRIEF-or-WHY context gets its own job and canvas identity. The
 terminal dispatches up to six FIFO jobs to isolated one-shot Pi worker sessions,

@@ -124,6 +124,8 @@ type Quote = {
 	dayLow: number | null;
 	dayHigh: number | null;
 	volume: number | null;
+	preMarketVolume: number | null;
+	postMarketVolume: number | null;
 	marketState: string;
 	updatedAt: number | null;
 	points: number[];
@@ -141,6 +143,10 @@ type RankedMover = {
 	movementPercentile: number;
 	volumePercentile: number;
 	dollarVolume: number;
+	/** Which session the $VOL leg measured: "pre" | "post" | "regular". */
+	volumeSource: "pre" | "post" | "regular";
+	/** True when the volume leg fell back to the regular-session figure as a liquidity proxy. */
+	volumeProxied: boolean;
 };
 
 type TechnicalSignal = "bullish" | "neutral" | "bearish";
@@ -788,28 +794,91 @@ function percentileScore(values: number[], value: number): number {
 	return (below + Math.max(0, equal - 1) / 2) / (values.length - 1);
 }
 
-function eligibleMoverQuotes(quotes: Quote[]): Quote[] {
+function positiveFinite(value: number | null | undefined): number | null {
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function isExtendedSession(marketState: string): boolean {
+	const state = (marketState || "").toUpperCase();
+	return state.startsWith("PRE") || state.startsWith("POST");
+}
+
+export type MoverVolumeResolution = {
+	/** Shares used for the $VOL leg of the mover score. */
+	volume: number;
+	/** Which session the volume actually measures. */
+	session: "pre" | "post" | "regular";
+	/** True when the extended-session volume was unavailable and the regular-session volume stands in as a liquidity proxy. */
+	proxied: boolean;
+};
+
+/**
+ * Session-aware volume for mover scoring.
+ *
+ * - PRE → prefer live pre-market volume; fall back to regular-session volume as
+ *   a liquidity proxy when Yahoo's chart meta ships no pre-market volume.
+ * - POST → same, preferring post-market volume.
+ * - regular → the regular-session volume, unchanged from the legacy formula.
+ * - Extended sessions with no volume fields at all resolve to 0, so the quote
+ *   can still rank by its (pre/post-correct) move alone.
+ */
+export function moverVolume(quote: Quote): MoverVolumeResolution {
+	const state = (quote.marketState || "").toUpperCase();
+	const regular = positiveFinite(quote.volume);
+	if (state.startsWith("PRE")) {
+		const pre = positiveFinite(quote.preMarketVolume);
+		if (pre !== null) return { volume: pre, session: "pre", proxied: false };
+		if (regular !== null) return { volume: regular, session: "pre", proxied: true };
+		return { volume: 0, session: "pre", proxied: false };
+	}
+	if (state.startsWith("POST")) {
+		const post = positiveFinite(quote.postMarketVolume);
+		if (post !== null) return { volume: post, session: "post", proxied: false };
+		if (regular !== null) return { volume: regular, session: "post", proxied: true };
+		return { volume: 0, session: "post", proxied: false };
+	}
+	return { volume: regular ?? 0, session: "regular", proxied: false };
+}
+
+/**
+ * Extended sessions may carry a real pre/post-market move while Yahoo has not
+ * yet populated any volume field. Those quotes stay eligible (movement-first),
+ * because dropping them makes the pre-market mover list vanish entirely.
+ */
+export function moverEligible(marketState: string, volume: number | null): boolean {
+	if (isExtendedSession(marketState)) return true;
+	return positiveFinite(volume) !== null;
+}
+
+/** Short, honest volume-leg label for a mover row: "VOL 4.2M", "VOL PM 1.2M", "VOL~ 8.1M". */
+export function moverVolumeRowLabel(quote: Quote): string {
+	const resolution = moverVolume(quote);
+	const sessionLabel = resolution.session === "pre" ? "PM " : resolution.session === "post" ? "AF " : "";
+	const proxyMark = resolution.proxied ? "~" : "";
+	return `VOL ${sessionLabel}${compactNumber(resolution.volume)}${proxyMark}`;
+}
+
+export function eligibleMoverQuotes(quotes: Quote[]): Quote[] {
 	const eligibleSymbols = new Set<string>(MOVER_UNIVERSE);
 	return quotes.filter((quote) =>
 		eligibleSymbols.has(quote.symbol)
 		&& typeof quote.changePercent === "number"
 		&& Number.isFinite(quote.changePercent)
-		&& typeof quote.volume === "number"
-		&& Number.isFinite(quote.volume)
-		&& quote.volume > 0
 		&& Number.isFinite(quote.price)
-		&& quote.price > 0,
+		&& quote.price > 0
+		&& moverEligible(quote.marketState, quote.volume),
 	);
 }
 
-function rankMovers(quotes: Quote[], limit = MOVER_LIMIT): RankedMover[] {
+export function rankMovers(quotes: Quote[], limit = MOVER_LIMIT): RankedMover[] {
 	const candidates = eligibleMoverQuotes(quotes);
-	const movements = candidates.map((quote) => Math.abs(quote.changePercent!));
-	const dollarVolumes = candidates.map((quote) => quote.price * quote.volume!);
-	return candidates
-		.map((quote): RankedMover => {
+	const withVolume = candidates.map((quote) => ({ quote, volume: moverVolume(quote) }));
+	const movements = withVolume.map((entry) => Math.abs(entry.quote.changePercent!));
+	const dollarVolumes = withVolume.map((entry) => entry.quote.price * entry.volume.volume);
+	return withVolume
+		.map(({ quote, volume }): RankedMover => {
 			const movement = Math.abs(quote.changePercent!);
-			const dollarVolume = quote.price * quote.volume!;
+			const dollarVolume = quote.price * volume.volume;
 			const movementPercentile = percentileScore(movements, movement);
 			const volumePercentile = percentileScore(dollarVolumes, dollarVolume);
 			return {
@@ -818,6 +887,8 @@ function rankMovers(quotes: Quote[], limit = MOVER_LIMIT): RankedMover[] {
 				movementPercentile,
 				volumePercentile,
 				dollarVolume,
+				volumeSource: volume.session,
+				volumeProxied: volume.proxied,
 			};
 		})
 		.sort((a, b) => b.score - a.score
@@ -1811,6 +1882,8 @@ async function fetchQuote(symbol: string, scope: ChartScope = DEFAULT_CHART_SCOP
 		dayLow: number("regularMarketDayLow"),
 		dayHigh: number("regularMarketDayHigh"),
 		volume: number("regularMarketVolume"),
+		preMarketVolume: number("preMarketVolume"),
+		postMarketVolume: number("postMarketVolume"),
 		marketState,
 		updatedAt: updatedAtSeconds !== null ? updatedAtSeconds * 1000 : pointTimes.at(-1) ?? null,
 		points: closes,
@@ -6436,11 +6509,17 @@ class MarketHub {
 		const listWidth = width >= 84
 			? Math.max(32, Math.floor((width - visibleWidth(" │ ")) * 0.59))
 			: width;
+		const sessionTag = movers.some((mover) => (mover.quote.marketState || "").toUpperCase().startsWith("PRE"))
+			? "PRE-MKT"
+			: movers.some((mover) => (mover.quote.marketState || "").toUpperCase().startsWith("POST"))
+				? "POST-MKT"
+				: "";
+		const sessionPrefix = sessionTag ? `${sessionTag} · ` : "";
 		const title = listWidth >= 62
-			? `AUTO MOVERS · ${movers.length}/${MOVER_LIMIT} · ${scopeState} · 65% MOVE / 35% $VOL`
+			? `${sessionPrefix}AUTO MOVERS · ${movers.length}/${MOVER_LIMIT} · ${scopeState} · 65% MOVE / 35% $VOL`
 			: listWidth >= 45
-				? `MOVERS ${movers.length}/${MOVER_LIMIT} · ${scopeState} · M65/V35`
-				: `MOVERS ${movers.length} · ${scopeState}`;
+				? `${sessionPrefix}MOVERS ${movers.length}/${MOVER_LIMIT} · ${scopeState} · M65/V35`
+				: `${sessionPrefix}MOVERS ${movers.length} · ${scopeState}`;
 		const heading = th.bold(th.fg("accent", title));
 		if (movers.length === 0) {
 			lines.push(...stretchBlocks([[
@@ -6457,14 +6536,14 @@ class MarketHub {
 			const tone = (quote.change ?? 0) >= 0 ? "success" : "error";
 			const watched = this.viewWatchlist.includes(quote.symbol) ? th.fg("accent", " ★") : "";
 			const prefix = selected ? th.bg("selectedBg", th.fg("accent", ">")) : " ";
-			return `${prefix} #${String(index + 1).padStart(2, "0")} ${directionGlyph(quote.change)} ${th.bold(th.fg("text", quote.symbol.padEnd(6)))} ${th.fg(tone, percent(quote.changePercent).padStart(8))} ${th.fg("dim", `VOL ${compactNumber(quote.volume).padStart(7)} · SCORE ${String(Math.round(mover.score * 100)).padStart(3)}`)}${watched}`;
+			return `${prefix} #${String(index + 1).padStart(2, "0")} ${directionGlyph(quote.change)} ${th.bold(th.fg("text", quote.symbol.padEnd(6)))} ${th.fg(tone, percent(quote.changePercent).padStart(8))} ${th.fg("dim", `${moverVolumeRowLabel(quote).padEnd(11)} · SCORE ${String(Math.round(mover.score * 100)).padStart(3)}`)}${watched}`;
 		};
 		const selectedMover = movers[this.selected] ?? movers[0]!;
 		const selectedQuote = selectedMover.quote;
 		const selectedTone = (selectedQuote.change ?? 0) >= 0 ? "success" : "error";
 		const chartTone = selectedQuote.points.length >= 2 ? selectedQuote.points.at(-1)! >= selectedQuote.points[0]! ? "success" : "error" : selectedTone;
 		const selectedSummary = `${th.bold(th.fg("text", selectedQuote.symbol))} ${th.fg(selectedTone, percent(selectedQuote.changePercent))} ${th.fg("dim", `· RANK SCORE ${Math.round(selectedMover.score * 100)} · ${this.viewWatchlist.includes(selectedQuote.symbol) ? "ON WATCH" : "E ADD TO WATCH"}`)}`;
-		const selectedMetrics = th.fg("dim", `Volume ${compactNumber(selectedQuote.volume)} · $Volume ${compactNumber(selectedMover.dollarVolume)} · Move P${Math.round(selectedMover.movementPercentile * 100)} · Liquidity P${Math.round(selectedMover.volumePercentile * 100)}`);
+		const selectedMetrics = th.fg("dim", `${moverVolumeRowLabel(selectedQuote)} · $Vol ${compactNumber(selectedMover.dollarVolume)}${selectedMover.volumeProxied ? " (reg proxy)" : ""} · Move P${Math.round(selectedMover.movementPercentile * 100)} · Liq P${Math.round(selectedMover.volumePercentile * 100)}`);
 
 		if (width >= 84 && terminalRows(this.tui) >= 24) {
 			const reserveStatus = movers.length > Math.max(1, bodyRows - 3) ? 1 : 0;
@@ -6521,7 +6600,12 @@ class MarketHub {
 				score: mover.score,
 				changePercent: mover.quote.changePercent,
 				volume: mover.quote.volume,
+				preMarketVolume: mover.quote.preMarketVolume,
+				postMarketVolume: mover.quote.postMarketVolume,
+				marketState: mover.quote.marketState,
 				dollarVolume: mover.dollarVolume,
+				volumeSource: mover.volumeSource,
+				volumeProxied: mover.volumeProxied,
 			})),
 			storyScroll: this.screen === MARKET_SCREEN.signals ? {
 				offset: this.signalStoryScroll,
@@ -6666,6 +6750,8 @@ function makeTestQuote(symbol: string, index: number, updatedAt = 1_700_000_000_
 		dayLow: price * 0.98,
 		dayHigh: price * 1.02,
 		volume: 1_000_000 + index * 250_000,
+		preMarketVolume: null,
+		postMarketVolume: null,
 		marketState: "REGULAR",
 		updatedAt,
 		points: Array.from({ length: pointCount }, (_, point) => price * (0.99 + point / 4_800 + ((point % 5) - 2) / 1_000)),
