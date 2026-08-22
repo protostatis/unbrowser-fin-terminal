@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   eligibleMoverQuotes,
+  mockMondayChartPayload,
   moverEligible,
   moverVolume,
   moverVolumeRowLabel,
@@ -306,4 +307,47 @@ test("parseChartPayloadToQuote honors meta.marketState when present and keeps sa
   const quote = parseChartPayloadToQuote("AAPL", payload, { yahooInterval: "5m", includePrePost: true, chartScope: "week" });
   assert.equal(quote.marketState, "REGULAR");
   assert.equal(quote.chartScope, "week");
+});
+
+test("mockMondayChartPayload produces a PRE-session quote through the real parser (as-of-Monday path)", () => {
+  // The public feed cannot be observed in PRE on weekends, so the mock is the
+  // stand-in that exercises the full as-of-Monday pipeline in CI.
+  const payload = mockMondayChartPayload("NVDA");
+  const quote = parseChartPayloadToQuote("NVDA", payload, {
+    yahooInterval: "5m",
+    includePrePost: true,
+    chartScope: "day",
+  });
+
+  // Derived from the last pre bar — NOT from meta.marketState (which the mock
+  // deliberately omits, matching the live endpoint).
+  assert.equal(quote.marketState, "PRE");
+  assert.equal(quote.chartScope, "day");
+  assert.ok(Number.isFinite(quote.price) && quote.price > 0);
+  assert.ok(typeof quote.changePercent === "number" && Number.isFinite(quote.changePercent));
+  // Public-feed parity: extended volume absent (null), Friday regular volume present.
+  assert.equal(quote.preMarketVolume, null);
+  assert.equal(quote.postMarketVolume, null);
+  assert.ok(quote.volume! > 0);
+
+  // Deterministic: the same symbol → the same fixture.
+  const again = parseChartPayloadToQuote("NVDA", mockMondayChartPayload("NVDA"), {
+    yahooInterval: "5m",
+    includePrePost: true,
+    chartScope: "day",
+  });
+  assert.equal(again.price, quote.price);
+  assert.equal(again.changePercent, quote.changePercent);
+
+  // Ranking a couple of mock quotes yields an honest pre-market mover list on
+  // the proxy basis (no live extended volume anywhere).
+  const movers = rankMovers([
+    parseChartPayloadToQuote("NVDA", mockMondayChartPayload("NVDA"), { yahooInterval: "5m", includePrePost: true, chartScope: "day" }),
+    parseChartPayloadToQuote("TSLA", mockMondayChartPayload("TSLA"), { yahooInterval: "5m", includePrePost: true, chartScope: "day" }),
+  ]);
+  assert.equal(movers.length, 2);
+  assert.equal(movers[0]!.volumeBasis, "proxy");
+  assert.equal(movers[0]!.volumeProxied, true);
+  assert.equal(movers[0]!.volumeSource, "regular");
+  assert.equal(movers[0]!.moveOnly, false);
 });

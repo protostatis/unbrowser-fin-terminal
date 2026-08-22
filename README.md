@@ -397,6 +397,7 @@ Configure it with environment variables:
 | `MARKET_PRECACHE_QUALITY_GATE` | `1` | A/B switch for the quality gates. When on (default): a pre-warm identity is fresh only when the archive holds a **usable** same-day canvas (complete, fetched-evidence, item-level sourced read, no scenarios in a BRIEF) — evidence-blocked or unsupported canvases never satisfy the cache and are re-warmed; and a missing `UNBROWSER_MCP_URL` skips the source pre-warm entirely (extraction has no local fallback, so it would only produce degraded TA-only canvases). Set to `0` to restore the baseline date-only freshness and fan-out. |
 | `MARKET_PRECACHE_BUDGET` | `2000000` | UTC-day total Pi-reported token budget for pre-cache runs (10 000–10 000 000). See `market-precache-ledger.json`. |
 | `MARKET_PRECACHE_RUN_LIMIT` | `100000` | Conservative reservation per run; at most ~20 attempts/day at defaults (5 000–500 000). |
+| `MARKET_MOCK_MONDAY` | `0` | Dev/testing only. `1` serves deterministic Monday-pre-market fixtures instead of the live quote feed (DAY scope), so the PRE session path and mover labels can be verified on any day of the week — the public Yahoo API only exposes a live PRE state Mon–Fri 04:00–09:30 ET. Never set in production. |
 
 With the `paired` strategy, the synthetic `v1/paired/*` worker identity is never
 archived or exposed as a cache hit. With `single`, jobs carry the exact

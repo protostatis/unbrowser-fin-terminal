@@ -1991,8 +1991,103 @@ export function parseChartPayloadToQuote(
 	};
 }
 
+/**
+ * Monday pre-market mock.
+ *
+ * The public Yahoo chart API cannot be observed in a PRE session on weekends
+ * (the last bar is Friday's post bar), so tests that need "as of Monday
+ * pre-market" behavior build a synthetic chart payload. Set
+ * MARKET_MOCK_MONDAY=1 to serve these instead of the live feed — useful for
+ * local dev, demos, and verifying the PRE session path through the REAL parser
+ * and mover pipeline on any day of the week.
+ *
+ * Deterministic: the same symbol always produces the same Friday close, pre
+ * move, and volume, so snapshots are reproducible across runs.
+ */
+export function readMarketMockMonday(env: NodeJS.ProcessEnv = process.env): boolean {
+	return (env.MARKET_MOCK_MONDAY ?? "").trim() === "1";
+}
+
+// Monday 2026-08-24, EDT = UTC-4.
+const MOCK_MON_0000_ET = 1_787_529_600;
+const MOCK_PRE_START = MOCK_MON_0000_ET + 4 * 3_600;       // 04:00 ET
+const MOCK_REGULAR_START = MOCK_MON_0000_ET + 9.5 * 3_600; // 09:30 ET
+const MOCK_REGULAR_END = MOCK_MON_0000_ET + 16 * 3_600;    // 16:00 ET
+const MOCK_MON_BARS = 5;
+
+function mockSymbolHash(symbol: string): number {
+	let hash = 0;
+	for (const char of symbol) hash = ((hash << 5) - hash + char.charCodeAt(0)) >>> 0;
+	return hash;
+}
+
+/** Deterministic per-symbol Monday pre-market fixture. */
+function mockMondaySymbol(symbol: string): { fridayClose: number; preMovePct: number; fridayVol: number } {
+	const hash = mockSymbolHash(symbol);
+	// Spread the 32-bit hash across independent bands so price/move/volume vary
+	// for short symbols too (`hash >>> 16` collapses for 4–6 char names).
+	const priceBand = (hash ^ (hash << 9 >>> 0)) % 960;
+	const moveBand = ((hash * 2654435761) >>> 0) % 160;
+	const volBand = ((hash ^ (hash << 13 >>> 0)) >>> 8) % 115_000_000;
+	const fridayClose = 40 + priceBand;
+	const preMovePct = Math.round(moveBand - 80) / 10; // −8.0..+7.9
+	const fridayVol = 5_000_000 + volBand;
+	return { fridayClose, preMovePct, fridayVol };
+}
+
+export function mockMondayChartPayload(symbol: string): unknown {
+	const vm = mockMondaySymbol(symbol);
+	const preClose = vm.fridayClose * (1 + vm.preMovePct / 100);
+
+	// A Monday pre-market chart (range=1d, includePrePost) carries PRE bars from
+	// 04:00 ET up to ~08:55 ET — with the public feed shipping 0 volume for them.
+	// meta.regularMarketVolume supplies Friday's session volume for the proxy leg.
+	const preTimestamps: number[] = [];
+	const preCloses: number[] = [];
+	for (let i = 0; i < MOCK_MON_BARS; i++) {
+		const last = i === MOCK_MON_BARS - 1;
+		preTimestamps.push(last
+			? MOCK_PRE_START + 295 * 60 // 08:55 ET, just before open
+			: MOCK_PRE_START + i * 60 * 60); // 05:00, 06:00, 07:00, 08:00 ET
+		preCloses.push(last ? preClose : vm.fridayClose * (1 + vm.preMovePct / 100 / 2));
+	}
+
+	return {
+		chart: {
+			result: [{
+				meta: {
+					symbol,
+					currency: "USD",
+					longName: `${symbol} Inc.`,
+					shortName: symbol,
+					fullExchangeName: "NasdaqGS",
+					exchangeTimezoneName: "America/New_York",
+					dataGranularity: "5m",
+					regularMarketPrice: vm.fridayClose,
+					regularMarketVolume: vm.fridayVol,
+					regularMarketTime: MOCK_REGULAR_END,
+					previousClose: vm.fridayClose,
+					chartPreviousClose: vm.fridayClose,
+					currentTradingPeriod: {
+						pre: { start: MOCK_PRE_START, end: MOCK_REGULAR_START, timezone: "America/New_York", gmtoffset: -14400 },
+						regular: { start: MOCK_REGULAR_START, end: MOCK_REGULAR_END, timezone: "America/New_York", gmtoffset: -14400 },
+						post: { start: MOCK_REGULAR_END, end: MOCK_REGULAR_END + 4 * 3_600, timezone: "America/New_York", gmtoffset: -14400 },
+					},
+					// Deliberately NO marketState / preMarketPrice / preMarketVolume,
+					// exactly like the live public endpoint (verified 2026-08-22).
+				},
+				timestamp: preTimestamps,
+				indicators: { quote: [{ close: preCloses, volume: preTimestamps.map(() => 0) }] },
+			}],
+		},
+	};
+}
+
 async function fetchQuote(symbol: string, scope: ChartScope = DEFAULT_CHART_SCOPE, signal?: AbortSignal): Promise<Quote> {
 	const cfg = CHART_SCOPE_CONFIGS[scope];
+	if (readMarketMockMonday() && scope === "day") {
+		return parseChartPayloadToQuote(symbol, mockMondayChartPayload(symbol), { ...cfg, chartScope: scope });
+	}
 	const url = new URL(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}`);
 	url.searchParams.set("range", cfg.yahooRange);
 	url.searchParams.set("interval", cfg.yahooInterval);
