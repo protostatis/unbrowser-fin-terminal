@@ -38,10 +38,11 @@ import {
 	readPrecacheLedger,
 	reservePrecacheEntries,
 	settlePrecacheEntry,
+	singlePrecacheKey,
 	utcDayKey,
 	writeLedger as writePrecacheLedger,
 } from "../../shared/research-precache-ledger.js";
-import { collectResearchWorkerUsage } from "../../shared/research-worker-usage.js";
+import { collectResearchWorkerUsage, isTokenGuardTriggered } from "../../shared/research-worker-usage.js";
 import {
 	DEFAULT_MARKET_EVENT_SOURCES,
 	MarketEventScout,
@@ -696,10 +697,11 @@ function emitWorkerSettled(job: ResearchJob | undefined): void {
 		outcome,
 		...(job.error ? { error: job.error } : {}),
 	};
-	if (job.origin === "precache" && job.pairedTarget) {
+	if (job.origin === "precache") {
 		try {
 			const stats = collectResearchWorkerUsage();
 			if (stats) payload.usage = stats;
+			if (isTokenGuardTriggered()) payload.tokenGuard = true;
 		} catch { /* best-effort */ }
 	}
 	emitWorkerEvent("settled", payload, job.id);
@@ -1041,6 +1043,99 @@ export function buildPairedPrecachePlan(options: PairedPrecachePlanOptions): Pre
 		if (!symbol || seenTickers.has(symbol)) continue;
 		seenTickers.add(symbol);
 		pushPaired(symbol, tickerResearchIdentity(symbol, "brief"), tickerResearchIdentity(symbol, "why"), PRECACHE_TICKER_QUESTION, tickerWhyQuestion(symbol));
+	}
+
+	if (options.maxJobs === 0) return [];
+	if (options.maxJobs !== undefined && Number.isFinite(options.maxJobs) && options.maxJobs > 0) {
+		return plan.slice(0, Math.floor(options.maxJobs));
+	}
+	return plan;
+}
+
+export type PrecacheStrategy = "paired" | "single";
+
+/**
+ * Pre-cache strategy selector. `paired` runs one shared evidence pass per
+ * context and splits BRIEF+WHY (token-efficient but relies on the strict
+ * block-partition contract). `single` runs each exact interactive identity as
+ * an independent job through the proven compact path (BRIEFs first), trading
+ * extra evidence activity for model compliance. Default: `single` — the paired
+ * contract has produced zero usable warm cache in production.
+ */
+export function readPrecacheStrategy(env: NodeJS.ProcessEnv = process.env): PrecacheStrategy {
+	const raw = env.MARKET_PRECACHE_STRATEGY?.trim();
+	if (raw === undefined || raw === "") return "single";
+	const value = raw.toLowerCase();
+	if (value === "paired") return "paired";
+	if (value === "single") return "single";
+	throw new Error("MARKET_PRECACHE_STRATEGY must be paired or single");
+}
+
+/**
+ * Single-strategy pre-cache plan builder: each exact interactive identity
+ * (BRIEF and WHY separately) becomes its own job using the exact research keys
+ * the interactive path uses, so archived results are direct cache hits. Order:
+ * all BRIEFs first (Market Story → headline → event lanes → mover tickers),
+ * then the matching WHYs. An identity is skipped when it is already fresh.
+ */
+export type SinglePrecachePlanOptions = {
+	leadHeadline?: Headline;
+	isFresh: (symbol: string, researchKey: string) => boolean;
+	maxJobs?: number;
+	moverSymbols?: readonly string[];
+};
+
+export function buildSinglePrecachePlan(options: SinglePrecachePlanOptions): PrecacheResearchRequest[] {
+	const plan: PrecacheResearchRequest[] = [];
+	const seenTickers = new Set<string>();
+
+	function pushSingle(symbol: string, identity: ResearchIdentity, question: string): void {
+		if (options.isFresh(symbol, identity.researchKey)) return;
+		plan.push({
+			symbol,
+			question,
+			chartScope: DEFAULT_CHART_SCOPE,
+			researchKey: identity.researchKey,
+			intent: identity.intent,
+			contextLabel: identity.contextLabel,
+		});
+	}
+
+	// Build the same ordered context list as the paired plan.
+	const contexts: Array<() => void> = [];
+	const pushContext = (fn: () => void): void => { contexts.push(fn); };
+
+	pushContext(() => pushSingle("MARKET", marketStoryIdentity("brief"), PRECACHE_MARKET_STORY_QUESTION));
+	if (options.leadHeadline) {
+		const hl = options.leadHeadline;
+		pushContext(() => pushSingle("MARKET", headlineResearchIdentity(hl, "brief"), headlineBriefQuestion(hl.title)));
+	}
+	for (const lane of EVENT_LANES) {
+		pushContext(() => pushSingle("MARKET", eventResearchIdentity(lane, "brief"), lane.briefQuestion));
+	}
+	for (const raw of (options.moverSymbols ?? [])) {
+		const symbol = normalizeSymbol(raw);
+		if (!symbol || seenTickers.has(symbol)) continue;
+		seenTickers.add(symbol);
+		pushContext(() => pushSingle(symbol, tickerResearchIdentity(symbol, "brief"), PRECACHE_TICKER_QUESTION));
+	}
+
+	// BRIEFs first across all contexts, then WHYs in the same context order.
+	for (const run of contexts) run();
+	pushSingle("MARKET", marketStoryIdentity("why"), PRECACHE_MARKET_STORY_WHY_QUESTION);
+	if (options.leadHeadline) {
+		const hl = options.leadHeadline;
+		pushSingle("MARKET", headlineResearchIdentity(hl, "why"), headlineWhyQuestion(hl.title));
+	}
+	for (const lane of EVENT_LANES) {
+		pushSingle("MARKET", eventResearchIdentity(lane, "why"), lane.whyQuestion);
+	}
+	const whyTickers = new Set<string>();
+	for (const raw of (options.moverSymbols ?? [])) {
+		const symbol = normalizeSymbol(raw);
+		if (!symbol || !seenTickers.has(symbol) || whyTickers.has(symbol)) continue;
+		whyTickers.add(symbol);
+		pushSingle(symbol, tickerResearchIdentity(symbol, "why"), tickerWhyQuestion(symbol));
 	}
 
 	if (options.maxJobs === 0) return [];
@@ -7813,7 +7908,7 @@ export default function (pi: ExtensionAPI) {
 		intent: job.intent,
 		contextLabel: job.contextLabel,
 		...(job.pairedTarget ? { pairedTarget: job.pairedTarget } : {}),
-		...(job.origin === "precache" && job.pairedTarget && job.tokenLimit !== undefined
+		...(job.origin === "precache" && job.tokenLimit !== undefined
 			? { origin: "precache" as const, tokenLimit: job.tokenLimit }
 			: {}),
 	});
@@ -7825,7 +7920,11 @@ export default function (pi: ExtensionAPI) {
 		settleResearchJob(jobId, { outcome: "failed", error: message || "Research worker failed" });
 	};
 
-	const finalizeWorkerCompletion = async (jobId: string, canvas: Canvas): Promise<void> => {
+	const finalizeWorkerCompletion = async (
+		jobId: string,
+		canvas: Canvas,
+		event?: Pick<Extract<WorkerEvent, { type: "settled" }>, "outcome" | "error" | "usage" | "tokenGuard">,
+	): Promise<void> => {
 		if (workerFinalizations.has(jobId)) return;
 		workerFinalizations.add(jobId);
 		const job = researchJobs.get(jobId);
@@ -7834,31 +7933,52 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		try {
-			await archiveCompletedCanvas(canvas, job.question, { promptVariant: job.promptVariant, origin: job.origin });
+			const qualityGate = job.origin === "precache" ? readPrecacheQualityGate() : undefined;
+			await archiveCompletedCanvas(canvas, job.question, { promptVariant: job.promptVariant, origin: job.origin, ...(qualityGate !== undefined ? { qualityGate } : {}) });
+			if (job.origin === "precache" && job.precacheReservation && !job.pairedTarget) {
+				// Mirror the paired path: the exact identity may not linger in the
+				// live canvas map as a warm result unless it is quality-usable.
+				if (qualityGate && !assessCanvasQuality(canvas).usable) {
+					canvases.delete(canvasKey(job.symbol, job.chartScope, job.researchKey));
+				}
+				await persistPrecacheSettlement(job, "complete", event?.usage);
+			}
 			const current = researchJobs.get(jobId);
 			if (!current || !researchSlotHeld(current) || current.outcome !== "complete") return;
 			settleResearchJob(jobId, { outcome: "complete", error: undefined });
 		} catch (error) {
+			if (job.origin === "precache" && job.precacheReservation && !job.pairedTarget) {
+				const message = `Could not persist completed research: ${cleanText(error instanceof Error ? error.message : String(error)).slice(0, 140)}`;
+				workerFinalizations.delete(jobId);
+				void finalizeSinglePrecacheSettlement(jobId, { outcome: "failed", error: message, usage: event?.usage, tokenGuard: event?.tokenGuard });
+				return;
+			}
 			settleWorkerFailure(jobId, `Could not persist completed research: ${cleanText(error instanceof Error ? error.message : String(error)).slice(0, 140)}`);
 		} finally {
 			workerFinalizations.delete(jobId);
 		}
 	};
 
-	const persistPairedPrecacheSettlement = async (
+	const precacheSettlementKey = (job: ResearchJob): string => job.pairedTarget
+		? pairedPairKey(job.symbol, job.chartScope, job.pairedTarget.brief.researchKey, job.pairedTarget.why.researchKey)
+		: singlePrecacheKey(job.symbol, job.chartScope, job.researchKey);
+
+	const persistPrecacheSettlement = async (
 		job: ResearchJob,
 		outcome: "complete" | "failed" | "cancelled",
 		usage: { totalTokens: number; cost?: number } | undefined,
+		failure?: {
+			code: string;
+			phase?: string;
+			lastTool?: string;
+			tokenGuard?: boolean;
+			message?: string;
+		},
 	): Promise<void> => {
-		if (job.origin !== "precache" || !job.pairedTarget) return;
+		if (job.origin !== "precache") return;
 		const reservation = job.precacheReservation;
 		if (!reservation) throw new Error("Pre-cache reservation correlation is unavailable");
-		const pairKey = pairedPairKey(
-			job.symbol,
-			job.chartScope,
-			job.pairedTarget.brief.researchKey,
-			job.pairedTarget.why.researchKey,
-		);
+		const pairKey = precacheSettlementKey(job);
 		if (reservation.pairKey !== pairKey) throw new Error("Pre-cache reservation identity mismatch");
 		const write = precacheLedgerWriteQueue.then(async () => {
 			const file = await readPrecacheLedger(reservation.ledgerPath);
@@ -7871,6 +7991,7 @@ export default function (pi: ExtensionAPI) {
 				outcome,
 				usage?.totalTokens,
 				usage?.cost,
+				outcome === "complete" ? undefined : failure,
 			);
 			const existing = day.entries.find((entry) => entry.pairKey === pairKey && entry.attempt === reservation.attempt);
 			if (!changed && existing?.outcome === undefined) {
@@ -7882,9 +8003,34 @@ export default function (pi: ExtensionAPI) {
 		await write;
 	};
 
+	const precacheFailureTelemetry = (
+		job: ResearchJob,
+		message: string | undefined,
+		tokenGuard: boolean,
+	): { code: string; phase?: string; lastTool?: string; tokenGuard?: boolean; message?: string } | undefined => {
+		if (job.outcome === "complete") return undefined;
+		const text = cleanText(message ?? "").replace(/\s+/g, " ").slice(0, 400);
+		let code = "worker-failed";
+		if (tokenGuard) code = "token-guard";
+		else if (/requires exactly one|Duplicate paired|Unsupported paired|mismatched dossierHint|empty post-prefix/i.test(text)) code = "paired-split-contract";
+		else if (/requires extracted source evidence|extraction failed|all candidate sources failed/i.test(text)) code = "no-fetched-evidence";
+		else if (/degraded brief|no evidence|EVIDENCE_BLOCKED/i.test(text)) code = "degraded-output";
+		else if (/could not persist|archive/i.test(text)) code = "archive-write";
+		else if (/reservation|ledger/i.test(text)) code = "ledger-write";
+		else if (/no research canvas|without a complete/i.test(text)) code = "no-canvas";
+		else if (/token limit|exceeded|abort/i.test(text)) code = "token-guard";
+		return {
+			code,
+			...(job.phase ? { phase: job.phase } : {}),
+			...(job.toolName ? { lastTool: job.toolName } : {}),
+			...(tokenGuard ? { tokenGuard: true } : {}),
+			...(text ? { message: text } : {}),
+		};
+	};
+
 	const finalizePairedWorkerSettlement = async (
 		jobId: string,
-		event: Pick<Extract<WorkerEvent, { type: "settled" }>, "outcome" | "error" | "usage">,
+		event: Pick<Extract<WorkerEvent, { type: "settled" }>, "outcome" | "error" | "usage" | "tokenGuard">,
 	): Promise<void> => {
 		if (workerFinalizations.has(jobId)) return;
 		workerFinalizations.add(jobId);
@@ -7938,12 +8084,12 @@ export default function (pi: ExtensionAPI) {
 				outcome = "failed";
 				failure ||= "Worker settled without a complete paired canvas";
 			}
-			await persistPairedPrecacheSettlement(job, outcome, event.usage);
+			await persistPrecacheSettlement(job, outcome, event.usage, precacheFailureTelemetry(job, failure, event.tokenGuard === true));
 		} catch (error) {
 			outcome = "failed";
 			failure = cleanText(error instanceof Error ? error.message : String(error)).slice(0, 180);
 			try {
-				await persistPairedPrecacheSettlement(job, "failed", event.usage);
+				await persistPrecacheSettlement(job, "failed", event.usage, precacheFailureTelemetry(job, failure, event.tokenGuard === true));
 			} catch (ledgerError) {
 				failure = `Could not persist pre-cache usage: ${cleanText(ledgerError instanceof Error ? ledgerError.message : String(ledgerError)).slice(0, 130)}`;
 				precachePending = [];
@@ -7960,11 +8106,51 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
+	/**
+	 * Single-strategy pre-cache settlement: a non-paired precache job that
+	 * carried a ledger reservation settles its ledger entry on worker outcome,
+	 * with the same failure telemetry as paired jobs.
+	 */
+	const finalizeSinglePrecacheSettlement = async (
+		jobId: string,
+		event: Pick<Extract<WorkerEvent, { type: "settled" }>, "outcome" | "error" | "usage" | "tokenGuard">,
+	): Promise<void> => {
+		if (workerFinalizations.has(jobId)) return;
+		workerFinalizations.add(jobId);
+		const job = researchJobs.get(jobId);
+		if (!job || !researchSlotHeld(job) || job.origin !== "precache" || job.pairedTarget) {
+			workerFinalizations.delete(jobId);
+			return;
+		}
+		const outcome: "complete" | "failed" | "cancelled" = event.outcome;
+		const failure = event.error ? cleanText(event.error).slice(0, 180) : undefined;
+		try {
+			await persistPrecacheSettlement(job, outcome, event.usage, precacheFailureTelemetry(job, failure, event.tokenGuard === true));
+		} catch (error) {
+			const ledgerFailure = `Could not persist pre-cache usage: ${cleanText(error instanceof Error ? error.message : String(error)).slice(0, 130)}`;
+			precachePending = [];
+			stopPrecacheTimer();
+			const current = researchJobs.get(jobId);
+			if (current && researchSlotHeld(current)) {
+				settleResearchJob(jobId, { outcome: "failed", error: ledgerFailure });
+			}
+			workerFinalizations.delete(jobId);
+			return;
+		}
+		const current = researchJobs.get(jobId);
+		if (current && researchSlotHeld(current)) {
+			settleResearchJob(jobId, { outcome, ...(failure ? { error: failure } : { error: undefined }) });
+		}
+		workerFinalizations.delete(jobId);
+	};
+
 	const failWorkerResearch = (jobId: string, error: unknown): void => {
 		const job = researchJobs.get(jobId);
 		const message = cleanText(error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 180) || "Research worker failed";
-		if (job?.pairedTarget && job.origin === "precache" && !isResearchWorkerProcess) {
-			void finalizePairedWorkerSettlement(jobId, { outcome: "failed", error: message });
+		if (job?.origin === "precache" && !isResearchWorkerProcess) {
+			void (job.pairedTarget
+				? finalizePairedWorkerSettlement(jobId, { outcome: "failed", error: message })
+				: finalizeSinglePrecacheSettlement(jobId, { outcome: "failed", error: message }));
 			return;
 		}
 		settleWorkerFailure(jobId, message);
@@ -8037,7 +8223,16 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			case "settled": {
-				if (job.pairedTarget) {
+				if (job.origin === "precache" && job.precacheReservation) {
+					if (!job.pairedTarget) {
+						const canvas = canvasForResearch(job.symbol, job.chartScope, job.researchKey);
+						if (event.outcome === "complete" && canvas?.researchId === job.id && canvas.stage === "complete") {
+							void finalizeWorkerCompletion(job.id, canvas, event);
+							return;
+						}
+						void finalizeSinglePrecacheSettlement(job.id, event);
+						return;
+					}
 					void finalizePairedWorkerSettlement(job.id, event);
 					return;
 				}
@@ -8129,9 +8324,13 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const cancelAndSettleResearchJob = (job: ResearchJob): ResearchJob | undefined => {
-		if (!isResearchWorkerProcess && job.origin === "precache" && job.pairedTarget) {
+		if (!isResearchWorkerProcess && job.origin === "precache" && job.precacheReservation) {
 			const cancelling = updateResearchJob(job.id, { phase: "cancelling", outcome: "cancelled", error: undefined });
-			void finalizePairedWorkerSettlement(job.id, { outcome: "cancelled" });
+			if (job.pairedTarget) {
+				void finalizePairedWorkerSettlement(job.id, { outcome: "cancelled" });
+			} else {
+				void finalizeSinglePrecacheSettlement(job.id, { outcome: "cancelled" });
+			}
 			return cancelling;
 		}
 		return settleResearchJob(job.id, { outcome: "cancelled", error: undefined });
@@ -8327,7 +8526,10 @@ export default function (pi: ExtensionAPI) {
 			// Snapshot failed: build story + events only.
 		}
 
-		const plan = buildPairedPrecachePlan({ isFresh, maxJobs, leadHeadline, moverSymbols });
+		const strategy = readPrecacheStrategy();
+		const plan = strategy === "single"
+			? buildSinglePrecachePlan({ isFresh, maxJobs, leadHeadline, moverSymbols })
+			: buildPairedPrecachePlan({ isFresh, maxJobs, leadHeadline, moverSymbols });
 		if (generation !== warmGeneration || plan.length === 0) return;
 
 		// Reserve the highest-priority prefix and persist it before any dispatch.
@@ -8335,12 +8537,9 @@ export default function (pi: ExtensionAPI) {
 		try {
 			if (!archiveCwd) throw new Error("Research archive path is unavailable");
 			const path = precacheLedgerFilePath(archiveCwd);
-			const keyFor = (item: PrecacheResearchRequest): string => pairedPairKey(
-				item.symbol,
-				item.chartScope,
-				item.pairedTarget!.brief.researchKey,
-				item.pairedTarget!.why.researchKey,
-			);
+			const keyFor = (item: PrecacheResearchRequest): string => item.pairedTarget
+				? pairedPairKey(item.symbol, item.chartScope, item.pairedTarget.brief.researchKey, item.pairedTarget.why.researchKey)
+				: singlePrecacheKey(item.symbol, item.chartScope, item.researchKey);
 			const reserveAndWrite = precacheLedgerWriteQueue.then(async () => {
 				const file = await readPrecacheLedger(path);
 				const reservationNow = Date.now();

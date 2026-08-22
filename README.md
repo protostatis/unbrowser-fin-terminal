@@ -339,18 +339,26 @@ advancing its baseline or dedupe state.
 
 When a session starts (the `/market` flow in TUI, the live server, or a private
 workspace), the terminal bootstraps the shared research cache with the agent
-requests a fresh session is most likely to make. Each warm job builds BRIEF and
-WHY from one shared evidence pass, in this order: Market Story, the bootstrap
-snapshot's lead SIGNALS headline, all three EVENTS lanes, then ticker pairs by
-snapshot mover rank. There is no watchlist fallback. If snapshot discovery
-fails, Market Story and the EVENTS lanes still warm.
+requests a fresh session is most likely to make. The default **`single`
+strategy** runs each exact interactive identity (BRIEF and WHY) as an
+independent job through the proven compact research path, in this order:
+Market Story BRIEF → the bootstrap snapshot's lead SIGNALS headline BRIEF → all
+three EVENTS lanes BRIEF → mover-ranked ticker BRIEFs, then the matching WHYs.
+There is no watchlist fallback. If snapshot discovery fails, Market Story and
+the EVENTS lanes still warm.
 
-The host strictly partitions a completed paired canvas and writes only the exact
-interactive BRIEF/WHY identities. A pair is skipped when both halves already
-have usable same-day archives; if only one half is stale, the pair runs but the
-fresh half is not overwritten. Completed exact canvases are shared with later
-sessions, so the first matching request can use a current-date cache instead of
-starting cold research.
+The `paired` strategy (opt-in via `MARKET_PRECACHE_STRATEGY=paired`) instead
+builds BRIEF and WHY from one shared evidence pass and strictly partitions the
+completed canvas into the exact interactive identities. Paired contexts were the
+original default, but their hard block-ID partition contract can reject
+model output that interactive compact runs produce successfully; `single` is
+the default so pre-warm stays reliable for flash-class models.
+
+A context/identity is skipped when its exact research key already has a usable
+same-day archive; if only one half is stale, the pair (or single job) runs but
+the fresh half is not overwritten. Completed exact canvases are shared with
+later sessions, so the first matching request can use a current-date cache
+instead of starting cold research.
 
 Pre-warm jobs never compete with interactive research: at most
 `MARKET_RESEARCH_CONCURRENCY - 1` warm jobs are in flight at once (one worker
@@ -366,18 +374,22 @@ Configure it with environment variables:
 | Variable | Default | Meaning |
 |---|---|---|
 | `MARKET_PRECACHE_ENABLED` | `1` (private/live/TUI), `0` (public workers) | Master switch, `1/true/on` or `0/false/off`. Disposable public workers are always cold, even if this variable is enabled. |
+| `MARKET_PRECACHE_STRATEGY` | `single` | `single` runs each exact identity independently through the compact path (reliable, recommended). `paired` uses one shared evidence pass with a strict block-partition split (token-efficient but can reject flash-model output). |
 | `MARKET_PRECACHE_MAX_JOBS` | `24` | Cap on the pre-warm plan per bootstrap (story + headline + events + movers), `1`–`24`. Secondary to budget ceiling. In-flight warm jobs are additionally capped at `MARKET_RESEARCH_CONCURRENCY - 1`. |
 | `MARKET_PRECACHE_QUALITY_GATE` | `1` | A/B switch for the quality gates. When on (default): a pre-warm identity is fresh only when the archive holds a **usable** same-day canvas (complete, fetched-evidence, item-level sourced read, no scenarios in a BRIEF) — evidence-blocked or unsupported canvases never satisfy the cache and are re-warmed; and a missing `UNBROWSER_MCP_URL` skips the source pre-warm entirely (extraction has no local fallback, so it would only produce degraded TA-only canvases). Set to `0` to restore the baseline date-only freshness and fan-out. |
-| `MARKET_PRECACHE_BUDGET` | `2000000` | UTC-day total Pi-reported token budget for paired pre-cache runs (10 000–10 000 000). See `market-precache-ledger.json`. |
-| `MARKET_PRECACHE_RUN_LIMIT` | `100000` | Conservative reservation per paired run; at most ~20 attempts/day at defaults (5 000–500 000). |
+| `MARKET_PRECACHE_BUDGET` | `2000000` | UTC-day total Pi-reported token budget for pre-cache runs (10 000–10 000 000). See `market-precache-ledger.json`. |
+| `MARKET_PRECACHE_RUN_LIMIT` | `100000` | Conservative reservation per run; at most ~20 attempts/day at defaults (5 000–500 000). |
 
-The synthetic `v1/paired/*` worker identity is never archived or exposed as a
-cache hit. Before dispatch, the parent durably reserves the full per-run limit
-in `$MARKET_DATA_DIR/market-precache-ledger.json` (or `.pi/` without a data
-directory). Reservations are permanent for their UTC day; actual Pi usage and
-cost are settlement telemetry. The worker checks projected Pi usage before
-every provider turn, including the first. Budget settings are fixed once that
-UTC day's ledger record exists and can be changed for the next day.
+With the `paired` strategy, the synthetic `v1/paired/*` worker identity is never
+archived or exposed as a cache hit. With `single`, jobs carry the exact
+interactive identities and are archived directly. Before dispatch, the parent
+durably reserves the full per-run limit in `$MARKET_DATA_DIR/market-precache-ledger.json`
+(or `.pi/` without a data directory). Reservations are permanent for their UTC
+day; actual Pi usage, cost, and — for failed runs — a bounded failure code,
+phase, last tool, token-guard flag, and redacted worker error are settlement
+telemetry. The worker checks projected Pi usage before every provider turn,
+including the first. Budget settings are fixed once that UTC day's ledger
+record exists and can be changed for the next day.
 
 With the quality gate enabled, degraded split halves are retained in archive
 history for cooldown telemetry but are never published as cache-eligible

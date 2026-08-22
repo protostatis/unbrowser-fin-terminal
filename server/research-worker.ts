@@ -36,7 +36,11 @@ import {
   type WorkerSettledEvent,
 } from "./research-worker-protocol.js";
 import { wouldExceedTokenLimit } from "../shared/research-precache-ledger.js";
-import { setResearchWorkerUsageCollector, type ResearchWorkerUsage } from "../shared/research-worker-usage.js";
+import {
+  setResearchWorkerUsageCollector,
+  setTokenGuardTriggered,
+  type ResearchWorkerUsage,
+} from "../shared/research-worker-usage.js";
 
 const CWD = path.resolve(process.env.MARKET_ROOT?.trim() || process.cwd());
 const RUN_TIMEOUT_MS = 10 * 60_000;
@@ -287,11 +291,15 @@ export function installTokenGuard(
         || wouldExceedTokenLimit({ usedTotal, contextEstimate, modelMaxTokens, tokenLimit })
       ) {
         guardTriggered = true;
+        // Record explicit telemetry so a guard abort is not misread as a
+        // generic "no canvas published" contract failure in the ledger.
+        setTokenGuardTriggered(true);
         void activeSession.abort();
       }
     } catch {
       // Unknown accounting cannot safely authorize another paid provider turn.
       guardTriggered = true;
+      setTokenGuardTriggered(true);
       void activeSession.abort();
     }
   });
@@ -364,6 +372,8 @@ async function main(): Promise<void> {
   const run = await waitForRunMessage();
   activeRun = run;
   installCancellationListener();
+  // Reset per-run token-guard telemetry before the first provider turn.
+  setTokenGuardTriggered(false);
   if (cancellationRequested) {
     await sendBootstrapEvent(run, "settled");
     return;

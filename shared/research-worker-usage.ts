@@ -28,3 +28,27 @@ export function setResearchWorkerUsageCollector(collector: ResearchWorkerUsageCo
 export function collectResearchWorkerUsage(): ResearchWorkerUsage | undefined {
   return workerUsageGlobal.__unbrowserFinTerminalWorkerUsageCollector?.();
 }
+
+// ── Token-guard bridge ─────────────────────────────────────────────────────
+//
+// The per-run token guard lives in the worker process (installTokenGuard in
+// server/research-worker.ts). It aborts the session on the pre-turn projection
+// check, which otherwise surfaces as a generic "no canvas published" failure.
+// Expose the trigger through the same globalThis bridge so the settled event
+// can carry explicit `tokenGuard: true` telemetry for ledger diagnosis.
+
+export type TokenGuardTriggeredCollector = () => boolean;
+
+type TokenGuardGlobal = typeof globalThis & {
+  __unbrowserFinTerminalTokenGuardTriggered?: boolean;
+};
+
+const tokenGuardGlobal = globalThis as TokenGuardGlobal;
+
+export function setTokenGuardTriggered(triggered: boolean): void {
+  tokenGuardGlobal.__unbrowserFinTerminalTokenGuardTriggered = triggered;
+}
+
+export function isTokenGuardTriggered(): boolean {
+  return tokenGuardGlobal.__unbrowserFinTerminalTokenGuardTriggered === true;
+}

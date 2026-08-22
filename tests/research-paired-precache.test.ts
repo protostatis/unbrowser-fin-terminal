@@ -6,6 +6,7 @@ import test from "node:test";
 import type { AgentSession, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   buildPairedPrecachePlan,
+  buildSinglePrecachePlan,
   isArchivedResearchCacheEligible,
   localMarketEventDocumentClient,
   marketScoutScheduleDelay,
@@ -13,6 +14,7 @@ import {
   readMarketScoutLocalCliEnabled,
   readMarketScoutEnabled,
   readPrecacheEnabled,
+  readPrecacheStrategy,
   splitPairedCanvas,
 } from "../.pi/extensions/market-terminal.js";
 import {
@@ -32,6 +34,7 @@ import {
   readPrecacheBudgetConfig,
   reservePrecacheEntries,
   settlePrecacheEntry,
+  singlePrecacheKey,
   utcDayKey,
   wouldExceedTokenLimit,
   writeLedger,
@@ -40,7 +43,9 @@ import {
 } from "../shared/research-precache-ledger.js";
 import {
   collectResearchWorkerUsage,
+  isTokenGuardTriggered,
   setResearchWorkerUsageCollector,
+  setTokenGuardTriggered,
 } from "../shared/research-worker-usage.js";
 
 const noFresh = () => false;
@@ -559,4 +564,221 @@ test("worker usage collector is available through the cross-loader global bridge
   } finally {
     setResearchWorkerUsageCollector(undefined);
   }
+});
+
+// ── Single-strategy plan + strategy switch ────────────────────────────────
+
+test("single plan emits each exact interactive identity as its own job, BRIEFs first", () => {
+  const plan = buildSinglePrecachePlan({
+    isFresh: noFresh,
+    leadHeadline: { title: "Fed raises rates", url: "https://example.com/1", source: "Wire" },
+    moverSymbols: ["NVDA", "TSLA"],
+  });
+
+  // 4 BRIEFs (story, headline, earnings, macro, global-relay = 5) then WHYs.
+  const briefs = plan.filter((item) => item.intent === "brief");
+  const whys = plan.filter((item) => item.intent === "why");
+  assert.equal(briefs.length, whys.length, "every identity has a matching WHY");
+  assert.deepEqual(briefs.map((item) => item.symbol), ["MARKET", "MARKET", "MARKET", "MARKET", "MARKET", "NVDA", "TSLA"]);
+  assert.equal(plan[0]!.researchKey, "v1/market/story/brief");
+  assert.match(plan[1]!.researchKey, /^v1\/market\/headline\/[a-f0-9]{12}\/brief$/);
+  assert.deepEqual(briefs.slice(2, 5).map((item) => item.researchKey), [
+    "v1/market/events/earnings/brief",
+    "v1/market/events/macro/brief",
+    "v1/market/events/global-relay/brief",
+  ]);
+  assert.equal(plan[5]!.researchKey, "v1/ticker/brief");
+  assert.equal(plan[5]!.symbol, "NVDA");
+  assert.equal(plan[6]!.researchKey, "v1/ticker/brief");
+  assert.equal(plan[6]!.symbol, "TSLA");
+
+  // No synthetic paired identity leaks into the single plan.
+  assert.equal(plan.some((item) => item.researchKey.startsWith("v1/paired/")), false);
+  assert.equal(plan.some((item) => item.pairedTarget !== undefined), false);
+});
+
+test("single plan skips each identity independently and respects maxJobs", () => {
+  const skipped = buildSinglePrecachePlan({
+    isFresh: (_symbol, researchKey) => researchKey.includes("/story/"),
+  });
+  assert.equal(skipped.some((item) => item.researchKey.includes("/story/")), false);
+  assert.equal(skipped.length > 0, true, "other identities still warm");
+
+  const capped = buildSinglePrecachePlan({ isFresh: noFresh, maxJobs: 3 });
+  assert.equal(capped.length, 3);
+  assert.deepEqual(capped.map((item) => item.intent), ["brief", "brief", "brief"]);
+});
+
+test("single plan mover selection is normalized, deduped, and mover-only", () => {
+  const plan = buildSinglePrecachePlan({
+    isFresh: noFresh,
+    moverSymbols: [" nvda ", "NVDA", "TSLA", "invalid!"],
+  });
+  const briefs = plan.filter((item) => item.intent === "brief");
+  assert.deepEqual(briefs.filter((item) => item.symbol !== "MARKET").map((item) => item.symbol), ["NVDA", "TSLA"]);
+  assert.equal(briefs.filter((item) => item.symbol === "NVDA").length, 1, "duplicate mover normalized away");
+
+  const whys = plan.filter((item) => item.intent === "why");
+  assert.deepEqual(whys.filter((item) => item.symbol !== "MARKET").map((item) => item.symbol), ["NVDA", "TSLA"]);
+  assert.equal(whys.filter((item) => item.symbol === "NVDA").length, 1, "WHY movers deduped too");
+});
+
+test("precache strategy env parses paired/single and defaults to single", () => {
+  const previous = process.env.MARKET_PRECACHE_STRATEGY;
+  try {
+    delete process.env.MARKET_PRECACHE_STRATEGY;
+    assert.equal(readPrecacheStrategy(), "single");
+    process.env.MARKET_PRECACHE_STRATEGY = "paired";
+    assert.equal(readPrecacheStrategy(), "paired");
+    process.env.MARKET_PRECACHE_STRATEGY = "SINGLE";
+    assert.equal(readPrecacheStrategy(), "single");
+    process.env.MARKET_PRECACHE_STRATEGY = "banana";
+    assert.throws(() => readPrecacheStrategy(), /MARKET_PRECACHE_STRATEGY/);
+  } finally {
+    if (previous === undefined) delete process.env.MARKET_PRECACHE_STRATEGY;
+    else process.env.MARKET_PRECACHE_STRATEGY = previous;
+  }
+});
+
+test("single identity keys are stable, bounded, and distinct from pair keys", () => {
+  const brief = singlePrecacheKey("AAPL", "day", "v1/ticker/brief");
+  const why = singlePrecacheKey("AAPL", "day", "v1/ticker/why");
+  const story = singlePrecacheKey("MARKET", "day", "v1/market/story/brief");
+  assert.match(brief, /^pair-[a-f0-9]{32}$/);
+  assert.notEqual(brief, why);
+  assert.notEqual(brief, story);
+  assert.equal(singlePrecacheKey("AAPL", "day", "v1/ticker/brief"), brief, "deterministic");
+  assert.notEqual(brief, pairKey("AAPL"), "single key must not collide with the pair key");
+});
+
+test("single-strategy IPC requests are accepted and interactive ones still rejected", () => {
+  assert.equal(isValidResearchRequest({
+    symbol: "NVDA",
+    question: "Build a source-verified factual brief",
+    chartScope: "day",
+    researchKey: "v1/ticker/brief",
+    intent: "brief",
+    contextLabel: "NVDA BRIEF",
+    origin: "precache",
+    tokenLimit: 100_000,
+  }), true);
+
+  // Interactive jobs must not carry precache origin or a token limit.
+  assert.equal(isValidResearchRequest({
+    symbol: "NVDA",
+    question: "question",
+    chartScope: "day",
+    researchKey: "v1/ticker/brief",
+    intent: "brief",
+    contextLabel: "NVDA BRIEF",
+    origin: "precache",
+  }), false, "single precache requires a token limit");
+
+  assert.equal(isValidResearchRequest({
+    symbol: "NVDA",
+    question: "question",
+    chartScope: "day",
+    researchKey: "v1/ticker/brief",
+    intent: "brief",
+    contextLabel: "NVDA BRIEF",
+    tokenLimit: 100_000,
+  }), false, "token limit without precache origin is rejected");
+
+  assert.equal(isValidResearchRequest({
+    symbol: "NVDA",
+    question: "question",
+    chartScope: "day",
+    researchKey: "v1/paired/00000000000000000000000000000000",
+    intent: "brief",
+    contextLabel: "PAIRED NVDA",
+    origin: "precache",
+    tokenLimit: 100_000,
+  }), false, "synthetic paired key without pairedTarget is rejected");
+});
+
+// ── Ledger failure telemetry ──────────────────────────────────────────────
+
+test("failed settlement persists bounded failure telemetry", () => {
+  const key = pairKey("AAPL");
+  const day: PrecacheLedgerDay = {
+    date: "2026-08-07",
+    budget: 2_000_000,
+    perRunLimit: 100_000,
+    entries: [{ pairKey: key, attempt: 1, reservation: 100_000, reservedAt: 1 }],
+  };
+  const failure = { code: "paired-split-contract", phase: "synthesizing", lastTool: "market_canvas", tokenGuard: false, message: "Paired read must carry sourceIds" };
+  assert.equal(settlePrecacheEntry(day, key, 1, "failed", 12_000, 0.001, failure), true);
+  assert.deepEqual(day.entries[0]!.failure, failure);
+
+  const invalid = settlePrecacheEntry(day, key, 1, "failed", 12_000, 0.001, { code: "BAD CODE!" });
+  assert.equal(invalid, false, "already-settled entry is not overwritten");
+});
+
+test("failure telemetry validation rejects malformed payloads", () => {
+  const key = pairKey("AAPL");
+  const day: PrecacheLedgerDay = {
+    date: "2026-08-07",
+    budget: 2_000_000,
+    perRunLimit: 100_000,
+    entries: [{ pairKey: key, attempt: 1, reservation: 100_000, reservedAt: 1 }],
+  };
+  assert.throws(() => settlePrecacheEntry(day, key, 1, "failed", 0, 0, { code: "BAD CODE!" }), /failure telemetry is invalid/);
+  assert.throws(() => settlePrecacheEntry(day, key, 1, "failed", 0, 0, { code: "ok", message: "x".repeat(500) }), /failure telemetry is invalid/);
+  assert.equal(day.entries[0]!.outcome, undefined, "invalid telemetry must not settle the reservation");
+});
+
+test("ledger round trip preserves failure telemetry", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "market-precache-ledger-failure-"));
+  const path = join(directory, "ledger.json");
+  try {
+    const key = pairKey("AAPL");
+    const file: PrecacheLedgerFile = {
+      version: 1,
+      updatedAt: 1,
+      days: [{
+        date: "2026-08-07",
+        budget: 2_000_000,
+        perRunLimit: 100_000,
+        entries: [{
+          pairKey: key,
+          attempt: 1,
+          reservation: 100_000,
+          reservedAt: 1,
+          outcome: "failed",
+          actualTokens: 20_000,
+          failure: { code: "no-canvas", phase: "running", message: "No research canvas was published" },
+        }],
+      }],
+    };
+    await writeLedger(path, file);
+    assert.deepEqual((await readPrecacheLedger(path)).days[0]!.entries, file.days[0]!.entries);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("token guard trigger flag is visible through the cross-loader global bridge", () => {
+  try {
+    setTokenGuardTriggered(false);
+    assert.equal(isTokenGuardTriggered(), false);
+    setTokenGuardTriggered(true);
+    assert.equal(isTokenGuardTriggered(), true);
+  } finally {
+    setTokenGuardTriggered(false);
+  }
+});
+
+test("settled events accept explicit tokenGuard telemetry", () => {
+  const base = {
+    version: 1,
+    type: "settled",
+    jobId: "job",
+    attemptId: "attempt",
+    sequence: 1,
+    outcome: "failed",
+    error: "No research canvas was published",
+  };
+  assert.equal(isWorkerSettledEvent(base), true);
+  assert.equal(isWorkerSettledEvent({ ...base, tokenGuard: true }), true);
+  assert.equal(isWorkerSettledEvent({ ...base, tokenGuard: "yes" }), false);
 });
