@@ -2568,7 +2568,10 @@ function chartLines(
 	pointHighs: number[] = [],
 	pointLows: number[] = [],
 ): string[] {
-	const chartWidth = Math.max(18, Math.min(64, width - 12));
+	// One column per bar: if the series has fewer bars than the pane would
+	// hold, cap the width at the bar count. Sampling more columns than bars
+	// would draw each candle 2-3x side by side (the visible "repeat" bug).
+	const chartWidth = Math.max(2, Math.min(64, width - 12, points.length));
 	if (points.length < 2) return [muted("  Chart unavailable for this interval.")];
 	const sampledIndices = Array.from({ length: chartWidth }, (_, index) => Math.min(points.length - 1, Math.floor((index / (chartWidth - 1)) * (points.length - 1))));
 	const sampled = sampledIndices.map((index) => points[index]!);
@@ -5787,6 +5790,8 @@ class MarketHub {
 	private cryptoQuotes = new Map<string, Quote>();
 	private cryptoQuoteAttempted = new Set<string>();
 	private cryptoQuoteLoading = false;
+	/** Latest chart request skipped while a fetch was in flight. */
+	private cryptoQuotePending: { scope: ChartScope; symbol: string } | undefined;
 
 	constructor(
 		private readonly tui: Tui,
@@ -6217,7 +6222,13 @@ class MarketHub {
 			this.tui.requestRender();
 			return;
 		}
-		if (this.cryptoQuoteLoading) return;
+		if (this.cryptoQuoteLoading) {
+			// A fetch is in flight; remember the latest request and run it
+			// after the current one settles so rapid W/S changes never leave
+			// the newly selected symbol on a permanent "syncing chart…".
+			this.cryptoQuotePending = { scope, symbol: yahooSymbol };
+			return;
+		}
 		this.cryptoQuoteLoading = true;
 		this.cryptoQuoteAttempted.add(cacheKey);
 		try {
@@ -6228,6 +6239,11 @@ class MarketHub {
 			// quiet "no bars" note instead of an error wall.
 		} finally {
 			this.cryptoQuoteLoading = false;
+			const pending = this.cryptoQuotePending;
+			this.cryptoQuotePending = undefined;
+			if (pending && `${pending.scope}:${pending.symbol}` !== cacheKey) {
+				void this.ensureCryptoChart(pending.symbol, pending.scope);
+			}
 			this.tui.requestRender();
 		}
 	}
@@ -6859,7 +6875,10 @@ class MarketHub {
 		// references the merged sequence (unranked stays display-only).
 		const board = rows.map((entry) => entry.row);
 		const unrankedRows = pulse.unranked;
-		const windowCapacity = width >= 84 ? 8 : 6;
+		// Fill the pane vertically like MOVERS: capacity tracks available rows
+		// after the head block and the window-status line.
+		const boardReserve = board.length > Math.max(1, bodyRows - head.length - 2) ? 1 : 0;
+		const windowCapacity = Math.max(2, Math.min(board.length, bodyRows - head.length - 2 - boardReserve));
 		const window = selectionWindow(board, this.cryptoSelected, windowCapacity);
 		const boardBlock = [
 			fit(`${th.bold(th.fg("success", "HOTTEST"))}•${th.bold(th.fg("error", "COLDEST"))} · RELATIVE 24H`),
@@ -6898,7 +6917,8 @@ class MarketHub {
 			chartBlock.push(fit(`${th.bold(th.fg("accent", "PRICE CHART"))}  ${th.bold(th.fg("text", chartQuote.symbol))} ${th.bold(th.fg(direction, `${dollars(chartQuote.price, chartQuote.currency)} ${percent(chartQuote.changePercent)}`))}`));
 			chartBlock.push(fit(th.fg("dim", `  ${CHART_SCOPE_CONFIGS[this.chartScope].label} · ${chartQuote.chartScope === "day" ? `${chartQuote.interval} · PRE/REG/POST` : chartQuote.interval} · J open · K why · E watch`)));
 			if (chartQuote.points.length >= 2) {
-				for (const row of chartLines(chartQuote.points, Math.floor(width * 0.39), (text) => th.fg("success", text), (text) => th.fg("dim", text), chartQuote.chartScope === "day" ? chartQuote.previousClose : undefined, Math.max(2, Math.min(16, bodyRows - 6)), chartQuote.pointTimes, chartQuote.pointSessions, chartQuote.timezone, chartQuote.interval, (value) => dollars(value, chartQuote.currency), undefined, undefined, chartQuote.chartScope, "candles", undefined, (text) => th.fg("error", text), chartQuote.pointVolumes, deltaBase, chartQuote.pointOpens, chartQuote.pointHighs, chartQuote.pointLows)) chartBlock.push(fit(row));
+				const chartHeight = Math.max(2, Math.min(20, bodyRows - 4, chartQuote.points.length));
+				for (const row of chartLines(chartQuote.points, Math.floor(width * 0.39), (text) => th.fg("success", text), (text) => th.fg("dim", text), chartQuote.chartScope === "day" ? chartQuote.previousClose : undefined, chartHeight, chartQuote.pointTimes, chartQuote.pointSessions, chartQuote.timezone, chartQuote.interval, (value) => dollars(value, chartQuote.currency), undefined, undefined, chartQuote.chartScope, "candles", undefined, (text) => th.fg("error", text), chartQuote.pointVolumes, deltaBase, chartQuote.pointOpens, chartQuote.pointHighs, chartQuote.pointLows)) chartBlock.push(fit(row));
 			} else {
 				chartBlock.push(fit(th.fg("dim", "  No intraday bars from the delayed feed for this symbol.")));
 			}
@@ -6911,8 +6931,9 @@ class MarketHub {
 		}
 
 		if (width >= 84 && terminalRows(this.tui) >= 24) {
-			// Natural-height two-column board; the full-width strip sits right
-			// under it and composeScreen pads any remaining rows at the bottom.
+			// Natural-height two-column board: the left list fills its capacity,
+			// the right chart renders to the pane; the full-width strip sits
+			// right under them. twoColumn pads the shorter column with blanks.
 			lines.push(...twoColumn([...head, ...boardBlock], [...chartBlock, ""], width, 0));
 			lines.push(...stripBlock);
 		} else {
