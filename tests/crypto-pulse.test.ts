@@ -1,15 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  CRYPTO_INTERACTIVE_UNIVERSE,
   buildMoversStrip,
   buildUniverseScoreboard,
   deriveCryptoMood,
   fetchCryptoPulse,
-  interactiveUniverseIndex,
   isCryptoPulseUsable,
   isStablecoinListing,
   isStablecoinSymbol,
+  yahooPairForSymbol,
   type CryptoListing,
 } from "../shared/crypto-pulse.js";
 
@@ -65,7 +64,7 @@ const CMC_LISTINGS = {
       id: 1027, symbol: "ETH", name: "Ethereum", slug: "ethereum", cmc_rank: 2,
       quote: [{ symbol: "USD", price: 2427.15, volume_24h: 2e10, market_cap: 2.9e11, market_cap_dominance: 11.4, percent_change_24h: 2.9, percent_change_7d: 8.1 }],
     }),
-    // Stablecoin (tag-classified) excluded from the movers strip.
+    // Stablecoin (tag-classified) excluded from board and movers strip.
     CMC_LISTING({
       id: 825, symbol: "USDT", name: "Tether", slug: "tether", cmc_rank: 3, tags: ["stablecoin", "asset-backed-stablecoin"],
       quote: [{ symbol: "USD", price: 1.0, volume_24h: 5e10, market_cap: 1.2e11, market_cap_dominance: 4.6, percent_change_24h: 0.01, percent_change_7d: 0.0 }],
@@ -74,42 +73,42 @@ const CMC_LISTINGS = {
       id: 5426, symbol: "SOL", name: "Solana", slug: "solana", cmc_rank: 5,
       quote: [{ symbol: "USD", price: 144.8, volume_24h: 8e9, market_cap: 6.6e10, market_cap_dominance: 2.5, percent_change_24h: 7.8, percent_change_7d: 15.0 }],
     }),
-    // Non-universe mover appears in the display-only strip only.
+    // Non-top mover appears in the display-only strip only.
     CMC_LISTING({
       id: 99999, symbol: "BOGUS", name: "BogusCoin", slug: "boguscoin", cmc_rank: 40,
       quote: [{ symbol: "USD", price: 0.5, volume_24h: 1e6, market_cap: 5e6, market_cap_dominance: 0.0, percent_change_24h: -12.0, percent_change_7d: -30.0 }],
     }),
+    // Dynamic-universe fixtures: derived Yahoo pairs plus one no-chart cohort.
+    CMC_LISTING({
+      id: 52, symbol: "XRP", name: "XRP", slug: "xrp", cmc_rank: 4,
+      quote: [{ symbol: "USD", price: 0.624, volume_24h: 2e9, market_cap: 3.2e10, market_cap_dominance: 1.2, percent_change_24h: 5.94, percent_change_7d: 9.0 }],
+    }),
+    CMC_LISTING({
+      id: 1839, symbol: "BNB", name: "BNB", slug: "bnb", cmc_rank: 6,
+      quote: [{ symbol: "USD", price: 691, volume_24h: 1.5e9, market_cap: 1.0e11, market_cap_dominance: 3.8, percent_change_24h: 2.61, percent_change_7d: 5.0 }],
+    }),
+    // PEPE: Yahoo never hosts it — row must resolve to a null pair (display-only).
+    CMC_LISTING({
+      id: 24478, symbol: "PEPE", name: "Pepe", slug: "pepe", cmc_rank: 25,
+      quote: [{ symbol: "USD", price: 0.00001, volume_24h: 5e8, market_cap: 4e9, market_cap_dominance: 0.2, percent_change_24h: 18.0, percent_change_7d: 40.0 }],
+    }),
   ],
 };
 
-/**
- * quotes/latest fixture for the 14 universe assets with deterministic 24h
- * changes (verified CMC IDs; name reflects the corrected registry).
- */
-const UNIVERSE_CHANGES: ReadonlyArray<[number, string, number]> = [
-  [1, 0.02],       // BTC
-  [1027, 0.81],    // ETH
-  [5426, 2.93],    // SOL
-  [52, 5.94],      // XRP
-  [1839, 2.61],    // BNB
-  [74, 9.97],      // DOGE
-  [2010, 4.56],    // ADA
-  [5805, -0.54],   // AVAX
-  [6636, 4.42],    // DOT
-  [1975, 2.25],    // LINK
-  [28321, 25.08],  // POL
-  [2, 2.21],       // LTC
-  [7083, 7.67],    // UNI
-  [21794, 2.03],   // APT
+/** Deterministic top-100 listings for scoreboard tests (excluding stables). */
+const SCOREBOARD_LISTINGS: ReadonlyArray<[string, number, number]> = [
+  ["BTC", 1, 5.47], ["ETH", 1027, 2.9], ["SOL", 5426, 7.8], ["XRP", 52, 5.94],
+  ["BNB", 1839, 2.61], ["DOGE", 74, 9.97], ["ADA", 2010, 4.56], ["AVAX", 5805, -0.54],
+  ["DOT", 6636, 4.42], ["LINK", 1975, 2.25], ["POL", 28321, 25.08], ["LTC", 2, 2.21],
+  ["UNI", 7083, 7.67], ["APT", 21794, 2.03], ["PEPE", 24478, null],
 ];
 
-function universeQuote(cmcId: number, change24h: number | null): Record<string, unknown> {
-  const universe = interactiveUniverseIndex().get(cmcId)!;
+function boardListing(symbol: string, cmcId: number, change24h: number | null): Record<string, unknown> {
   return CMC_LISTING({
     id: cmcId,
-    symbol: universe.label,
-    name: universe.label,
-    slug: universe.label.toLowerCase(),
+    symbol,
+    name: symbol,
+    slug: symbol.toLowerCase(),
     cmc_rank: cmcId,
     quote: [{
       symbol: "USD",
@@ -122,10 +121,6 @@ function universeQuote(cmcId: number, change24h: number | null): Record<string, 
     }],
   });
 }
-
-const CMC_QUOTES = {
-  data: UNIVERSE_CHANGES.map(([cmcId, change]) => universeQuote(cmcId, change)),
-};
 
 const PANIC_RADAR_SUMMARY = {
   timestamp: "2026-08-22T14:18:42.573039+00:00",
@@ -164,7 +159,6 @@ function allProvidersMock(url: string): Response {
   if (url.includes("/global-metrics/")) return jsonResponse(CMC_GLOBAL_METRICS);
   if (url.includes("/fear-and-greed/")) return jsonResponse(CMC_FEAR_GREED);
   if (url.includes("/listings/")) return jsonResponse(CMC_LISTINGS);
-  if (url.includes("/quotes/latest")) return jsonResponse(CMC_QUOTES);
   if (url.includes("/dashboard/summary")) return jsonResponse(PANIC_RADAR_SUMMARY);
   if (url.includes("/dashboard/panic-score")) return jsonResponse(PANIC_RADAR_PANIC_SCORE);
   return new Response("not found", { status: 404 });
@@ -182,9 +176,10 @@ test("fetches a normalized crypto pulse snapshot from all providers", async () =
   assert.ok(snapshot.fearGreed);
   assert.equal(snapshot.fearGreed.value, 76);
   assert.equal(snapshot.fearGreed.label, "GREED");
-  assert.equal(snapshot.listings.length, 5);
-  assert.equal(snapshot.hot.length, 7);
-  assert.equal(snapshot.cold.length, 7);
+  assert.equal(snapshot.listings.length, 8);
+  // Ranked board = non-stable listings with finite 24h change; PEPE is ranked
+  // but resolves display-only (no Yahoo pair).
+  assert.ok(snapshot.hot.length + snapshot.cold.length >= 4);
   assert.equal(snapshot.unranked.length, 0);
   assert.ok(snapshot.movers);
   assert.equal(snapshot.movers.leaders.length, 3);
@@ -200,7 +195,7 @@ test("mood derivation merges CMC primary with PanicRadar secondary", () => {
     { totalMarketCap: 2.6e12, totalVolume24h: 1.6e11, altcoinMarketCap: 1e12, stablecoinMarketCap: 2.8e11, changeYesterdayPercent: 2.13, asOf: { provider: "cmc", fetchedAt: 1 } },
     { sentimentScore: -0.006, sentimentState: "Neutral", fearGreedIndex: 71, fearGreedLabel: "GREED", volatility24h: 4.53, volatilityState: "High", btcPrice: 77044, btcChange24h: 5.47, btcChange7d: 22.32, asOf: { provider: "panicRadar", fetchedAt: 1 } },
     { panicScore: 15.5, totalPosts: 228, bearishPosts: 25, bullishPosts: 27, avgSentiment: 0.006, sentimentLabel: "CALM", asOf: { provider: "panicRadar", fetchedAt: 1 } },
-    parseQuotes(CMC_QUOTES),
+    parseListings(CMC_LISTINGS),
     1000,
   );
 
@@ -241,7 +236,6 @@ test("provider failure isolates and degrades only its own datasets", async () =>
     if (url.includes("/global-metrics/")) return jsonResponse(CMC_GLOBAL_METRICS);
     if (url.includes("/fear-and-greed/")) return jsonResponse(CMC_FEAR_GREED);
     if (url.includes("/listings/")) return jsonResponse(CMC_LISTINGS);
-    if (url.includes("/quotes/latest")) return jsonResponse(CMC_QUOTES);
     return new Response("not found", { status: 404 });
   });
 
@@ -250,62 +244,78 @@ test("provider failure isolates and degrades only its own datasets", async () =>
   assert.equal(snapshot.panicRadarSummary, null);
   assert.equal(snapshot.panicScore, null);
   assert.ok(snapshot.fearGreed);
-  assert.equal(snapshot.listings.length, 5);
+  assert.equal(snapshot.listings.length, 8);
   assert.deepEqual(snapshot.providers, { cmc: true, panicRadar: false });
   assert.equal(errors.length, 2);
   assert.ok(errors.some((error) => error.startsWith("panicRadar.summary")));
   assert.ok(errors.some((error) => error.startsWith("panicRadar.panic-score")));
-  // Board still derives from the CMC quotes source.
-  assert.equal(snapshot.hot.length, 7);
-  assert.equal(snapshot.cold.length, 7);
+  // Board still derives from the CMC listings source.
+  assert.ok(snapshot.hot.length + snapshot.cold.length >= 4);
   assert.equal(snapshot.mood?.value, 76);
 });
 
-test("universe board ranks all 14 into relative HOTTEST/COLDEST halves", () => {
-  const { hot, cold, unranked } = buildUniverseScoreboard(parseQuotes(CMC_QUOTES));
+test("dynamic scoreboard ranks all finite-change listings into HOT/COLD halves", () => {
+  const listings = parseListings({ data: SCOREBOARD_LISTINGS.map(([symbol, cmcId, change]) => boardListing(symbol, cmcId, change)) });
+  const { hot, cold, unranked } = buildUniverseScoreboard(listings);
 
   assert.equal(hot.length, 7);
   assert.equal(cold.length, 7);
-  assert.equal(unranked.length, 0);
-  assert.deepEqual(hot.map((row) => row.symbol), ["POL", "DOGE", "UNI", "XRP", "ADA", "DOT", "SOL"]);
+  assert.equal(unranked.length, 1);
+  // Sorted descending: POL best, then DOGE, SOL, UNI, XRP, BTC, ADA.
+  assert.deepEqual(hot.map((row) => row.symbol), ["POL", "DOGE", "SOL", "UNI", "XRP", "BTC", "ADA"]);
   assert.equal(hot[0]!.change24h, 25.08);
-  // COLDEST is ascending (worst first) and can contain positive returns.
-  assert.deepEqual(cold.map((row) => row.symbol), ["AVAX", "BTC", "ETH", "APT", "LTC", "LINK", "BNB"]);
+  // COLDEST is ascending (worst first).
+  assert.deepEqual(cold.map((row) => row.symbol), ["AVAX", "APT", "LTC", "LINK", "BNB", "ETH", "DOT"]);
   assert.ok(cold[0]!.change24h <= cold.at(-1)!.change24h);
-  // Every universe asset appears exactly once across the board.
+  // Every ranked listing appears exactly once; PEPE has no finite change → unranked.
   const seen = new Set([...hot, ...cold, ...unranked].map((row) => row.cmcId));
-  assert.equal(seen.size, CRYPTO_INTERACTIVE_UNIVERSE.length);
-  for (const asset of CRYPTO_INTERACTIVE_UNIVERSE) assert.ok(seen.has(asset.cmcId), `missing ${asset.label}`);
+  assert.equal(seen.size, SCOREBOARD_LISTINGS.length);
+});
+
+test("dynamic Yahoo pair derivation: -USD convention with overrides and exclusions", () => {
+  assert.equal(yahooPairForSymbol("BTC"), "BTC-USD");
+  assert.equal(yahooPairForSymbol("btc"), "BTC-USD");
+  assert.equal(yahooPairForSymbol("POL"), "MATIC-USD"); // Polygon rebrand override
+  assert.equal(yahooPairForSymbol("PEPE"), null); // Yahoo never hosts it
+  assert.equal(yahooPairForSymbol("SUI"), null);
+  assert.equal(yahooPairForSymbol("UNI"), null);
+  assert.equal(yahooPairForSymbol("APT"), null);
 });
 
 test("a one-directional (all-positive) market still fills both columns", () => {
-  const quotes = UNIVERSE_CHANGES.map(([cmcId]) => universeQuote(cmcId, 1 + cmcId % 7));
-  const { hot, cold } = buildUniverseScoreboard(parseQuotes({ data: quotes }));
+  const listings = parseListings({
+    data: SCOREBOARD_LISTINGS.filter(([symbol, , change]) => symbol !== "PEPE")
+      .map(([symbol, cmcId]) => boardListing(symbol, cmcId, 1 + cmcId % 7)),
+  });
+  const { hot, cold } = buildUniverseScoreboard(listings);
   assert.equal(hot.length, 7);
   assert.equal(cold.length, 7);
   assert.ok(cold.every((row) => row.change24h > 0), "COLDEST is relative, not sign-based");
   assert.ok(cold[0]!.change24h <= cold.at(-1)!.change24h);
 });
 
-test("missing-change universe assets land in unranked and remain mapped", () => {
-  const quotes = [
-    ...UNIVERSE_CHANGES.slice(0, 13).map(([cmcId, change]) => universeQuote(cmcId, change)),
-    universeQuote(21794, null), // APT without a finite 24h change
-  ];
-  const { hot, cold, unranked } = buildUniverseScoreboard(parseQuotes({ data: quotes }));
+test("missing-change listings land in unranked and stay mapped", () => {
+  const listings = parseListings({
+    data: [
+      ...SCOREBOARD_LISTINGS.slice(0, 13).map(([symbol, cmcId, change]) => boardListing(symbol, cmcId, change)),
+      boardListing("PEPE", 24478, null),
+      boardListing("SUI", 20947, null),
+    ],
+  });
+  const { hot, cold, unranked } = buildUniverseScoreboard(listings);
   assert.equal(hot.length, 7);
   assert.equal(cold.length, 6);
-  assert.equal(unranked.length, 1);
-  assert.equal(unranked[0]!.symbol, "APT");
-  assert.equal(unranked[0]!.yahooSymbol, "APT-USD");
+  assert.equal(unranked.length, 2);
+  assert.equal(unranked[0]!.symbol, "PEPE");
+  assert.equal(unranked[0]!.yahooSymbol, null);
 });
 
 test("movers strip excludes stablecoins, reports breadth, and is display-only", () => {
   const strip = buildMoversStrip(parseListings(CMC_LISTINGS), 3);
   assert.ok(strip);
-  assert.deepEqual(strip.leaders.map((row) => row.symbol), ["SOL", "BTC", "ETH"]);
-  assert.deepEqual(strip.laggards.map((row) => row.symbol), ["BOGUS", "ETH", "BTC"]);
-  assert.deepEqual(strip.breadth, { advancing: 3, declining: 1, measured: 4 });
+  assert.deepEqual(strip.leaders.map((row) => row.symbol), ["PEPE", "SOL", "XRP"]);
+  assert.deepEqual(strip.laggards.map((row) => row.symbol), ["BOGUS", "BNB", "ETH"]);
+  assert.deepEqual(strip.breadth, { advancing: 6, declining: 1, measured: 7 });
   assert.ok(strip.leaders.every((row) => row.yahooSymbol === null), "strip rows are display-only");
 });
 
@@ -319,18 +329,6 @@ test("stablecoin helpers prefer the CMC tag over the symbol denylist", () => {
   assert.equal(isStablecoinListing(tagged), true);
   const untagged = parseListings(CMC_LISTINGS).find((listing) => listing.symbol === "ETH")!;
   assert.equal(isStablecoinListing(untagged), false);
-});
-
-test("registry uses the verified stable CMC IDs for every universe asset", () => {
-  const ids = CRYPTO_INTERACTIVE_UNIVERSE.map((asset) => asset.cmcId);
-  assert.equal(new Set(ids).size, ids.length, "CMC IDs must be unique");
-  const known: Record<number, string> = {
-    1: "BTC", 1027: "ETH", 5426: "SOL", 52: "XRP", 1839: "BNB", 74: "DOGE", 2010: "ADA",
-    5805: "AVAX", 6636: "DOT", 1975: "LINK", 28321: "POL", 2: "LTC", 7083: "UNI", 21794: "APT",
-  };
-  for (const asset of CRYPTO_INTERACTIVE_UNIVERSE) {
-    assert.equal(asset.label, known[asset.cmcId], `CMC id ${asset.cmcId} must be ${known[asset.cmcId]}`);
-  }
 });
 
 function parseListings(raw: { data: unknown[] }): CryptoListing[] {
@@ -357,16 +355,12 @@ function parseListings(raw: { data: unknown[] }): CryptoListing[] {
   });
 }
 
-function parseQuotes(raw: { data: unknown[] }): CryptoListing[] {
-  return parseListings(raw);
-}
-
 test("isCryptoPulseUsable rejects provider-outage snapshots", async () => {
   const { snapshot: empty, errors: emptyErrors } = await fetchCryptoPulse({
     fetchImpl: async () => new Response("down", { status: 503 }),
   });
   assert.equal(isCryptoPulseUsable(empty), false);
-  assert.equal(emptyErrors.length, 6);
+  assert.equal(emptyErrors.length, 5); // global-metrics + fear-and-greed + listings + 2x panicRadar
   assert.equal(empty.mood, null);
   assert.equal(empty.hot.length + empty.cold.length + empty.unranked.length, 0);
   assert.equal(empty.movers, null);
