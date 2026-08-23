@@ -65,6 +65,10 @@ const STABLECOIN_SYMBOLS = new Set([
  * the UI marks such rows as `DISPLAY-ONLY` instead of opening a broken
  * chart, per the design doc's "explicit open behavior" invariant.
  */
+/*   This replaces the old `${SYMBOL}-USD`-only convention, which silently
+ *   missed assets Yahoo hosts under numeric-suffix pairs (TRUMP→TRUMP35336-USD,
+ *   ZRO→ZRO26997-USD, HYPE→HYPE32196-USD, verified 2026-08-22).
+ */
 export type YahooPairResolution = string | null;
 
 /** Overrides for assets whose Yahoo pair differs from `<SYMBOL>-USD`. */
@@ -72,9 +76,9 @@ const YAHOO_SYMBOL_OVERRIDES: Readonly<Record<string, string>> = Object.freeze({
   POL: "MATIC-USD", // Polygon rebrand: Yahoo quotes Polygon as MATIC-USD; POL-USD is Proof Of Liquidity
 });
 
-/** Symbols Yahoo has never charted under -USD; rows stay display-only. */
+/** Symbols Yahoo has never charted as a crypto pair; rows stay display-only. */
 const YAHOO_SYMBOL_EXCLUSIONS = new Set([
-  "PEPE", "SUI", "UNI", "APT", // verified 2026-08-22: no bars under *-USD
+  "PEPE", "SUI", "UNI", "APT", "VVV", "PANG", "BB", "SUP", "INK", "WOL", "OQ", "ECL", // verified 2026-08-22: no pair
 ]);
 
 export function yahooPairForSymbol(symbol: string): YahooPairResolution {
@@ -82,6 +86,61 @@ export function yahooPairForSymbol(symbol: string): YahooPairResolution {
   if (!canonical) return null;
   if (YAHOO_SYMBOL_EXCLUSIONS.has(canonical)) return null;
   return YAHOO_SYMBOL_OVERRIDES[canonical] ?? `${canonical}-USD`;
+}
+
+/**
+ * Yahoo search URL for the crypto-pair lookup; quoted so the resolver can
+ * discover numeric-suffix pairs (`<SYMBOL>12345-USD`) that never match the
+ * `<SYMBOL>-USD` convention.
+ */
+export const YAHOO_SEARCH_URL = "https://query1.finance.yahoo.com/v1/finance/search";
+
+/**
+ * Resolve a CMC symbol to the Yahoo pair that actually carries bars.
+ *
+ * `<SYMBOL>-USD` covers most liquid assets; when that comes back empty the
+ * Yahoo search endpoint reveals numeric-suffix pairs (e.g. TRUMP35336-USD)
+ * or confirms the asset is never charted (returns null). The result is cached
+ * by the caller; this function is pure and does no caching of its own.
+ */
+export async function resolveYahooPair(
+  symbol: string,
+  fetchImpl: FetchLike = fetch,
+  timeoutMs = 4_000,
+  maxResponseBytes = 64 * 1024,
+): Promise<YahooPairResolution> {
+  const canonical = symbol.trim().toUpperCase();
+  const direct = yahooPairForSymbol(canonical);
+  if (!direct) return null;
+  // Probe the direct pair first.
+  try {
+    const chart = await fetchJson(
+      `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(direct)}?range=1mo&interval=1d`,
+      fetchImpl,
+      timeoutMs,
+      maxResponseBytes,
+    );
+    const bars = (chart as { chart?: { result?: Array<{ timestamp?: unknown[] }> } })?.chart?.result?.[0]?.timestamp?.length ?? 0;
+    if (bars > 0) return direct;
+  } catch {
+    // Fall through to search if the direct pair fails to parse.
+  }
+  // Search for the real crypto pair (numeric suffix or renamed ticker).
+  try {
+    const search = await fetchJson(
+      `${YAHOO_SEARCH_URL}?q=${encodeURIComponent(canonical)}&quotesCount=8&newsCount=0`,
+      fetchImpl,
+      timeoutMs,
+      maxResponseBytes,
+    );
+    const quotes = (search as { quotes?: Array<{ symbol?: unknown; quoteType?: unknown }> })?.quotes ?? [];
+    const cryptoPair = quotes.find(
+      (quote) => quote.quoteType === "CRYPTOCURRENCY" && typeof quote.symbol === "string" && /-USD$/.test(quote.symbol),
+    )?.symbol;
+    return typeof cryptoPair === "string" ? cryptoPair : null;
+  } catch {
+    return null;
+  }
 }
 
 // ── Typed datasets ──────────────────────────────────────────────────────────
