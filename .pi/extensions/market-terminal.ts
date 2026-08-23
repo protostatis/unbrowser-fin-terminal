@@ -6101,14 +6101,17 @@ class MarketHub {
 		this.status = `${MARKET_SCREEN_NAMES[this.screen]} · W/S SELECT · A/D SWITCH SCREENS`;
 	}
 
-	/** Visible interactive rows in render order (all openable; the strip is not). */
+	/**
+	 * Selectable crypto rows in render order: the ranked board (HOT half
+	 * followed by COLD half). Unranked assets are display-only and excluded
+	 * here so the selection index always maps 1:1 onto the windowed board.
+	 */
 	private cryptoRows(): Array<{ section: "hot" | "cold" | "unranked"; row: CryptoScoreboardRow }> {
 		const pulse = this.cryptoPulse;
 		if (!pulse) return [];
 		return [
 			...pulse.hot.map((row) => ({ section: "hot" as const, row })),
 			...pulse.cold.map((row) => ({ section: "cold" as const, row })),
-			...pulse.unranked.map((row) => ({ section: "unranked" as const, row })),
 		];
 	}
 
@@ -6196,8 +6199,9 @@ class MarketHub {
 		}
 		this.cryptoSelected = Math.max(0, Math.min(rows.length - 1, index));
 		const row = rows[this.cryptoSelected]!;
-		const sectionLabel = row.section === "unranked" ? "UNRANKED" : row.section === "hot" ? "HOTTEST" : "COLDEST";
-		this.status = `${sectionLabel} ${row.row.symbol}${row.section !== "unranked" ? ` ${percent(row.row.change24h)}` : " · NO QUOTE"} · J OPEN · K WHY · E WATCH`;
+		const sectionLabel = row.section === "hot" ? "HOTTEST" : "COLDEST";
+		const openHint = row.row.yahooSymbol ? "J OPEN · K WHY · E WATCH" : "DISPLAY-ONLY · NO YAHOO PAIR";
+		this.status = `${sectionLabel} ${row.row.symbol} ${percent(row.row.change24h)} · ${openHint}`;
 		void this.ensureCryptoChart(row.row.yahooSymbol);
 	}
 
@@ -6560,6 +6564,9 @@ class MarketHub {
 					this.tui.requestRender();
 					return;
 				}
+				this.status = `${row?.row.symbol ?? "ROW"} HAS NO YAHOO PAIR · DISPLAY-ONLY · W/S PICK ANOTHER`;
+				this.tui.requestRender();
+				return;
 			}
 			this.why();
 		} else if (data === "j" || data === "J" || matchesKey(data, "enter") || matchesKey(data, "space")) {
@@ -6575,6 +6582,9 @@ class MarketHub {
 					this.tui.requestRender();
 					return;
 				}
+				this.status = `${row?.row.symbol ?? "ROW"} HAS NO YAHOO PAIR · DISPLAY-ONLY · W/S PICK ANOTHER`;
+				this.tui.requestRender();
+				return;
 			}
 			if (this.screen === MARKET_SCREEN.signals && this.signalsFocus === "story") {
 				this.research(PRECACHE_MARKET_STORY_QUESTION, marketStoryIdentity("brief"));
@@ -6841,21 +6851,29 @@ class MarketHub {
 		const rowLine = (row: CryptoScoreboardRow, selected: boolean) => {
 			const glyph = selected ? th.fg("accent", "►") : th.fg("dim", "·");
 			const tone = row.change24h >= 0 ? "success" : "error";
-			return fit(`${glyph} ${row.symbol.padEnd(5)} ${row.price !== null ? dollars(row.price, "USD") : "--".padStart(8)} ${th.fg(tone, percent(row.change24h))}`);
+			const yahooTag = row.yahooSymbol ? th.fg("dim", "") : th.fg("warning", "·NO CHART");
+			return fit(`${glyph} ${row.symbol.padEnd(5)} ${row.price !== null ? dollars(row.price, "USD") : "--".padStart(8)} ${th.fg(tone, percent(row.change24h))}${yahooTag}`);
 		};
-		const hotBlock = [fit(th.bold(th.fg("success", "HOTTEST · RELATIVE 24H"))), ...(pulse.hot.length > 0
-			? pulse.hot.map((row, index) => rowLine(row, rows[index] !== undefined && this.cryptoSelected === index && rows[index]!.section === "hot"))
-			: [fit(th.fg("dim", "no ranked gainers"))])];
-		const coldBlock = [fit(th.bold(th.fg("error", "COLDEST · RELATIVE 24H"))), ...(pulse.cold.length > 0
-			? pulse.cold.map((row, index) => rowLine(row, rows[pulse.hot.length + index] !== undefined && this.cryptoSelected === pulse.hot.length + index && rows[pulse.hot.length + index]!.section === "cold"))
-			: [fit(th.fg("dim", "no ranked laggards"))])];
+		// Scrollable ranked board: HOT half (best first) then COLD half (worst
+		// first) as one windowed sequence, exactly like MOVERS. Selection index
+		// references the merged sequence (unranked stays display-only).
+		const board = rows.map((entry) => entry.row);
+		const unrankedRows = pulse.unranked;
+		const windowCapacity = width >= 84 ? 8 : 6;
+		const window = selectionWindow(board, this.cryptoSelected, windowCapacity);
+		const boardBlock = [
+			fit(`${th.bold(th.fg("success", "HOTTEST"))}•${th.bold(th.fg("error", "COLDEST"))} · RELATIVE 24H`),
+			...window.items.map((row, offset) => rowLine(row, this.cryptoSelected === window.start + offset)),
+		];
+		if (window.items.length < board.length) boardBlock.push(fit(th.fg("dim", `CRYPTO ${window.start + 1}–${window.start + window.items.length} / ${board.length} · W/S SCROLL`)));
 
-		// Display-only surfaces: UNRANKED universe assets and the TOP-20 MOVERS
-		// strip. Neither participates in W/S selection or J/K/E.
-		const stripBlock: string[] = [];
-		if (pulse.unranked.length > 0) {
-			stripBlock.push(fit(`${th.fg("dim", "UNRANKED · NO QUOTE")}  ${pulse.unranked.map((row) => row.symbol).join(" ")}`));
+		// Display-only surfaces: UNRANKED assets and the TOP-20 MOVERS strip.
+		// Neither participates in W/S selection or J/K/E.
+		const unrankedBlock: string[] = [];
+		if (unrankedRows.length > 0) {
+			unrankedBlock.push(fit(`${th.fg("dim", "UNRANKED · NO QUOTE")}  ${unrankedRows.map((row) => row.symbol).join(" ")}`));
 		}
+		const stripBlock: string[] = [];
 		if (pulse.movers) {
 			const tone = (row: CryptoScoreboardRow) => (row.change24h >= 0 ? "success" : "error");
 			const leaders = pulse.movers.leaders.map((row) => th.fg(tone(row), `▲ ${row.symbol} ${percent(row.change24h)}`)).join("  ");
@@ -6895,10 +6913,10 @@ class MarketHub {
 		if (width >= 84 && terminalRows(this.tui) >= 24) {
 			// Natural-height two-column board; the full-width strip sits right
 			// under it and composeScreen pads any remaining rows at the bottom.
-			lines.push(...twoColumn([...head, ...hotBlock], [...chartBlock, "", ...coldBlock], width, 0));
+			lines.push(...twoColumn([...head, ...boardBlock], [...chartBlock, ""], width, 0));
 			lines.push(...stripBlock);
 		} else {
-			lines.push(...stretchBlocks([head, hotBlock, coldBlock, chartBlock, stripBlock], bodyRows, "", 1));
+			lines.push(...stretchBlocks([head, boardBlock, unrankedBlock, chartBlock, stripBlock], bodyRows, "", 1));
 		}
 	}
 

@@ -25,9 +25,6 @@ const CMC_GLOBAL_METRICS_URL = `${CMC_BASE_URL}/v1/global-metrics/quotes/latest?
 const CMC_FEAR_GREED_URL = `${CMC_BASE_URL}/v3/fear-and-greed/latest`;
 const CMC_LISTINGS_URL = (limit: number) =>
   `${CMC_BASE_URL}/v3/cryptocurrency/listings/latest?start=1&limit=${limit}&convert=USD`;
-/** Stable board source: the 14 curated universe assets fetched by stable CMC ID. */
-const CMC_QUOTES_URL = (ids: readonly number[]) =>
-  `${CMC_BASE_URL}/v3/cryptocurrency/quotes/latest?id=${ids.join(",")}&convert=USD`;
 
 const PANIC_RADAR_BASE_URL = "https://panicradar.ai";
 const PANIC_RADAR_SUMMARY_URL = `${PANIC_RADAR_BASE_URL}/api/dashboard/summary`;
@@ -42,40 +39,50 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 12_000;
  */
 const DEFAULT_PANIC_RADAR_TIMEOUT_MS = 4_000;
 const MAX_RESPONSE_BYTES = 512 * 1024;
-const MAX_LISTINGS = 20;
+/**
+ * How many CMC listings the dynamic drill-down universe covers. The design
+ * doc says "display ≠ drill-down", but a static 14-asset registry chokes on
+ * every rebrand and new listing. The top-100 by market cap is fetched live,
+ * stablecoins excluded, and every row maps to a Yahoo pair via the
+ * `<SYMBOL>-USD` convention (with a small override registry for known
+ * collisions). Rows are selectable and openable like MOVERS.
+ */
+const MAX_LISTINGS = 100;
 /** Stablecoins are excluded from the HOT/COLD scoreboard. */
 const STABLECOIN_SYMBOLS = new Set([
   "USDT", "USDC", "DAI", "BUSD", "TUSD", "USDP", "PYUSD", "FDUSD", "USDE", "USDY", "RLUSD", "USDS",
 ]);
 
 /**
- * Interactive drill-down universe: the small, curated set of crypto assets that
- * can open an existing quote view (Yahoo pair + TA). Every row is selectable
- * and openable; there is no render-only membership here (the TOP-20 MOVERS
- * strip is the display-only surface).
+ * Dynamic drill-down universe: no static registry. The CMC top-100 listings
+ * ARE the universe (stablecoins excluded), so rebrands and new listings flow
+ * in automatically. Yahoo pairs are derived as `<SYMBOL>-USD`, which matches
+ * Yahoo's crypto convention for the vast majority of liquid assets; a small
+ * override registry fixes documented collisions and an exclusion set drops
+ * assets Yahoo has never hosted (verified live 2026-08-22).
  *
- * CMC IDs are the stable key (verified against the live quotes endpoint
- * 2026-08-22). POL intentionally maps to the MATIC-USD Yahoo pair: Yahoo quotes
- * Polygon as "MATIC-USD", and "POL-USD" resolves to a different token
- * (Proof Of Liquidity) — a known symbol collision.
+ * `null` returns mean "no reliable Yahoo pair — keep the row display-only";
+ * the UI marks such rows as `DISPLAY-ONLY` instead of opening a broken
+ * chart, per the design doc's "explicit open behavior" invariant.
  */
-export const CRYPTO_INTERACTIVE_UNIVERSE: ReadonlyArray<{ cmcId: number; yahooSymbol: string; label: string }> =
-  Object.freeze([
-    { cmcId: 1, yahooSymbol: "BTC-USD", label: "BTC" },       // Bitcoin
-    { cmcId: 1027, yahooSymbol: "ETH-USD", label: "ETH" },    // Ethereum
-    { cmcId: 5426, yahooSymbol: "SOL-USD", label: "SOL" },    // Solana
-    { cmcId: 52, yahooSymbol: "XRP-USD", label: "XRP" },      // XRP
-    { cmcId: 1839, yahooSymbol: "BNB-USD", label: "BNB" },    // BNB
-    { cmcId: 74, yahooSymbol: "DOGE-USD", label: "DOGE" },    // Dogecoin
-    { cmcId: 2010, yahooSymbol: "ADA-USD", label: "ADA" },    // Cardano
-    { cmcId: 5805, yahooSymbol: "AVAX-USD", label: "AVAX" },  // Avalanche
-    { cmcId: 6636, yahooSymbol: "DOT-USD", label: "DOT" },    // Polkadot
-    { cmcId: 1975, yahooSymbol: "LINK-USD", label: "LINK" },  // Chainlink
-    { cmcId: 28321, yahooSymbol: "MATIC-USD", label: "POL" }, // Polygon (prev. MATIC); Yahoo pair is MATIC-USD
-    { cmcId: 2, yahooSymbol: "LTC-USD", label: "LTC" },       // Litecoin
-    { cmcId: 7083, yahooSymbol: "UNI-USD", label: "UNI" },    // Uniswap
-    { cmcId: 21794, yahooSymbol: "APT-USD", label: "APT" },   // Aptos
-  ]);
+export type YahooPairResolution = string | null;
+
+/** Overrides for assets whose Yahoo pair differs from `<SYMBOL>-USD`. */
+const YAHOO_SYMBOL_OVERRIDES: Readonly<Record<string, string>> = Object.freeze({
+  POL: "MATIC-USD", // Polygon rebrand: Yahoo quotes Polygon as MATIC-USD; POL-USD is Proof Of Liquidity
+});
+
+/** Symbols Yahoo has never charted under -USD; rows stay display-only. */
+const YAHOO_SYMBOL_EXCLUSIONS = new Set([
+  "PEPE", "SUI", "UNI", "APT", // verified 2026-08-22: no bars under *-USD
+]);
+
+export function yahooPairForSymbol(symbol: string): YahooPairResolution {
+  const canonical = symbol.trim().toUpperCase();
+  if (!canonical) return null;
+  if (YAHOO_SYMBOL_EXCLUSIONS.has(canonical)) return null;
+  return YAHOO_SYMBOL_OVERRIDES[canonical] ?? `${canonical}-USD`;
+}
 
 // ── Typed datasets ──────────────────────────────────────────────────────────
 
@@ -389,16 +396,6 @@ function parseCmcListings(raw: unknown, fetchedAt: number, limit: number): Crypt
     .slice(0, limit);
 }
 
-/** Same item shape as listings; used for the by-ID quotes/latest board source. */
-function parseCmcQuotes(raw: unknown, fetchedAt: number): CryptoListing[] {
-  const root = asRecord(raw);
-  const data = root ? root.data : null;
-  if (!Array.isArray(data)) return [];
-  return data
-    .map((item) => parseCmcListing(item, fetchedAt))
-    .filter((listing): listing is CryptoListing => listing !== null);
-}
-
 function parsePanicRadarSummary(raw: unknown, fetchedAt: number): PanicRadarSummary | null {
   const root = asRecord(raw);
   if (!root) return null;
@@ -443,10 +440,36 @@ export function isStablecoinSymbol(symbol: string): boolean {
   return STABLECOIN_SYMBOLS.has(symbol.trim().toUpperCase());
 }
 
-export function interactiveUniverseIndex(): Map<number, { yahooSymbol: string; label: string }> {
-  const index = new Map<number, { yahooSymbol: string; label: string }>();
-  for (const asset of CRYPTO_INTERACTIVE_UNIVERSE) index.set(asset.cmcId, { yahooSymbol: asset.yahooSymbol, label: asset.label });
-  return index;
+/**
+ * Rank the dynamic top-N listings by signed 24h move into relative HOTTEST
+ * (top half) / COLDEST (bottom half, ascending). Both columns stay populated
+ * in one-directional markets; signed percentages make a positive COLDEST row
+ * legible. Stablecoins are excluded; assets without a finite 24h change land
+ * in `unranked` (still selectable).
+ */
+export function buildUniverseScoreboard(
+  listings: CryptoListing[],
+): { hot: CryptoScoreboardRow[]; cold: CryptoScoreboardRow[]; unranked: CryptoScoreboardRow[] } {
+  const toRow = (listing: CryptoListing): CryptoScoreboardRow => ({
+    cmcId: listing.cmcId,
+    symbol: listing.symbol,
+    yahooSymbol: yahooPairForSymbol(listing.symbol),
+    rank: listing.rank,
+    price: listing.price,
+    change24h: listing.change24h!,
+    volume24h: listing.volume24h,
+  });
+  const eligible = listings.filter((listing) => !isStablecoinListing(listing));
+  const ranked = eligible
+    .filter((listing) => listing.change24h !== null && Number.isFinite(listing.change24h))
+    .sort((a, b) => b.change24h! - a.change24h!);
+  const unranked = eligible
+    .filter((listing) => listing.change24h === null || !Number.isFinite(listing.change24h))
+    .map(toRow);
+  const hotCount = Math.ceil(ranked.length / 2);
+  const hot = ranked.slice(0, hotCount).map(toRow);
+  const cold = ranked.slice(hotCount).reverse().map(toRow);
+  return { hot, cold, unranked };
 }
 
 /**
@@ -505,39 +528,6 @@ export function deriveCryptoMood(
 export function isStablecoinListing(listing: CryptoListing): boolean {
   if (listing.tags.some((tag) => tag.toLowerCase() === "stablecoin")) return true;
   return isStablecoinSymbol(listing.symbol);
-}
-
-/**
- * Rank the interactive 14-asset universe by signed 24h move into relative
- * HOTTEST (top half) / COLDEST (bottom half, ascending). Both columns stay
- * populated in one-directional markets; signed percentages make a positive
- * COLDEST row legible. Assets without a finite 24h change land in `unranked`
- * (still selectable/openable, never falsely classified).
- */
-export function buildUniverseScoreboard(
-  quotes: CryptoListing[],
-): { hot: CryptoScoreboardRow[]; cold: CryptoScoreboardRow[]; unranked: CryptoScoreboardRow[] } {
-  const universe = interactiveUniverseIndex();
-  const toRow = (listing: CryptoListing): CryptoScoreboardRow => ({
-    cmcId: listing.cmcId,
-    symbol: universe.get(listing.cmcId)?.label ?? listing.symbol,
-    yahooSymbol: universe.get(listing.cmcId)?.yahooSymbol ?? null,
-    rank: listing.rank,
-    price: listing.price,
-    change24h: listing.change24h!,
-    volume24h: listing.volume24h,
-  });
-  const universeQuotes = quotes.filter((listing) => universe.has(listing.cmcId));
-  const ranked = universeQuotes
-    .filter((listing) => listing.change24h !== null && Number.isFinite(listing.change24h))
-    .sort((a, b) => b.change24h! - a.change24h!);
-  const unranked = universeQuotes
-    .filter((listing) => listing.change24h === null || !Number.isFinite(listing.change24h))
-    .map(toRow);
-  const hotCount = Math.ceil(ranked.length / 2);
-  const hot = ranked.slice(0, hotCount).map(toRow);
-  const cold = ranked.slice(hotCount).reverse().map(toRow);
-  return { hot, cold, unranked };
 }
 
 /**
@@ -626,16 +616,6 @@ export async function fetchCryptoPulse(
       const raw = await fetchJson(CMC_LISTINGS_URL(MAX_LISTINGS), fetchImpl, requestTimeoutMs, maxResponseBytes, signal);
       return parseCmcListings(raw, fetchedAt, MAX_LISTINGS);
     }),
-    guard("cmc.quotes", async () => {
-      const raw = await fetchJson(
-        CMC_QUOTES_URL(CRYPTO_INTERACTIVE_UNIVERSE.map((asset) => asset.cmcId)),
-        fetchImpl,
-        requestTimeoutMs,
-        maxResponseBytes,
-        signal,
-      );
-      return parseCmcQuotes(raw, fetchedAt);
-    }),
   ]);
 
   const panicTask = panicRadarEnabled
@@ -651,22 +631,21 @@ export async function fetchCryptoPulse(
       ])
     : Promise.resolve([null, null] as const);
 
-  const [[globalMetrics, fearGreed, listings, quotes], [panicRadarSummary, panicScore]] = await Promise.all([
+  const [[globalMetrics, fearGreed, listings], [panicRadarSummary, panicScore]] = await Promise.all([
     cmcTask,
     panicTask,
   ]);
 
   const parsedListings = listings ?? [];
-  const parsedQuotes = quotes ?? [];
-  const mood = deriveCryptoMood(fearGreed, globalMetrics, panicRadarSummary, panicScore, parsedQuotes, fetchedAt);
-  const { hot, cold, unranked } = buildUniverseScoreboard(parsedQuotes);
+  const mood = deriveCryptoMood(fearGreed, globalMetrics, panicRadarSummary, panicScore, parsedListings, fetchedAt);
+  const { hot, cold, unranked } = buildUniverseScoreboard(parsedListings);
   const movers = buildMoversStrip(parsedListings, 3);
 
   return {
     snapshot: {
       fetchedAt,
       providers: {
-        cmc: Boolean(globalMetrics || fearGreed || parsedListings.length > 0 || parsedQuotes.length > 0),
+        cmc: Boolean(globalMetrics || fearGreed || parsedListings.length > 0),
         panicRadar: Boolean(panicRadarSummary || panicScore),
       },
       globalMetrics,
