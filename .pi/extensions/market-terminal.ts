@@ -22,6 +22,7 @@ import {
 	CryptoPulseCache,
 	fetchCryptoPulse,
 	isCryptoPulseUsable,
+	resolveYahooPair,
 	type CryptoPulseSnapshot,
 	type CryptoScoreboardRow,
 	type FetchLike,
@@ -5792,6 +5793,8 @@ class MarketHub {
 	private cryptoQuoteLoading = false;
 	/** Latest chart request skipped while a fetch was in flight. */
 	private cryptoQuotePending: { scope: ChartScope; symbol: string } | undefined;
+	/** Symbols whose Yahoo quote resolved but carries no chartable series. */
+	private cryptoNoChart = new Set<string>();
 
 	constructor(
 		private readonly tui: Tui,
@@ -6167,7 +6170,7 @@ class MarketHub {
 			this.cryptoPulseState = usable || this.cryptoPulse ? "ready" : "error";
 			this.cryptoPulseError = errors.length > 0 ? errors.join(" · ") : undefined;
 			const row = this.cryptoRows()[this.cryptoSelected];
-			void this.ensureCryptoChart(row?.row.yahooSymbol);
+			void this.ensureCryptoChart(row?.row.symbol);
 			const partial = usable && errors.length > 0;
 			const retainedPrior = !usable && Boolean(this.cryptoPulse);
 			this.status = this.cryptoPulseState === "error"
@@ -6205,19 +6208,37 @@ class MarketHub {
 		this.cryptoSelected = Math.max(0, Math.min(rows.length - 1, index));
 		const row = rows[this.cryptoSelected]!;
 		const sectionLabel = row.section === "hot" ? "HOTTEST" : "COLDEST";
-		const openHint = row.row.yahooSymbol ? "J OPEN · K WHY · E WATCH" : "DISPLAY-ONLY · NO YAHOO PAIR";
+		const noChart = !row.row.yahooSymbol || this.cryptoNoChart.has(row.row.symbol);
+		const openHint = noChart ? "DISPLAY-ONLY · NO YAHOO SERIES" : "J OPEN · K WHY · E WATCH";
 		this.status = `${sectionLabel} ${row.row.symbol} ${percent(row.row.change24h)} · ${openHint}`;
-		void this.ensureCryptoChart(row.row.yahooSymbol);
+		void this.ensureCryptoChart(row.row.symbol);
 	}
+
+	/**
+	 * Resolved Yahoo pair per CMC symbol (numeric-suffix pairs like
+	 * TRUMP35336-USD are discovered lazily via the search endpoint).
+	 */
+	private cryptoResolvedPair = new Map<string, string>();
+	private cryptoPairResolved = new Set<string>();
 
 	/**
 	 * Load the candle chart quote for the selected crypto row on demand.
 	 * Independent of the CMC scoreboard: pulls Yahoo bars for the ACTIVE chart
 	 * scope so the right-pane chart follows the 1–5 scope selector.
+	 *
+	 * The CMC symbol is resolved to a real Yahoo pair first (the `<SYMBOL>-USD`
+	 * convention misses numeric-suffix assets), then the quote is fetched.
 	 */
-	private async ensureCryptoChart(yahooSymbol: string | null | undefined, scope: ChartScope = this.chartScope): Promise<void> {
-		if (!yahooSymbol) return;
-		const cacheKey = `${scope}:${yahooSymbol}`;
+	private async ensureCryptoChart(cmcSymbol: string | null | undefined, scope: ChartScope = this.chartScope): Promise<void> {
+		if (!cmcSymbol) return;
+		const resolved = await this.resolveCryptoPair(cmcSymbol);
+		if (!resolved) {
+			this.cryptoNoChart.add(cmcSymbol);
+			this.cryptoQuoteAttempted.add(`${scope}:${cmcSymbol}`);
+			this.tui.requestRender();
+			return;
+		}
+		const cacheKey = `${scope}:${resolved}`;
 		if (this.cryptoQuotes.has(cacheKey) || this.cryptoQuoteAttempted.has(cacheKey)) {
 			this.tui.requestRender();
 			return;
@@ -6226,14 +6247,16 @@ class MarketHub {
 			// A fetch is in flight; remember the latest request and run it
 			// after the current one settles so rapid W/S changes never leave
 			// the newly selected symbol on a permanent "syncing chart…".
-			this.cryptoQuotePending = { scope, symbol: yahooSymbol };
+			this.cryptoQuotePending = { scope, symbol: cmcSymbol };
 			return;
 		}
 		this.cryptoQuoteLoading = true;
 		this.cryptoQuoteAttempted.add(cacheKey);
 		try {
-			const quote = await fetchQuote(yahooSymbol, scope);
+			const quote = await fetchQuote(resolved, scope);
 			this.cryptoQuotes.set(cacheKey, quote);
+			if (quote.points.length < 2) this.cryptoNoChart.add(cmcSymbol);
+			else this.cryptoNoChart.delete(cmcSymbol);
 		} catch {
 			// Chart stays unavailable for this symbol; the right pane shows a
 			// quiet "no bars" note instead of an error wall.
@@ -6241,11 +6264,26 @@ class MarketHub {
 			this.cryptoQuoteLoading = false;
 			const pending = this.cryptoQuotePending;
 			this.cryptoQuotePending = undefined;
-			if (pending && `${pending.scope}:${pending.symbol}` !== cacheKey) {
+			if (pending && `${pending.scope}:${pending.symbol}` !== `${scope}:${cmcSymbol}`) {
 				void this.ensureCryptoChart(pending.symbol, pending.scope);
 			}
 			this.tui.requestRender();
 		}
+	}
+
+	/**
+	 * Resolve a CMC symbol to its chartable Yahoo pair, with an in-memory
+	 * cache. Probe order: cached verdict → `<SYMBOL>-USD` probe → Yahoo search
+	 * (numeric suffix discovery) → null (no chart).
+	 */
+	private async resolveCryptoPair(cmcSymbol: string): Promise<string | null> {
+		const cached = this.cryptoResolvedPair.get(cmcSymbol);
+		if (cached !== undefined) return cached;
+		if (this.cryptoPairResolved.has(cmcSymbol)) return this.cryptoResolvedPair.get(cmcSymbol) ?? null;
+		this.cryptoPairResolved.add(cmcSymbol);
+		const resolved = await resolveYahooPair(cmcSymbol);
+		if (resolved) this.cryptoResolvedPair.set(cmcSymbol, resolved);
+		return resolved;
 	}
 
 	private snapshotStatus(): string {
@@ -6279,7 +6317,7 @@ class MarketHub {
 		this.status = `CHART SCOPE · ${CHART_SCOPE_CONFIGS[scope].label}`;
 		if (this.screen === MARKET_SCREEN.market && this.marketView === "crypto") {
 			const row = this.cryptoRows()[this.cryptoSelected];
-			void this.ensureCryptoChart(row?.row.yahooSymbol, scope);
+			void this.ensureCryptoChart(row?.row.symbol, scope);
 		}
 		void this.refresh();
 	}
@@ -6481,7 +6519,7 @@ class MarketHub {
 			if (this.marketView === "crypto") {
 				void this.loadCryptoPulse();
 				const row = this.cryptoRows()[this.cryptoSelected];
-				void this.ensureCryptoChart(row?.row.yahooSymbol);
+				void this.ensureCryptoChart(row?.row.symbol);
 			}
 			this.tui.requestRender();
 			return;
@@ -6568,19 +6606,20 @@ class MarketHub {
 		} else if (data === "k" || data === "K") {
 			if (this.screen === MARKET_SCREEN.market && this.marketView === "crypto") {
 				const row = this.cryptoRows()[this.cryptoSelected];
-				if (row?.row.yahooSymbol) {
+				const symbol = row?.row ? this.cryptoResolvedPair.get(row.row.symbol) ?? row.row.yahooSymbol : null;
+				if (symbol) {
 					this.requestResearch({
 						action: "research",
-						symbol: row.row.yahooSymbol,
-						question: tickerWhyQuestion(row.row.yahooSymbol),
+						symbol,
+						question: tickerWhyQuestion(symbol),
 						returnTo: "quote",
 						chartScope: this.chartScope,
-						...tickerResearchIdentity(row.row.yahooSymbol, "why"),
+						...tickerResearchIdentity(symbol, "why"),
 					});
 					this.tui.requestRender();
 					return;
 				}
-				this.status = `${row?.row.symbol ?? "ROW"} HAS NO YAHOO PAIR · DISPLAY-ONLY · W/S PICK ANOTHER`;
+				this.status = `${row?.row.symbol ?? "ROW"} HAS NO YAHOO SERIES · DISPLAY-ONLY · W/S PICK ANOTHER`;
 				this.tui.requestRender();
 				return;
 			}
@@ -6588,17 +6627,18 @@ class MarketHub {
 		} else if (data === "j" || data === "J" || matchesKey(data, "enter") || matchesKey(data, "space")) {
 			if (this.screen === MARKET_SCREEN.market && this.marketView === "crypto") {
 				const row = this.cryptoRows()[this.cryptoSelected];
-				if (row?.row.yahooSymbol) {
+				const symbol = row?.row ? this.cryptoResolvedPair.get(row.row.symbol) ?? row.row.yahooSymbol : null;
+				if (symbol) {
 					this.done({
 						action: "quote",
-						symbol: row.row.yahooSymbol,
+						symbol,
 						returnState: this.navigationState(),
 						chartScope: this.chartScope,
 					});
 					this.tui.requestRender();
 					return;
 				}
-				this.status = `${row?.row.symbol ?? "ROW"} HAS NO YAHOO PAIR · DISPLAY-ONLY · W/S PICK ANOTHER`;
+				this.status = `${row?.row.symbol ?? "ROW"} HAS NO YAHOO SERIES · DISPLAY-ONLY · W/S PICK ANOTHER`;
 				this.tui.requestRender();
 				return;
 			}
@@ -6627,7 +6667,7 @@ class MarketHub {
 		} else if (data === "e" || data === "E") {
 			if (this.screen === MARKET_SCREEN.market && this.marketView === "crypto") {
 				const row = this.cryptoRows()[this.cryptoSelected];
-				const sym = row?.row.yahooSymbol;
+				const sym = row?.row ? this.cryptoResolvedPair.get(row.row.symbol) ?? row.row.yahooSymbol : null;
 				if (sym) {
 					const idx = this.viewWatchlist.indexOf(sym);
 					if (idx >= 0) {
@@ -6867,7 +6907,8 @@ class MarketHub {
 		const rowLine = (row: CryptoScoreboardRow, selected: boolean) => {
 			const glyph = selected ? th.fg("accent", "►") : th.fg("dim", "·");
 			const tone = row.change24h >= 0 ? "success" : "error";
-			const yahooTag = row.yahooSymbol ? th.fg("dim", "") : th.fg("warning", "·NO CHART");
+			const noChart = this.cryptoNoChart.has(row.symbol) || !row.yahooSymbol;
+			const yahooTag = noChart ? th.fg("warning", "·NO CHART") : "";
 			return fit(`${glyph} ${row.symbol.padEnd(5)} ${row.price !== null ? dollars(row.price, "USD") : "--".padStart(8)} ${th.fg(tone, percent(row.change24h))}${yahooTag}`);
 		};
 		// Scrollable ranked board: HOT half (best first) then COLD half (worst
@@ -6905,25 +6946,37 @@ class MarketHub {
 		// layout animated when the selection changes.
 		const chartBlock: string[] = [];
 		const selectedRow = rows[this.cryptoSelected]?.row;
-		const chartSymbol = selectedRow?.yahooSymbol ?? null;
-		const chartQuote = chartSymbol ? this.cryptoQuotes.get(`${this.chartScope}:${chartSymbol}`) : undefined;
-		if (chartSymbol && !chartQuote) {
+		const selectedCmcSymbol = selectedRow?.symbol ?? null;
+		// The chartable pair may be a numeric-suffix discovery (TRUMP35336-USD);
+		// prefer the resolved pair, fall back to the scoreboard's derivation.
+		const resolvedPair = selectedCmcSymbol ? (this.cryptoResolvedPair.get(selectedCmcSymbol) ?? selectedRow?.yahooSymbol ?? null) : null;
+		const chartQuote = resolvedPair ? this.cryptoQuotes.get(`${this.chartScope}:${resolvedPair}`) : undefined;
+		if (selectedCmcSymbol && !resolvedPair) {
 			chartBlock.push(fit(th.bold(th.fg("accent", "PRICE CHART"))));
-			chartBlock.push(fit(th.fg("dim", `  ${chartSymbol} · syncing chart…`)));
+			chartBlock.push(fit(th.fg("dim", `  ${selectedCmcSymbol} · no chartable Yahoo pair`)));
+			chartBlock.push(fit(th.fg("dim", "  J open · K why · E watch")));
+		} else if (selectedCmcSymbol && !chartQuote && !this.cryptoNoChart.has(selectedCmcSymbol)) {
+			chartBlock.push(fit(th.bold(th.fg("accent", "PRICE CHART"))));
+			chartBlock.push(fit(th.fg("dim", `  ${resolvedPair} · syncing chart…`)));
 			chartBlock.push(fit(th.fg("dim", "  J opens the full ticker · K why · E watch")));
 		} else if (chartQuote) {
-			const direction = (chartQuote.change ?? 0) >= 0 ? "success" : "error";
-			const deltaBase = chartQuote.chartScope === "day" ? chartQuote.previousClose ?? null : chartQuote.points[0] ?? null;
-			chartBlock.push(fit(`${th.bold(th.fg("accent", "PRICE CHART"))}  ${th.bold(th.fg("text", chartQuote.symbol))} ${th.bold(th.fg(direction, `${dollars(chartQuote.price, chartQuote.currency)} ${percent(chartQuote.changePercent)}`))}`));
-			chartBlock.push(fit(th.fg("dim", `  ${CHART_SCOPE_CONFIGS[this.chartScope].label} · ${chartQuote.chartScope === "day" ? `${chartQuote.interval} · PRE/REG/POST` : chartQuote.interval} · J open · K why · E watch`)));
-			if (chartQuote.points.length >= 2) {
+			if (chartQuote.points.length < 2) {
+				// Yahoo resolved the pair but returned no bars: this asset has
+				// no chartable series. Show the honest pane instead of a fake
+				// $0.00 chart; the board marks the row ·NO CHART.
+				chartBlock.push(fit(th.bold(th.fg("accent", "PRICE CHART"))));
+				chartBlock.push(fit(th.fg("dim", `  ${selectedCmcSymbol} · no chartable Yahoo series`)));
+				chartBlock.push(fit(th.fg("dim", "  J open · K why · E watch")));
+			} else {
+				const direction = (chartQuote.change ?? 0) >= 0 ? "success" : "error";
+				const deltaBase = chartQuote.chartScope === "day" ? chartQuote.previousClose ?? null : chartQuote.points[0] ?? null;
+				chartBlock.push(fit(`${th.bold(th.fg("accent", "PRICE CHART"))}  ${th.bold(th.fg("text", chartQuote.symbol))} ${th.bold(th.fg(direction, `${dollars(chartQuote.price, chartQuote.currency)} ${percent(chartQuote.changePercent)}`))}`));
+				chartBlock.push(fit(th.fg("dim", `  ${CHART_SCOPE_CONFIGS[this.chartScope].label} · ${chartQuote.chartScope === "day" ? `${chartQuote.interval} · PRE/REG/POST` : chartQuote.interval} · J open · K why · E watch`)));
 				const chartHeight = Math.max(2, Math.min(20, bodyRows - 4, chartQuote.points.length));
 				for (const row of chartLines(chartQuote.points, Math.floor(width * 0.39), (text) => th.fg("success", text), (text) => th.fg("dim", text), chartQuote.chartScope === "day" ? chartQuote.previousClose : undefined, chartHeight, chartQuote.pointTimes, chartQuote.pointSessions, chartQuote.timezone, chartQuote.interval, (value) => dollars(value, chartQuote.currency), undefined, undefined, chartQuote.chartScope, "candles", undefined, (text) => th.fg("error", text), chartQuote.pointVolumes, deltaBase, chartQuote.pointOpens, chartQuote.pointHighs, chartQuote.pointLows)) chartBlock.push(fit(row));
-			} else {
-				chartBlock.push(fit(th.fg("dim", "  No intraday bars from the delayed feed for this symbol.")));
-			}
-			if (chartQuote.dayLow !== null || chartQuote.dayHigh !== null || chartQuote.volume !== null) {
-				chartBlock.push(fit(th.fg("dim", `  Range ${dollars(chartQuote.dayLow, chartQuote.currency)} – ${dollars(chartQuote.dayHigh, chartQuote.currency)} · Vol ${compactNumber(chartQuote.volume)}`)));
+				if (chartQuote.dayLow !== null || chartQuote.dayHigh !== null || chartQuote.volume !== null) {
+					chartBlock.push(fit(th.fg("dim", `  Range ${dollars(chartQuote.dayLow, chartQuote.currency)} – ${dollars(chartQuote.dayHigh, chartQuote.currency)} · Vol ${compactNumber(chartQuote.volume)}`)));
+				}
 			}
 		} else {
 			chartBlock.push(fit(th.bold(th.fg("accent", "PRICE CHART"))));
@@ -7374,12 +7427,12 @@ class MarketHub {
 			cryptoPulse: this.screen === MARKET_SCREEN.market ? {
 				state: this.cryptoPulseState,
 				selectedIndex: this.cryptoSelected,
-				selectedSymbol: this.cryptoRows()[this.cryptoSelected]?.row.yahooSymbol ?? null,
+				selectedSymbol: this.cryptoResolvedPair.get(this.cryptoRows()[this.cryptoSelected]?.row.symbol ?? "") ?? this.cryptoRows()[this.cryptoSelected]?.row.yahooSymbol ?? null,
 				moodValue: this.cryptoPulse?.mood?.value ?? null,
 				moodLabel: this.cryptoPulse?.mood?.label ?? null,
 				panicScore: this.cryptoPulse?.mood?.panicScore ?? null,
-				hot: (this.cryptoPulse?.hot ?? []).map((row) => ({ symbol: row.symbol, yahooSymbol: row.yahooSymbol, change24h: row.change24h })),
-				cold: (this.cryptoPulse?.cold ?? []).map((row) => ({ symbol: row.symbol, yahooSymbol: row.yahooSymbol, change24h: row.change24h })),
+				hot: (this.cryptoPulse?.hot ?? []).map((row) => ({ symbol: row.symbol, yahooSymbol: this.cryptoResolvedPair.get(row.symbol) ?? row.yahooSymbol, change24h: row.change24h })),
+				cold: (this.cryptoPulse?.cold ?? []).map((row) => ({ symbol: row.symbol, yahooSymbol: this.cryptoResolvedPair.get(row.symbol) ?? row.yahooSymbol, change24h: row.change24h })),
 				unranked: (this.cryptoPulse?.unranked ?? []).map((row) => row.symbol),
 				movers: this.cryptoPulse?.movers ? {
 					leaders: this.cryptoPulse.movers.leaders.map((row) => row.symbol),
