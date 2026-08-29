@@ -720,7 +720,18 @@ function PublicLiveRoot() {
   )} />;
 }
 
-const RootApp = REPLAY_DEMO ? ReplayApp : PUBLIC_LIVE_DEMO ? PublicLiveRoot : App;
+const BROWSER_ALPHA = (import.meta as unknown as { env: Record<string, string | undefined> }).env.VITE_SESSION_MODE === "browser";
+
+function BrowserAlphaLazy() {
+  const [Comp, setComp] = useState<React.ComponentType | null>(null);
+  useEffect(() => {
+    void import("./harness/browser-alpha.js").then((m) => setComp(() => m.BrowserAlphaApp as unknown as React.ComponentType));
+  }, []);
+  if (!Comp) return <div style={{ padding: 24, fontFamily: "system-ui" }}>Loading browser session…</div>;
+  return <Comp />;
+}
+
+const RootApp: React.ComponentType = REPLAY_DEMO ? ReplayApp : PUBLIC_LIVE_DEMO ? PublicLiveRoot : BROWSER_ALPHA ? BrowserAlphaLazy : App;
 
 createRoot(rootEl).render(
   <StrictMode>

@@ -21,3 +21,5 @@ venv/
 node_modules/
 dist-web/
 dist-server/
+dist-browser-session/
+test-results/

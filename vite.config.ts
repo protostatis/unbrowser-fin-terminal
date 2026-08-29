@@ -1,10 +1,12 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import { fileURLToPath, URL } from "node:url";
 
 // Dev: the React app proxies /api and /ws to the Node backend (server/index.ts).
 const backendPort = Number(process.env.MARKET_SERVER_PORT ?? process.env.PORT ?? 8787);
 const backendHttp = `http://127.0.0.1:${backendPort}`;
 const backendWs = `ws://127.0.0.1:${backendPort}`;
+const yahooHttp = "https://query1.finance.yahoo.com";
 const publicBasePath = process.env.PUBLIC_BASE_PATH?.trim() || "/";
 if (!/^\/(?:[A-Za-z0-9._~-]+\/)*$/.test(publicBasePath)) {
   throw new Error("PUBLIC_BASE_PATH must start and end with / and contain URL-safe path segments");
@@ -29,6 +31,16 @@ const baseProxyPath = publicBasePath === "/" ? "" : publicBasePath.replace(/\/$/
 const proxy = {
   "/api": { target: backendHttp, changeOrigin: true },
   "/ws": { target: backendWs, ws: true, changeOrigin: true },
+  // Yahoo rejects browser-like requests from this environment with HTTP 429
+  // and does not expose a stable CORS contract. Keep the browser alpha's dev
+  // path same-origin, while leaving production deployments responsible for
+  // supplying an explicit quote transport.
+  "/yahoo": {
+    target: yahooHttp,
+    changeOrigin: true,
+    headers: { "user-agent": "signal-terminal-mvp/0.1" },
+    rewrite: (requestPath: string) => requestPath.replace(/^\/yahoo/, ""),
+  },
   ...(baseProxyPath ? {
     [`${baseProxyPath}/api`]: {
       target: backendHttp,
@@ -59,9 +71,35 @@ export default defineConfig({
       },
     },
   ],
+  resolve: {
+    alias: [
+      { find: "node:crypto", replacement: fileURLToPath(new URL("./web/src/harness/browser-shims.ts", import.meta.url)) },
+      { find: "node:fs/promises", replacement: fileURLToPath(new URL("./web/src/harness/node-fs-stub.ts", import.meta.url)) },
+      { find: "node:fs", replacement: fileURLToPath(new URL("./web/src/harness/node-fs-stub.ts", import.meta.url)) },
+      { find: "node:path", replacement: fileURLToPath(new URL("./web/src/harness/node-path-shim.ts", import.meta.url)) },
+      { find: "node:child_process", replacement: fileURLToPath(new URL("./web/src/harness/node-child-process-stub.ts", import.meta.url)) },
+      { find: "node:url", replacement: fileURLToPath(new URL("./web/src/harness/node-url-shim.ts", import.meta.url)) },
+      { find: "@earendil-works/pi-tui", replacement: fileURLToPath(new URL("./web/src/vendor/pi-tui-utils.ts", import.meta.url)) },
+      { find: "@earendil-works/pi-ai", replacement: fileURLToPath(new URL("./web/src/vendor/pi-ai-shim.ts", import.meta.url)) },
+      { find: "@earendil-works/pi-coding-agent", replacement: fileURLToPath(new URL("./web/src/vendor/pi-coding-agent-shim.ts", import.meta.url)) },
+    ],
+  },
+  define: {
+    process: "globalThis.__browserProcess",
+    Buffer: "globalThis.__browserBuffer",
+  },
+  // The isolated research worker imports shared chunks. Vite's default IIFE
+  // worker format cannot represent that code-split graph. The shared hash
+  // adapter also uses a dynamic node:crypto import, so keep the browser graph
+  // in ESNext rather than asking esbuild to lower top-level await.
+  worker: { format: "es" },
   server: {
     port: 5173,
     proxy,
   },
-  build: { outDir: "../dist-web", emptyOutDir: true },
+  build: {
+    outDir: "../dist-web",
+    emptyOutDir: true,
+    target: "esnext",
+  },
 });

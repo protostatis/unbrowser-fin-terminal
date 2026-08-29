@@ -24,6 +24,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import {
   isWorkerEvent,
+  isValidResearchRequest,
   makeCancelMessage,
   makeRunMessage,
   type ResearchRequestContext,
@@ -259,8 +260,14 @@ export class ResearchWorkerCoordinator {
     this.permitPollIntervalMs = positiveTimeout(options.permitPollIntervalMs, 30_000);
     this.onEvent = options.onEvent;
     this.onError = options.onError;
-    this._setTimeout = options.setTimeout ?? globalThis.setTimeout;
-    this._clearTimeout = options.clearTimeout ?? globalThis.clearTimeout;
+    // Keep the native timer receiver intact when this coordinator is bundled
+    // into a browser session. Chromium treats some Window timer methods as
+    // Web-IDL operations and can throw "Illegal invocation" when they are
+    // called through an arbitrary object (`this._setTimeout(...)`). The Node
+    // path is behaviorally identical; the explicit bind only preserves the
+    // browser host's global receiver.
+    this._setTimeout = options.setTimeout ?? globalThis.setTimeout.bind(globalThis);
+    this._clearTimeout = options.clearTimeout ?? globalThis.clearTimeout.bind(globalThis);
   }
 
   // ── Public API ──────────────────────────────────────────────────────────
@@ -280,6 +287,9 @@ export class ResearchWorkerCoordinator {
    */
   enqueue(jobId: string, request: ResearchRequestContext): EnqueueResult {
     if (this._disposed) return { accepted: false, status: "rejected", reason: "disposed" };
+    if (!isValidResearchRequest(request)) {
+      return { accepted: false, status: "rejected", reason: "invalid-research-request" };
+    }
 
     // Deduplicate by jobId.
     if (this.activeJobIds.has(jobId)) {
@@ -470,7 +480,15 @@ export class ResearchWorkerCoordinator {
 
     let worker: WorkerHandle;
     try {
-      worker = this.workerFactory({ MARKET_RESEARCH_WORKER: "1" });
+      const workerEnv: Record<string, string> = { MARKET_RESEARCH_WORKER: "1" };
+      if (request.modelProvider === "openrouter" && request.modelId) {
+        // Scout jobs may use a free, request-scoped model without changing the
+        // process-global model used by interactive and pre-cache research.
+        workerEnv.MARKET_MODEL_PROVIDER = "openrouter";
+        workerEnv.MARKET_MODEL_ID = request.modelId;
+        workerEnv.OPENROUTER_MODEL = request.modelId;
+      }
+      worker = this.workerFactory(workerEnv);
     } catch (err) {
       // The caller (dispatchWithPermit) returns a held permit on `false`.
       this.emitError(

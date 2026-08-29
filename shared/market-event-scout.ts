@@ -1,11 +1,11 @@
 /**
- * Deterministic market-event scout with a no-dispatch trigger dry run.
+ * Deterministic market-event scout with a guarded trigger dispatch outbox.
  *
  * Public RSS/Atom feeds are acquired through Unbrowser, parsed with bounded
  * helpers, associated to a tracked security or market lane, and persisted for
  * inspection. It also records bounded "would trigger" evidence under a fixed
- * simulation policy. This module never dispatches model research or reserves
- * tokens.
+ * simulation policy. Real dispatch is opt-in through an injected adapter and
+ * remains disabled unless the caller explicitly supplies one.
  */
 
 import { createHash } from "node:crypto";
@@ -18,6 +18,9 @@ export type MarketEventFamily = "halt" | "corporate-action" | "filing" | "macro"
 export type MarketEventClass = MarketEventFamily | "other";
 export type MarketEventDisposition = "admit-shadow" | "watch" | "suppress";
 export type MarketEventAssociation = "structured-symbol" | "explicit-symbol" | "market-wide" | "unresolved";
+
+/** The only model permitted for authenticated market-event scout dispatch. */
+export const MARKET_SCOUT_MODEL_ID = "nvidia/nemotron-3.5-lightning:free";
 
 export interface MarketEventSource {
   id: string;
@@ -115,6 +118,52 @@ export interface MarketEventTriggerCandidate {
   policy: MarketEventTriggerPolicy;
 }
 
+export type MarketEventTriggerDispatchStatus = "pending" | "reserved" | "enqueued" | "settled" | "failed";
+
+export interface MarketEventTriggerDispatchRecord {
+  candidateId: string;
+  status: MarketEventTriggerDispatchStatus;
+  attempt: number;
+  createdAt: number;
+  updatedAt: number;
+  modelId: string;
+  /** One entry per adapter attempt; this makes the daily cap restart-safe. */
+  dispatchDays?: string[];
+  /** Legacy v3 field retained for reading journals written before attempt history. */
+  dispatchDay?: string;
+  jobId?: string;
+  error?: string;
+}
+
+export interface MarketEventTriggerDispatchPolicy {
+  /** Maximum number of model jobs accepted from one scout poll. */
+  perRunCap: number;
+  /** Maximum number of dispatch attempts per UTC day. */
+  dailyCap: number;
+}
+
+export const DEFAULT_MARKET_EVENT_TRIGGER_DISPATCH_POLICY: Readonly<MarketEventTriggerDispatchPolicy> = Object.freeze({
+  perRunCap: 1,
+  dailyCap: 4,
+});
+
+export interface MarketEventTriggerDispatcher {
+  modelId: string;
+  policy?: MarketEventTriggerDispatchPolicy;
+  dispatch(candidate: MarketEventTriggerCandidate): Promise<{
+    accepted: boolean;
+    jobId?: string;
+    error?: string;
+    /** Keep the candidate pending when the parent queue is temporarily busy. */
+    retryable?: boolean;
+  }> | {
+    accepted: boolean;
+    jobId?: string;
+    error?: string;
+    retryable?: boolean;
+  };
+}
+
 export interface MarketEventTriggerAggregate {
   evaluated: number;
   mapped: number;
@@ -179,13 +228,15 @@ export interface MarketEventScoutSourceState {
 }
 
 export interface MarketEventScoutState {
-  version: 2;
+  version: 3;
   updatedAt: number;
   sources: MarketEventScoutSourceState[];
   /** Recent actionable observations only; suppressed events remain counters. */
   decisions: MarketEventDecision[];
-  /** Durable simulation evidence only; no research job is dispatched. */
+  /** Durable trigger evaluation evidence. */
   triggerDryRun: MarketEventTriggerDryRunState;
+  /** Durable, candidate-ID keyed execution outbox. */
+  triggerDispatches: MarketEventTriggerDispatchRecord[];
 }
 
 export interface MarketEventScoutRunResult {
@@ -204,6 +255,9 @@ export interface MarketEventScoutRunResult {
   candidateEvaluated: number;
   wouldTrigger: number;
   gated: number;
+  dispatchEnqueued: number;
+  dispatchFailed: number;
+  dispatchPending: number;
 }
 
 export interface MarketEventDocumentClient {
@@ -220,6 +274,8 @@ export interface MarketEventScoutOptions {
   maxStoredDecisions?: number;
   maxStoredTriggerCandidates?: number;
   triggerPolicy?: MarketEventTriggerPolicy;
+  /** Supplying this adapter opts the scout into real model dispatch. */
+  dispatch?: MarketEventTriggerDispatcher;
   errorBackoffMs?: number;
   sourceTimeoutMs?: number;
 }
@@ -240,7 +296,10 @@ const EVENT_MAX_FUTURE_SKEW_MS = 15 * 60_000;
 const DEFAULT_MAX_STORED_TRIGGER_CANDIDATES = 1_000;
 const MAX_TRIGGER_DAYS = 31;
 const MAX_TRIGGER_COOLDOWNS = 2_000;
+const MAX_TRIGGER_DISPATCHES = 2_000;
+const MAX_TRIGGER_DISPATCH_ATTEMPTS = 100;
 const TRIGGER_MAPPING_VERSION = 1 as const;
+const MAX_MODEL_ID_CHARS = 200;
 
 /** Conservative simulation defaults. They do not authorize model dispatch. */
 export const DEFAULT_MARKET_EVENT_TRIGGER_POLICY: Readonly<MarketEventTriggerPolicy> = Object.freeze({
@@ -1039,11 +1098,42 @@ export function marketEventScoutFilePath(cwd: string, env: NodeJS.ProcessEnv = p
 }
 
 function emptyState(now: number): MarketEventScoutState {
-  return { version: 2, updatedAt: now, sources: [], decisions: [], triggerDryRun: emptyTriggerDryRunState() };
+  return {
+    version: 3,
+    updatedAt: now,
+    sources: [],
+    decisions: [],
+    triggerDryRun: emptyTriggerDryRunState(),
+    triggerDispatches: [],
+  };
 }
 
 function validInteger(value: unknown, min: number, max: number): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max;
+}
+
+function validModelId(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length >= 3
+    && value.length <= MAX_MODEL_ID_CHARS
+    && /^[a-z0-9][a-z0-9._/-]{1,198}(?::[a-z0-9._-]+)?$/.test(value);
+}
+
+function validUtcDay(value: unknown): value is string {
+  return typeof value === "string"
+    && /^\d{4}-\d{2}-\d{2}$/.test(value)
+    && new Date(`${value}T00:00:00.000Z`).toISOString().slice(0, 10) === value;
+}
+
+function dispatchAttemptDays(record: Pick<MarketEventTriggerDispatchRecord, "attempt" | "dispatchDays" | "dispatchDay">): string[] {
+  if (Array.isArray(record.dispatchDays)) return record.dispatchDays;
+  if (record.dispatchDay !== undefined && record.attempt > 0) {
+    // A pre-attempt-history v3 record only retained its most recent day. Count
+    // every historical attempt against that day rather than undercounting on
+    // migration; this is deliberately conservative and fail-closed.
+    return Array.from({ length: record.attempt }, () => record.dispatchDay!);
+  }
+  return [];
 }
 
 function validateSourceState(raw: unknown): raw is MarketEventScoutSourceState {
@@ -1316,6 +1406,63 @@ function validateTriggerDryRunState(raw: unknown): raw is MarketEventTriggerDryR
   return new Set(cooldownKeys).size === cooldownKeys.length;
 }
 
+function validateTriggerDispatchRecord(raw: unknown): raw is MarketEventTriggerDispatchRecord {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
+  const record = raw as Record<string, unknown>;
+  const allowedKeys = ["candidateId", "status", "attempt", "createdAt", "updatedAt", "modelId", "dispatchDays", "dispatchDay", "jobId", "error"];
+  if (Object.keys(record).some((key) => !allowedKeys.includes(key))) return false;
+  if (typeof record.candidateId !== "string" || !/^trg-[a-f0-9]{32}$/.test(record.candidateId)
+    || !validModelId(record.modelId) || record.modelId !== MARKET_SCOUT_MODEL_ID
+    || !(record.status === "pending" || record.status === "reserved" || record.status === "enqueued"
+      || record.status === "settled" || record.status === "failed")
+    || !validInteger(record.attempt, 0, MAX_TRIGGER_DISPATCH_ATTEMPTS)
+    || !validInteger(record.createdAt, 1, Number.MAX_SAFE_INTEGER)
+    || !validInteger(record.updatedAt, record.createdAt as number, Number.MAX_SAFE_INTEGER)
+    || (record.dispatchDay !== undefined && !validUtcDay(record.dispatchDay))
+    || (record.jobId !== undefined && (typeof record.jobId !== "string" || record.jobId.length < 1 || record.jobId.length > 256))
+    || (record.error !== undefined && (typeof record.error !== "string" || record.error.length < 1 || record.error.length > 500))) {
+    return false;
+  }
+  if (record.dispatchDays !== undefined && (
+    !Array.isArray(record.dispatchDays)
+    || record.dispatchDays.length !== record.attempt
+    || record.dispatchDays.length > MAX_TRIGGER_DISPATCH_ATTEMPTS
+    || !record.dispatchDays.every(validUtcDay)
+  )) return false;
+  if (record.dispatchDays === undefined && record.attempt > 0 && record.dispatchDay === undefined) return false;
+  if (record.status === "pending" || record.status === "reserved") {
+    if (record.jobId !== undefined) return false;
+  } else if (record.status === "enqueued" && typeof record.jobId !== "string") {
+    return false;
+  }
+  if (record.status !== "pending" && dispatchAttemptDays(record as Pick<MarketEventTriggerDispatchRecord, "attempt" | "dispatchDays" | "dispatchDay">).length === 0) return false;
+  if (record.status === "failed" && typeof record.error !== "string") return false;
+  return true;
+}
+
+function normalizeTriggerDispatchRecord(raw: MarketEventTriggerDispatchRecord): MarketEventTriggerDispatchRecord {
+  const days = dispatchAttemptDays(raw);
+  return {
+    ...raw,
+    ...(raw.dispatchDays === undefined ? { dispatchDays: days } : { dispatchDays: [...raw.dispatchDays] }),
+  };
+}
+
+function isLiveTriggerDispatch(record: MarketEventTriggerDispatchRecord): boolean {
+  return record.status === "pending" || record.status === "reserved" || record.status === "enqueued";
+}
+
+function retainTriggerDispatches(records: MarketEventTriggerDispatchRecord[]): MarketEventTriggerDispatchRecord[] {
+  const live = records.filter(isLiveTriggerDispatch);
+  const terminal = records.filter((record) => !isLiveTriggerDispatch(record));
+  // Never evict an unsettled dispatch to make room for newer terminal history.
+  // Admission stops once the live portion reaches the bound, so truncation is
+  // only needed for settled/failed telemetry.
+  return live.length >= MAX_TRIGGER_DISPATCHES
+    ? live.slice(0, MAX_TRIGGER_DISPATCHES)
+    : [...live, ...terminal.slice(0, MAX_TRIGGER_DISPATCHES - live.length)];
+}
+
 export async function readMarketEventScoutState(path: string, now: number = Date.now()): Promise<MarketEventScoutState> {
   let text: string;
   try {
@@ -1334,13 +1481,18 @@ export async function readMarketEventScoutState(path: string, now: number = Date
     throw new Error("Malformed market event scout state: not an object");
   }
   const state = parsed as Record<string, unknown>;
-  if ((state.version !== 1 && state.version !== 2) || !Array.isArray(state.sources) || !Array.isArray(state.decisions)
-    || (state.version === 2 && state.triggerDryRun === undefined)) {
+  if ((state.version !== 1 && state.version !== 2 && state.version !== 3)
+    || !Array.isArray(state.sources) || !Array.isArray(state.decisions)
+    || (state.version >= 2 && state.triggerDryRun === undefined)
+    || (state.version >= 3 && state.triggerDispatches === undefined)) {
     throw new Error("Malformed market event scout state: unsupported schema");
   }
   if (state.sources.length > 100 || !state.sources.every(validateSourceState)
     || state.decisions.length > 2_000 || !state.decisions.every(validateDecision)
-    || (state.version === 2 && !validateTriggerDryRunState(state.triggerDryRun))) {
+    || (state.version >= 2 && !validateTriggerDryRunState(state.triggerDryRun))
+    || (state.version >= 3 && (!Array.isArray(state.triggerDispatches)
+      || state.triggerDispatches.length > MAX_TRIGGER_DISPATCHES
+      || !state.triggerDispatches.every(validateTriggerDispatchRecord)))) {
     throw new Error("Malformed market event scout state: invalid record");
   }
   const sources = state.sources as MarketEventScoutSourceState[];
@@ -1354,16 +1506,23 @@ export async function readMarketEventScoutState(path: string, now: number = Date
   if (!validInteger(state.updatedAt, 1, Number.MAX_SAFE_INTEGER)) {
     throw new Error("Malformed market event scout state: invalid updatedAt");
   }
+  const triggerDispatches = state.version === 3
+    ? (state.triggerDispatches as MarketEventTriggerDispatchRecord[]).map(normalizeTriggerDispatchRecord)
+    : [];
+  if (new Set(triggerDispatches.map((record) => record.candidateId)).size !== triggerDispatches.length) {
+    throw new Error("Malformed market event scout state: duplicate trigger dispatch");
+  }
   return {
-    version: 2,
+    version: 3,
     updatedAt: state.updatedAt,
     sources,
     decisions,
     // v1 migration is deliberately empty: retained historical decisions are
     // not replayed as newly observed trigger evidence.
-    triggerDryRun: state.version === 2
+    triggerDryRun: state.version >= 2
       ? state.triggerDryRun as MarketEventTriggerDryRunState
       : emptyTriggerDryRunState(),
+    triggerDispatches,
   };
 }
 
@@ -1474,6 +1633,9 @@ export class MarketEventScout {
   private readonly maxStoredDecisions: number;
   private readonly maxStoredTriggerCandidates: number;
   private readonly triggerPolicy: MarketEventTriggerPolicy;
+  private readonly dispatch?: MarketEventTriggerDispatcher;
+  private readonly dispatchPolicy: MarketEventTriggerDispatchPolicy;
+  private dispatchRecoveryComplete = false;
   private readonly errorBackoffMs: number;
   private readonly sourceTimeoutMs: number;
   private running?: Promise<MarketEventScoutRunResult>;
@@ -1496,6 +1658,20 @@ export class MarketEventScout {
       throw new Error("Market event trigger dry-run policy is invalid");
     }
     this.triggerPolicy = cloneTriggerPolicy(options.triggerPolicy ?? DEFAULT_MARKET_EVENT_TRIGGER_POLICY);
+    this.dispatch = options.dispatch;
+    this.dispatchPolicy = {
+      ...DEFAULT_MARKET_EVENT_TRIGGER_DISPATCH_POLICY,
+      ...(options.dispatch?.policy ?? {}),
+    };
+    if (this.dispatch && this.dispatch.modelId !== MARKET_SCOUT_MODEL_ID) {
+      throw new Error(`Market event trigger dispatch model must be ${MARKET_SCOUT_MODEL_ID}`);
+    }
+    if (this.dispatch && (
+      this.dispatchPolicy.perRunCap !== DEFAULT_MARKET_EVENT_TRIGGER_DISPATCH_POLICY.perRunCap
+      || this.dispatchPolicy.dailyCap !== DEFAULT_MARKET_EVENT_TRIGGER_DISPATCH_POLICY.dailyCap
+    )) {
+      throw new Error("Market event trigger dispatch policy is pinned to 1 per poll and 4 attempts per UTC day");
+    }
     this.errorBackoffMs = positiveInteger(options.errorBackoffMs, DEFAULT_ERROR_BACKOFF_MS, 24 * 60 * 60_000);
     this.sourceTimeoutMs = positiveInteger(options.sourceTimeoutMs, DEFAULT_SOURCE_TIMEOUT_MS, 2 * 60_000);
     if (this.sources.length < 1 || this.sources.length > 100) throw new Error("Market event scout source count is invalid");
@@ -1532,6 +1708,122 @@ export class MarketEventScout {
     });
     this.running = operation;
     return operation;
+  }
+
+  /**
+   * Settle a dispatched candidate after the research worker publishes or
+   * rejects its result. This is deliberately separate from the scout poll so
+   * worker completion can update the durable outbox without another feed fetch.
+   */
+  async settleDispatch(
+    candidateId: string,
+    outcome: "complete" | "failed" | "cancelled",
+    error?: string,
+  ): Promise<void> {
+    await withStatePathLock(this.statePath, async () => {
+      const state = await readMarketEventScoutState(this.statePath, this.now());
+      const record = state.triggerDispatches.find((entry) => entry.candidateId === candidateId);
+      if (!record || record.status === "settled" || record.status === "failed") return;
+      record.status = outcome === "complete" ? "settled" : "failed";
+      record.updatedAt = this.now();
+      record.error = outcome === "complete" ? undefined : boundedText(error || `Research ${outcome}`, 500);
+      await writeMarketEventScoutState(this.statePath, state);
+    });
+  }
+
+  private async drainDispatches(state: MarketEventScoutState): Promise<{
+    enqueued: number;
+    failed: number;
+    pending: number;
+  }> {
+    if (!this.dispatch) return { enqueued: 0, failed: 0, pending: 0 };
+
+    // A reserved/enqueued record can only be in flight when the parent process
+    // was interrupted. The parent owns the worker lifecycle, so recovering it
+    // to pending is safe on the first drain of a fresh scout instance. Keeping
+    // this one-shot prevents duplicate dispatches during ordinary polling.
+    if (!this.dispatchRecoveryComplete) {
+      for (const record of state.triggerDispatches) {
+        if (record.status === "reserved" || record.status === "enqueued") {
+          record.status = "pending";
+          record.jobId = undefined;
+          record.error = undefined;
+          record.updatedAt = this.now();
+        }
+      }
+      await writeMarketEventScoutState(this.statePath, state);
+      this.dispatchRecoveryComplete = true;
+    }
+
+    const candidates = new Map(state.triggerDryRun.candidates.map((candidate) => [candidate.id, candidate]));
+    const today = marketEventTriggerDay(this.now());
+    let attemptsToday = state.triggerDispatches.reduce(
+      (count, record) => count + dispatchAttemptDays(record).filter((day) => day === today).length,
+      0,
+    );
+    let acceptedThisRun = 0;
+    let failedThisRun = 0;
+
+    for (const record of [...state.triggerDispatches].sort((a, b) => a.createdAt - b.createdAt)) {
+      if (record.status !== "pending") continue;
+      if (acceptedThisRun >= this.dispatchPolicy.perRunCap || attemptsToday >= this.dispatchPolicy.dailyCap) break;
+      if (record.attempt >= MAX_TRIGGER_DISPATCH_ATTEMPTS) {
+        record.status = "failed";
+        record.error = "Trigger dispatch retry limit reached";
+        record.updatedAt = this.now();
+        failedThisRun += 1;
+        await writeMarketEventScoutState(this.statePath, state);
+        continue;
+      }
+
+      const candidate = candidates.get(record.candidateId);
+      if (!candidate || candidate.outcome !== "would-trigger") {
+        record.status = "failed";
+        record.error = "Trigger candidate is no longer retained";
+        record.updatedAt = this.now();
+        failedThisRun += 1;
+        await writeMarketEventScoutState(this.statePath, state);
+        continue;
+      }
+
+      record.status = "reserved";
+      record.attempt += 1;
+      record.dispatchDays = [...dispatchAttemptDays(record), today];
+      record.updatedAt = this.now();
+      record.error = undefined;
+      record.jobId = undefined;
+      attemptsToday += 1;
+      await writeMarketEventScoutState(this.statePath, state);
+
+      let result: Awaited<ReturnType<MarketEventTriggerDispatcher["dispatch"]>>;
+      try {
+        result = await this.dispatch.dispatch(candidate);
+      } catch (error) {
+        result = { accepted: false, error: error instanceof Error ? error.message : String(error) };
+      }
+      const safeError = boundedText(result.error || "Dispatch adapter rejected the candidate", 500);
+      if (result.accepted && typeof result.jobId === "string" && result.jobId.length > 0 && result.jobId.length <= 256) {
+        record.status = "enqueued";
+        record.jobId = result.jobId;
+        record.error = undefined;
+        acceptedThisRun += 1;
+      } else if (!result.accepted && result.retryable) {
+        record.status = "pending";
+        record.error = safeError;
+      } else {
+        record.status = "failed";
+        record.error = safeError;
+        failedThisRun += 1;
+      }
+      record.updatedAt = this.now();
+      await writeMarketEventScoutState(this.statePath, state);
+    }
+
+    return {
+      enqueued: acceptedThisRun,
+      failed: failedThisRun,
+      pending: state.triggerDispatches.filter((record) => record.status === "pending").length,
+    };
   }
 
   private async runOnce(options: { force?: boolean; signal?: AbortSignal }): Promise<MarketEventScoutRunResult> {
@@ -1623,6 +1915,24 @@ export class MarketEventScout {
       policy: this.triggerPolicy,
       maxStoredCandidates: this.maxStoredTriggerCandidates,
     });
+    if (this.dispatch) {
+      const knownDispatches = new Set(state.triggerDispatches.map((record) => record.candidateId));
+      for (const candidate of triggerCandidates) {
+        if (candidate.outcome !== "would-trigger" || knownDispatches.has(candidate.id)
+          || state.triggerDispatches.filter(isLiveTriggerDispatch).length >= MAX_TRIGGER_DISPATCHES) continue;
+        state.triggerDispatches.unshift({
+          candidateId: candidate.id,
+          status: "pending",
+          attempt: 0,
+          createdAt: this.now(),
+          updatedAt: this.now(),
+          modelId: this.dispatch.modelId,
+          dispatchDays: [],
+        });
+        knownDispatches.add(candidate.id);
+      }
+      state.triggerDispatches = retainTriggerDispatches(state.triggerDispatches);
+    }
     if (runDecisions.length > 0) {
       const byId = new Map<string, MarketEventDecision>();
       for (const decision of [...runDecisions, ...state.decisions]) {
@@ -1636,6 +1946,7 @@ export class MarketEventScout {
     state.updatedAt = this.now();
     if (options.signal?.aborted) throw options.signal.reason ?? new Error("Market event scout aborted");
     await writeMarketEventScoutState(this.statePath, state);
+    const dispatch = await this.drainDispatches(state);
 
     return {
       startedAt,
@@ -1653,6 +1964,9 @@ export class MarketEventScout {
       candidateEvaluated: triggerCandidates.length,
       wouldTrigger: triggerCandidates.filter((candidate) => candidate.outcome === "would-trigger").length,
       gated: triggerCandidates.filter((candidate) => candidate.outcome === "gated").length,
+      dispatchEnqueued: dispatch.enqueued,
+      dispatchFailed: dispatch.failed,
+      dispatchPending: dispatch.pending,
     };
   }
 }

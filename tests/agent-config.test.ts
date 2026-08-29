@@ -12,6 +12,7 @@ import {
   assertMarketAgentTools,
   createAgentModelRuntime,
   DEFAULT_OPENROUTER_MODEL,
+  MARKET_SCOUT_OPENROUTER_MODEL,
   MARKET_AGENT_TOOLS,
   readAgentModelConfig,
   validateUnbrowserRuntime,
@@ -41,6 +42,23 @@ test("Pi resolves the July 31 DeepSeek Flash release before its catalog entry sh
     assert.equal(model?.contextWindow, 1_048_576);
     assert.equal(model?.cost.input, 0.09);
     assert.equal(model?.cost.output, 0.18);
+    assert.equal(model?.maxTokens, 4_096);
+  } finally {
+    await rm(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("Pi resolves the scout-only free Nemotron model before its catalog entry ships", async () => {
+  const agentDir = await mkdtemp(path.join(tmpdir(), "fin-terminal-scout-model-test-"));
+  try {
+    const { model } = await createAgentModelRuntime(agentDir, {
+      OPENROUTER_API_KEY: "test-only",
+      OPENROUTER_MODEL: MARKET_SCOUT_OPENROUTER_MODEL,
+    });
+    assert.equal(model?.provider, "openrouter");
+    assert.equal(model?.id, MARKET_SCOUT_OPENROUTER_MODEL);
+    assert.equal(model?.cost.input, 0);
+    assert.equal(model?.cost.output, 0);
     assert.equal(model?.maxTokens, 4_096);
   } finally {
     await rm(agentDir, { recursive: true, force: true });

@@ -49,6 +49,8 @@ export interface WebUi {
   sendInput: (data: string) => void;
   /** Resolve a pending select from the browser. */
   resolveSelect: (id: string, value: string | undefined, cancelled: boolean) => void;
+  /** Close an open custom panel and reject no browser resources on teardown. */
+  dispose: () => void;
 }
 
 export function createWebUi(hooks: WebUiHooks): WebUi {
@@ -59,15 +61,18 @@ export function createWebUi(hooks: WebUiHooks): WebUi {
 
   const pendingSelects = new Map<string, { resolve: (v: string | undefined) => void }>();
   let inputHandler: ((data: string) => unknown) | null = null;
+  let closeCustom: (() => void) | null = null;
 
   const uiBase: Record<string, unknown> = {
     theme: webTheme,
     custom<T>(factory: (...args: unknown[]) => Panel, opts?: { onHandle?: (h: unknown) => void }): Promise<T> {
       return new Promise<T>((resolve) => {
         const done = (result: T) => {
+          closeCustom = null;
           hooks.onPanel(null);
           resolve(result);
         };
+        closeCustom = () => done(undefined as unknown as T);
         // factory(tui, theme, keybindings, done) => Component
         const panel = factory(webTui as never, webTheme as never, undefined as never, done as never);
         hooks.onPanel(panel);
@@ -126,6 +131,14 @@ export function createWebUi(hooks: WebUiHooks): WebUi {
         pendingSelects.delete(id);
         pending.resolve(cancelled ? undefined : value);
       }
+    },
+    dispose: () => {
+      const close = closeCustom;
+      closeCustom = null;
+      close?.();
+      inputHandler = null;
+      for (const pending of pendingSelects.values()) pending.resolve(undefined);
+      pendingSelects.clear();
     },
   };
 }

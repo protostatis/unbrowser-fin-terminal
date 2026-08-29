@@ -5,15 +5,18 @@ import {
   type AgentSession,
 } from "@earendil-works/pi-coding-agent";
 import { InMemoryCredentialStore, type Model } from "@earendil-works/pi-ai";
+import {
+  CONFORMANCE_MODEL_ID,
+  CONFORMANCE_PROVIDER_ID,
+  createConformanceProvider,
+} from "./conformance-mock-model.js";
+import { MARKET_RESEARCH_TOOL_NAMES } from "../shared/research-tool-policy.js";
+import { MARKET_SCOUT_MODEL_ID } from "../shared/market-event-scout.js";
 
-export const MARKET_AGENT_TOOLS = [
-  "market_technicals",
-  "market_discover",
-  "market_extract",
-  "market_canvas",
-] as const;
+export const MARKET_AGENT_TOOLS = MARKET_RESEARCH_TOOL_NAMES;
 
 export const DEFAULT_OPENROUTER_MODEL = "deepseek/deepseek-v4-flash-0731";
+export const MARKET_SCOUT_OPENROUTER_MODEL = MARKET_SCOUT_MODEL_ID;
 const DEFAULT_MAX_OUTPUT_TOKENS = 4_096;
 const DEFAULT_OPENROUTER_MODEL_TEMPLATE = "deepseek/deepseek-v4-flash";
 
@@ -24,13 +27,29 @@ function resolveConfiguredModel(
 ): Model<any> | undefined {
   const catalogModel = modelRuntime.getModel(provider, modelId);
   if (catalogModel) return catalogModel;
-  if (provider !== "openrouter" || modelId !== DEFAULT_OPENROUTER_MODEL) return undefined;
+  if (provider !== "openrouter" || (modelId !== DEFAULT_OPENROUTER_MODEL && modelId !== MARKET_SCOUT_OPENROUTER_MODEL)) return undefined;
 
   // Pi 0.83.0's bundled catalog predates the July 31 model release. Reuse the
   // existing OpenRouter transport compatibility while supplying the published
   // identity, context, and pricing until the next Pi catalog ships it.
   const template = modelRuntime.getModel("openrouter", DEFAULT_OPENROUTER_MODEL_TEMPLATE);
   if (!template) return undefined;
+  if (modelId === MARKET_SCOUT_OPENROUTER_MODEL) {
+    return {
+      ...template,
+      id: modelId,
+      name: "NVIDIA: Nemotron 3.5 Lightning",
+      cost: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+      },
+      contextWindow: 1_048_576,
+      maxTokens: 65_536,
+    };
+  }
+
   return {
     ...template,
     id: DEFAULT_OPENROUTER_MODEL,
@@ -87,6 +106,7 @@ export function readAgentModelConfig(env: NodeJS.ProcessEnv = process.env): Agen
   if (
     explicitProvider
     && explicitProvider !== "openrouter"
+    && explicitProvider !== CONFORMANCE_PROVIDER_ID
     && (openRouterKeyFile || optionalValue(env.OPENROUTER_API_KEY))
   ) {
     throw new Error("OpenRouter credentials cannot be combined with a non-OpenRouter MARKET_MODEL_PROVIDER");
@@ -146,11 +166,25 @@ export async function createAgentModelRuntime(
   });
 
   if (!config.provider || !config.modelId) return { modelRuntime, config };
+
+  // Conformance capture mode: register the deterministic mock provider before
+  // resolving the model so both the parent session and forked research workers
+  // (which inherit env) execute the same scripted research flow with no key.
+  if (config.provider === CONFORMANCE_PROVIDER_ID) {
+    if (config.modelId !== CONFORMANCE_MODEL_ID) {
+      throw new Error(`Unknown conformance model: ${config.modelId}`);
+    }
+    modelRuntime.registerNativeProvider(createConformanceProvider());
+  }
+
   const selected = resolveConfiguredModel(modelRuntime, config.provider, config.modelId);
   if (!selected) {
     throw new Error(`Unknown configured market model: ${config.provider}/${config.modelId}`);
   }
-  if (!modelRuntime.hasConfiguredAuth(config.provider)) {
+  if (config.provider !== CONFORMANCE_PROVIDER_ID && !modelRuntime.hasConfiguredAuth(config.provider)) {
+    // The conformance provider is a keyless deterministic mock; the runtime's
+    // provider-auth snapshot is built before registerNativeProvider runs, so
+    // hasConfiguredAuth cannot see it. Real providers still fail closed.
     throw new Error(`No credentials configured for market model provider: ${config.provider}`);
   }
 

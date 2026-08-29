@@ -165,16 +165,22 @@ Behavior to expect in production:
   sessions. One parent process writes both archive and pre-cache ledger per data
   directory (the deployment is a singleton; public workers do not warm).
 
-## Shadow Market-Event Scout
+## Market-Event Scout
 
 The event scout is a separate, opt-in observation loop. It polls official public
 RSS/Atom sources through Unbrowser, records deterministic `admit-shadow`, `watch`,
-and suppression counters, and evaluates a bounded trigger **dry run**. It does
-**not** dispatch a model, reserve pre-cache budget, or mutate research canvases.
+and suppression counters, and evaluates a bounded trigger dry run. Real execution
+is a separate, default-off outbox that accepts at most one job per poll and four
+attempts per UTC day. It uses `nvidia/nemotron-3.5-lightning:free`, fails closed,
+and never falls back to a paid model.
 
 | Env | Default | Production guidance |
 |---|---|---|
 | `MARKET_SCOUT_ENABLED` | `0` | Enable only on the authenticated singleton parent while collecting shadow evidence. `1/true/on` enables; `0/false/off` disables |
+| `MARKET_SCOUT_DISPATCH_ENABLED` | `0` | Enable guarded real trigger dispatch only after validating the adapter. Requires `MARKET_SCOUT_ENABLED`; public/disposable workers remain disabled |
+| `MARKET_SCOUT_MODEL_ID` | `nvidia/nemotron-3.5-lightning:free` | The only model accepted by the scout adapter; paid or alternate model IDs fail closed |
+| `MARKET_SCOUT_DISPATCH_PER_RUN` | `1` | Maximum trigger jobs accepted from one poll |
+| `MARKET_SCOUT_DISPATCH_DAILY_CAP` | `4` | Maximum dispatch attempts per UTC day |
 | `UNBROWSER_MCP_URL` | required in production | Use the private Docker-internal MCP endpoint. The local CLI fallback is development-only |
 | `MARKET_SCOUT_LOCAL_CLI` | `0` | Keep disabled in every deployed runtime. It is an explicit local-development fallback and cannot replace MCP in production |
 | `MARKET_DATA_DIR` | project `.pi/` | The scout journal is `market-event-scout.json`; mount the same exclusive parent-writer data volume used by the archive |
@@ -199,10 +205,12 @@ Operational contract:
   observations. The same status view reports dry-run route coverage, UTC daily
   candidate volume, and gate pressure. These are operational measurements, not
   precision, recall, or association-correctness claims; those require reviewed
-  labels and an independent denominator. Keep all decisions no-dispatch until
-  that evidence justifies a separate execution adapter.
+  labels and an independent denominator. Dispatch records use candidate IDs and
+  recover in-flight reservations after a parent restart; settled candidates are
+  never redispatched. Failed free-model calls remain failed and do not fall
+  back to a paid model.
 
-### Trigger dry-run contract
+### Trigger and dispatch contract
 
 Every newly observed non-suppressed decision is mapped from its validated target
 only; titles are never reparsed to invent a route:
@@ -220,8 +228,10 @@ mapping evidence; current market-story decisions therefore do not qualify.
 Gated candidates consume neither cooldown nor daily capacity. The candidate and
 its policy snapshot are immutable, while bounded lifetime/day aggregates survive
 candidate-record rotation. Once evidence exists, changing any policy value
-requires an explicit policy/schema migration so daily aggregates cannot silently
-blend incomparable cohorts.
+  requires an explicit policy/schema migration so daily aggregates cannot silently
+  blend incomparable cohorts. When execution is enabled, only newly-created
+  `would-trigger` candidates enter the durable dispatch outbox; existing dry-run
+  history is never backfilled.
 
 The journal schema is version 2. A valid version-1 journal migrates in memory and
 is written as version 2 on the next atomic scout commit; retained version-1

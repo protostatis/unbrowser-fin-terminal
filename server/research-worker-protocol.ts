@@ -7,6 +7,7 @@
 
 import { pairedPairKey } from "../shared/research-precache-ledger.js";
 import type { ResearchWorkerUsage } from "../shared/research-worker-usage.js";
+import { MARKET_SCOUT_MODEL_ID } from "../shared/market-event-scout.js";
 
 export const WORKER_PROTOCOL_VERSION = 1;
 const MAX_IPC_BYTES = 64 * 1024;
@@ -40,9 +41,14 @@ export interface ResearchRequestContext {
   /** Optional paired pre-cache target. Never exposed as a cache hit. */
   pairedTarget?: PairedTarget;
   /** Only for paired pre-cache workers. */
-  origin?: "precache";
+  origin?: "precache" | "scout";
   /** Per-run token limit for pre-turn abort guard (paired pre-cache only). */
   tokenLimit?: number;
+  /** Scout-only model override; interactive and pre-cache jobs remain global-configured. */
+  modelProvider?: "openrouter";
+  modelId?: string;
+  /** Durable scout candidate identity used for dispatch idempotency and settlement. */
+  scoutCandidateId?: string;
 }
 
 // ── Worker usage (reported on settled events) ─────────────────────────────
@@ -237,12 +243,29 @@ export function isValidResearchRequest(
   const pt = value.pairedTarget;
   if (pt !== undefined && !isValidPairedTarget(pt)) return false;
   const origin = value.origin;
-  if (origin !== undefined && origin !== "precache") return false;
+  if (origin !== undefined && origin !== "precache" && origin !== "scout") return false;
   const tokenLimit = value.tokenLimit;
   if (tokenLimit !== undefined && (
     typeof tokenLimit !== "number" || !Number.isFinite(tokenLimit)
     || tokenLimit < 5_000 || tokenLimit > 500_000 || !Number.isInteger(tokenLimit)
   )) return false;
+  const modelProvider = value.modelProvider;
+  const modelId = value.modelId;
+  if (modelProvider !== undefined && modelProvider !== "openrouter") return false;
+  if (modelId !== undefined && (
+    typeof modelId !== "string" || modelId.length < 3 || modelId.length > 200
+    || !/^[a-z0-9][a-z0-9._/-]{1,198}(?::[a-z0-9._-]+)?$/.test(modelId)
+  )) return false;
+  const scoutCandidateId = value.scoutCandidateId;
+  if (scoutCandidateId !== undefined && (typeof scoutCandidateId !== "string" || !/^trg-[a-f0-9]{32}$/.test(scoutCandidateId))) return false;
+  if (origin === "scout") {
+    if (i !== "brief" || modelProvider !== "openrouter" || modelId !== MARKET_SCOUT_MODEL_ID || scoutCandidateId === undefined
+      || pt !== undefined || tokenLimit !== undefined) return false;
+  } else if (origin === "precache") {
+    if (modelProvider !== undefined || modelId !== undefined || scoutCandidateId !== undefined) return false;
+  } else if (modelProvider !== undefined || modelId !== undefined || scoutCandidateId !== undefined) {
+    return false;
+  }
   if (pt) {
     if (origin !== "precache" || tokenLimit === undefined || i !== "brief" || !/^v1\/paired\/[a-f0-9]{32}$/.test(String(rk))) return false;
     const pairedTarget = pt as PairedTarget;
@@ -258,7 +281,7 @@ export function isValidResearchRequest(
       typeof tokenLimit !== "number" || !Number.isFinite(tokenLimit)
       || tokenLimit < 5_000 || tokenLimit > 500_000 || !Number.isInteger(tokenLimit)
     )) return false;
-    if (!precacheSingle && (origin !== undefined || tokenLimit !== undefined)) return false;
+    if (origin !== "scout" && !precacheSingle && (origin !== undefined || tokenLimit !== undefined)) return false;
   }
   return true;
 }

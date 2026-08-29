@@ -156,6 +156,102 @@ body,
   outline-offset: 3px;
 }
 
+/* ── Personal browser alpha ──────────────────────────────────────────────── */
+
+.browser-alpha-connect {
+  width: min(480px, calc(100% - 48px));
+  margin: 12vh auto 0;
+  padding: 24px;
+  color: #c9d1d9;
+  border: 1px solid #30363d;
+  border-left: 2px solid #58a6ff;
+  background: #0d1117;
+}
+
+.browser-alpha-eyebrow,
+.browser-alpha-banner {
+  color: #58a6ff;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+}
+
+.browser-alpha-connect h2 {
+  margin: 12px 0 8px;
+  font-size: 20px;
+}
+
+.browser-alpha-connect p {
+  margin: 0 0 18px;
+  color: #8b949e;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.browser-alpha-connect input {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  margin: 8px 0;
+  padding: 9px 10px;
+  color: #c9d1d9;
+  background: #010409;
+  border: 1px solid #30363d;
+  font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.browser-alpha-connect button,
+.browser-alpha-banner button {
+  padding: 8px 12px;
+  color: #c9d1d9;
+  background: #161b22;
+  border: 1px solid #30363d;
+  font: inherit;
+  cursor: pointer;
+}
+
+.browser-alpha-connect button:hover,
+.browser-alpha-banner button:hover {
+  border-color: #58a6ff;
+}
+
+.browser-alpha-error,
+.browser-alpha-toast {
+  margin: 10px 0;
+  color: #f85149;
+  font-size: 12px;
+}
+
+.browser-alpha-shell {
+  position: relative;
+  height: 100%;
+}
+
+.browser-alpha-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 12px 0;
+}
+
+.browser-alpha-banner button {
+  padding: 3px 7px;
+  color: #8b949e;
+  font-size: 11px;
+}
+
+.browser-alpha-toast {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 50;
+  margin: 0;
+  padding: 8px 10px;
+  background: #0d1117;
+  border: 1px solid #f85149;
+}
+
 /* ── Theme color palette ────────────────────────────────────────────────────
  *
  * Every token the extension emits (via the web theme's fg/bg helpers).
@@ -223,7 +319,9 @@ strong {
   /* Anchored to the top-right corner of the terminal chrome. The center
      research beacon reserves right-side space so it never underlaps this. */
   position: absolute;
-  top: max(5px, env(safe-area-inset-top));
+  /* Keep the alpha banner's disconnect control clear; the importer lives on
+     the second chrome row at the top-right. */
+  top: max(30px, calc(env(safe-area-inset-top) + 24px));
   right: max(8px, env(safe-area-inset-right));
   z-index: 58;
   display: inline-flex;

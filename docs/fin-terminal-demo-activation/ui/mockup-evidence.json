@@ -1,0 +1,25 @@
+{
+  "schema_version": 2,
+  "workflow": {
+    "stage": "minimal_existing_terminal_reference",
+    "note": "The visual reference intentionally documents only the approved Phase 1 minimal overlay/banner treatment."
+  },
+  "baseline": {
+    "kind": "frontend-repo",
+    "source": "../../..",
+    "note": "Existing Fin Terminal frame, status line, demo banner, select overlay, interaction overlay, and Source Locker are the visual baseline."
+  },
+  "mockup": {
+    "path": "mockup.html",
+    "scope": "phase_1_minimal_ui"
+  },
+  "screenshots": [
+    { "path": "screenshots/replay-demo-1440.png", "state": "replay", "viewport": "1440x900" },
+    { "path": "screenshots/replay-demo-1280.png", "state": "replay", "viewport": "1280x800" },
+    { "path": "screenshots/activation-1440.png", "state": "activation", "viewport": "1440x900" }
+  ],
+  "prd": {
+    "path": "../fin-terminal-demo-activation-prd.md",
+    "note": "The PRD owns Phase 2 behavior; this visual package deliberately does not propose its interface."
+  }
+}
