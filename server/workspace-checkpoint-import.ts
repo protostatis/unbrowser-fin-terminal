@@ -12,6 +12,7 @@
 
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import {
+  serializeCheckpoint,
   validateCheckpoint,
   isWorkspaceCheckpointEnabled,
   type FinancialTerminalCheckpoint,
@@ -71,7 +72,12 @@ export function importCheckpointIntoFreshSession(options: {
   if (!validation.valid) {
     throw new Error(`cannot import invalid checkpoint: ${validation.reason}`);
   }
-  const checkpoint = validation.checkpoint;
+  // Canonicalize through the shared codec so undeclared/nested payload fields
+  // are stripped exactly as the export path does, before the payload touches
+  // the fresh session's custom entry.
+  const checkpoint = JSON.parse(
+    serializeCheckpoint(validation.checkpoint),
+  ) as FinancialTerminalCheckpoint;
 
   const sessionManager = SessionManager.inMemory(options.cwd, {
     id: freshSessionId(),

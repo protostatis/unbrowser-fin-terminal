@@ -21,6 +21,7 @@ import {
   HANDOFF_SECRET_COOKIE_NAME,
   type FinancialTerminalCheckpoint,
 } from "../shared/financial-workspace-checkpoint.js";
+import { WATCHLIST_MAX_SYMBOLS } from "../shared/watchlist-symbols.js";
 
 // ──── Helper to create a minimal valid checkpoint ────────────────────────────
 
@@ -621,33 +622,65 @@ test("accepts checkpoint without interrupted work", () => {
   assert.equal(result.valid, true);
 });
 
-test("rejects interrupted work with secret in context label", () => {
+test("rejects secret-like content in every interrupted-work string", () => {
+  for (const field of ["symbol", "contextLabel", "activity", "phase"] as const) {
+    const activeResearch = {
+      symbol: "AAPL",
+      contextLabel: "AAPL EARNINGS",
+      activity: "fetching",
+      phase: "running",
+      [field]: "password=secret123",
+    };
+    const checkpoint = validCheckpoint({ interruptedWork: { activeResearch } });
+    assert.equal(validateCheckpoint(checkpoint).valid, false, `${field} must reject secret-like content`);
+  }
+});
+
+test("rejects interrupted work whose activeResearch is not a record", () => {
+  for (const activeResearch of ["AAPL", 42, ["AAPL"]]) {
+    const checkpoint = validCheckpoint({ interruptedWork: { activeResearch } });
+    assert.equal(validateCheckpoint(checkpoint).valid, false, `activeResearch ${JSON.stringify(activeResearch)} must be rejected`);
+  }
+});
+
+test("rejects unknown secret-bearing properties in interrupted work", () => {
   const checkpoint = validCheckpoint({
     interruptedWork: {
       activeResearch: {
         symbol: "AAPL",
-        contextLabel: "password=secret123",
-        activity: "fetching",
+        phase: "running",
+        extra: "password=secret123",
       },
     },
   });
   const result = validateCheckpoint(checkpoint);
-  // The contextLabel validation checks for safety, not canary — but the event
-  // log might catch it. Either way, it should be rejected or the label
-  // shouldn't pass the safe string check.
-  // Actually, our canary patterns only apply at the top-level strings.
-  // "password=" as part of a context label should be caught by the secret canary.
-  // Let's check: the context label is in interruptedWork.activeResearch.contextLabel.
-  // The validateInterruptedWork only calls isSafeString, not containsSecretCanary.
-  // But isSafeString rejects control characters and path traversal.
-  // The string "password=secret123" would NOT be rejected by isSafeString alone.
-  // This is a gap. Let's fix by checking for canaries in interruptedWork too.
-  // Actually, the top-level validation of continuationSummary checks canaries.
-  // For now, the test verifies the current behavior.
-  // We'll accept this as a known gap — the continuation summary, event log,
-  // and packet strings are all checked for canaries.
-  // The interruptedWork contextLabel is just a display label.
-  assert.equal(result.valid, true, "contextLabel canary check could be added in future");
+  assert.equal(result.valid, false, "undeclared secret-bearing fields must fail validation");
+});
+
+test("serialization drops undeclared interrupted-work fields", () => {
+  const checkpoint = validCheckpoint({
+    interruptedWork: {
+      activeResearch: {
+        symbol: "AAPL",
+        contextLabel: "AAPL EARNINGS",
+        activity: "fetching",
+        phase: "running",
+        startedAt: 1_700_000_000_000,
+        extra: "drop-me",
+      },
+    },
+  });
+  assert.equal(validateCheckpoint(checkpoint).valid, true, "safe declared fields still validate");
+  const serialized = JSON.parse(serializeCheckpoint(checkpoint)) as {
+    interruptedWork?: { activeResearch?: Record<string, unknown> };
+  };
+  assert.deepEqual(serialized.interruptedWork?.activeResearch, {
+    symbol: "AAPL",
+    contextLabel: "AAPL EARNINGS",
+    activity: "fetching",
+    phase: "running",
+    startedAt: 1_700_000_000_000,
+  });
 });
 
 // ──── Context Validation ────────────────────────────────────────────────────
@@ -683,6 +716,16 @@ test("rejects watchlist exceeding maximum", () => {
   });
   const result = validateCheckpoint(checkpoint);
   assert.equal(result.valid, false);
+});
+
+test("checkpoint watchlists use the terminal's shared capacity", () => {
+  assert.equal(CHECKPOINT_MAX_WATCHLIST, WATCHLIST_MAX_SYMBOLS);
+  const checkpoint = validCheckpoint({
+    context: {
+      watchlist: Array.from({ length: WATCHLIST_MAX_SYMBOLS }, (_unused, index) => `SYM${index}`),
+    },
+  });
+  assert.equal(validateCheckpoint(checkpoint).valid, true);
 });
 
 // ──── Continuation Summary ──────────────────────────────────────────────────

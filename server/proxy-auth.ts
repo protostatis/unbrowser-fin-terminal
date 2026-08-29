@@ -24,6 +24,17 @@ export function normalizePrincipal(value: string | undefined, proxyAuthEnabled: 
   return value && PRINCIPAL_PATTERN.test(value) ? value : undefined;
 }
 
+/** A provisioned private runtime may only accept its owning account principal. */
+export function matchesPrivateWorkspacePrincipal(
+  principal: string | undefined,
+  accountSessionId: string | undefined,
+  proxyAuthEnabled: boolean,
+): boolean {
+  if (!proxyAuthEnabled) return principal === "local";
+  const sessionId = accountSessionId?.trim();
+  return Boolean(sessionId) && principal === `account:${sessionId}`;
+}
+
 export class PrincipalLease {
   private principal: string | undefined;
 

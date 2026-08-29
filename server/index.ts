@@ -48,11 +48,18 @@ import {
 import { ansiToHtml } from "./theme.js";
 import { createWebUi, type Panel } from "./web-ui.js";
 import {
+  matchesPrivateWorkspacePrincipal,
   normalizePrincipal,
   PrincipalLease,
 } from "./proxy-auth.js";
 import { readResearchWorkerConcurrency } from "./research-worker-coordinator.js";
 import { resolveWebAction } from "./web-actions.js";
+import {
+  WatchlistScreenshotImportError,
+  WatchlistScreenshotImportLimiter,
+  WATCHLIST_SCREENSHOT_MAX_BYTES,
+  extractWatchlistFromScreenshot,
+} from "./watchlist-screenshot-import.js";
 import { startPublicLiveGateway } from "./public-live-gateway.js";
 import { readPublicSessionWorkerConfig } from "./public-live-config.js";
 import { PublicSessionWorkerLifecycle } from "./public-session-worker.js";
@@ -73,6 +80,11 @@ import {
   type CheckpointWorkerState,
 } from "./workspace-checkpoint-export.js";
 import { importCheckpointIntoFreshSession, resolveCheckpointImportFile } from "./workspace-checkpoint-import.js";
+import {
+  WATCHLIST_MAX_SYMBOLS,
+  normalizeWatchlistSymbol,
+  type WatchlistUpdateMode,
+} from "../shared/watchlist-symbols.js";
 
 // ==========================================================================
 // Runtime mode — must be resolved before any live-only side effects
@@ -99,6 +111,39 @@ const PORT = Number(process.env.PORT ?? 8787);
 const HOST = process.env.HOST?.trim() || "127.0.0.1";
 const PROXY_TOKEN = process.env.MARKET_PROXY_TOKEN?.trim() || "";
 const PROXY_TOKEN_HEADER = "x-fin-terminal-proxy-token";
+
+type WatchlistImportRequest = {
+  mode: WatchlistUpdateMode;
+  symbols: string[];
+};
+
+const WATCHLIST_IMPORT_REQUEST_ID = /^[A-Za-z0-9_-]{1,80}$/;
+
+/** Validate the reviewed browser payload again before it reaches the terminal. */
+function parseWatchlistImportRequest(value: unknown): WatchlistImportRequest | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  if ((raw.mode !== "merge" && raw.mode !== "replace") || !Array.isArray(raw.symbols)) return undefined;
+  if (raw.symbols.length === 0 || raw.symbols.length > WATCHLIST_MAX_SYMBOLS) return undefined;
+  const symbols: string[] = [];
+  const seen = new Set<string>();
+  for (const candidate of raw.symbols) {
+    if (typeof candidate !== "string" || candidate.length > 32) return undefined;
+    const symbol = normalizeWatchlistSymbol(candidate);
+    if (!symbol) return undefined;
+    if (!seen.has(symbol)) {
+      seen.add(symbol);
+      symbols.push(symbol);
+    }
+  }
+  return symbols.length > 0 ? { mode: raw.mode, symbols } : undefined;
+}
+
+function parseWatchlistImportRequestId(value: unknown): string | undefined {
+  return typeof value === "string" && WATCHLIST_IMPORT_REQUEST_ID.test(value)
+    ? value
+    : undefined;
+}
 
 // Production guard: PROXY_TOKEN required in live mode only.
 // Replay mode may serve without a token if the deployer chooses.
@@ -267,12 +312,16 @@ else {
   // principal/session attached to this worker resets the event log and the
   // frame-transition cache so no session's events bleed into the next one.
   let boundCheckpointSessionId: string | undefined;
+  // Retain projected state after a panel closes. A private workspace may be
+  // checkpointed while no browser panel is currently open.
+  let latestCheckpointWorkerState: CheckpointWorkerState | undefined;
 
   /** Reset authoritative checkpoint state when a new public session attaches. */
   function bindCheckpointSession(sessionId: string | undefined): void {
     if (sessionId === boundCheckpointSessionId) return;
     resetServerCheckpointEventLog(checkpointEventLog);
     lastCheckpointEventState = undefined;
+    latestCheckpointWorkerState = undefined;
     boundCheckpointSessionId = sessionId;
   }
 
@@ -375,6 +424,7 @@ else {
         const rows = raw.map((r) => ansiToHtml(r));
         const rawState =
           typeof activePanel.debugState === "function" ? activePanel.debugState() : undefined;
+        latestCheckpointWorkerState = projectCheckpointWorkerState(rawState);
         if (publicWorkerLifecycle && hasActiveResearchState(rawState)) {
           // Trusted model/tool progress extends the idle lease, while the
           // absolute public-session deadline remains unchanged.
@@ -411,8 +461,8 @@ else {
       ...(typeof state.symbol === "string" ? { symbol: state.symbol } : {}),
       ...(typeof state.chartScope === "string" ? { chartScope: state.chartScope } : {}),
       ...(typeof state.searchQuery === "string" ? { searchQuery: state.searchQuery } : {}),
-      ...(Array.isArray(state.available)
-        ? { available: state.available.filter((s): s is string => typeof s === "string") }
+      ...(Array.isArray(state.watchlist)
+        ? { watchlist: state.watchlist.filter((s): s is string => typeof s === "string") }
         : {}),
       ...(research
         ? { research: projectResearchState(research) }
@@ -531,6 +581,9 @@ else {
   const web = createWebUi({
     onPanel: (p) => {
       activePanel = p;
+      if (p && typeof p.debugState === "function") {
+        latestCheckpointWorkerState = projectCheckpointWorkerState(p.debugState());
+      }
       console.log("[panel]", p ? `opened (${typeof p.debugState === "function" ? (p.debugState() as { mode?: string }).mode : "?"})` : "closed");
     },
     onRenderRequest: () => pushFrame(),
@@ -563,8 +616,8 @@ else {
   // alias), boot an in-memory session seeded from it (custom state entry +
   // bounded continuation seed) instead of an empty one. Both spellings
   // require the FINANCIAL_WORKSPACE_CHECKPOINTS feature flag.
-  let workspaceImportSessionManager: ReturnType<typeof SessionManager.inMemory> | undefined;
-  const checkpointImportFile = resolveCheckpointImportFile();
+  let workspaceImportSessionManager: SessionManager | undefined;
+  const checkpointImportFile = isPrivateWorkspace ? resolveCheckpointImportFile() : undefined;
   if (checkpointImportFile) {
     try {
       const raw = JSON.parse(readFileSync(checkpointImportFile, "utf8"));
@@ -580,7 +633,7 @@ else {
         );
       }
       console.error(
-        "[workspace-import] checkpoint import failed; booting an empty session:",
+        "[workspace-import] checkpoint import failed; booting without imported workspace state:",
         error instanceof Error ? error.message : String(error),
       );
     }
@@ -609,6 +662,9 @@ else {
     await loader.reload();
 
     console.log("[server] creating agent session...");
+    const selectedSessionManager = publicSessionWorker.enabled
+      ? SessionManager.inMemory(CWD)
+      : workspaceImportSessionManager;
     const { session, extensionsResult } = await createAgentSession({
       cwd: CWD,
       agentDir,
@@ -617,7 +673,9 @@ else {
       noTools: "builtin",
       tools: [...MARKET_AGENT_TOOLS],
       resourceLoader: loader,
-      sessionManager: workspaceImportSessionManager ?? SessionManager.inMemory(CWD),
+      // Disposable public workers and imported private workspaces are isolated;
+      // ordinary signed-in sessions use the SDK's disk-backed default.
+      ...(selectedSessionManager ? { sessionManager: selectedSessionManager } : {}),
     });
     if (extensionsResult.errors.length) {
       session.dispose();
@@ -677,16 +735,63 @@ else {
         if (!publicWorkerInstanceId && !isPrivateWorkspace) return undefined;
         const rawState =
           typeof activePanel?.debugState === "function" ? activePanel.debugState() : undefined;
+        if (rawState !== undefined) {
+          latestCheckpointWorkerState = projectCheckpointWorkerState(rawState);
+        }
         return {
           sessionId,
           generation: workerGenerationEpoch(generation),
           sourceRevision: generation,
-          state: projectCheckpointWorkerState(rawState),
+          state: latestCheckpointWorkerState ?? {},
           eventLog: checkpointEventLog,
         };
       },
     });
     console.log("[workspace-checkpoint] worker export endpoint enabled");
+  }
+
+  // Screenshot import is intentionally unavailable to disposable public seats:
+  // it is billable, accepts private images, and belongs to an owned workspace.
+  const screenshotImportLimiter = new WatchlistScreenshotImportLimiter();
+  if (!publicSessionWorker.enabled) {
+    app.post(
+      "/api/watchlist/import",
+      express.raw({ type: "*/*", limit: WATCHLIST_SCREENSHOT_MAX_BYTES }),
+      async (req, res) => {
+        res.setHeader("cache-control", "no-store");
+        const principal = requestPrincipal(req);
+        if (
+          !principal
+          || !activePanel
+          || !activeClient
+          || (
+            principalLease.assignedPrincipal !== undefined
+            && principalLease.assignedPrincipal !== principal
+          )
+        ) {
+          res.status(403).json({ error: "A live terminal session is required for screenshot import." });
+          return;
+        }
+        const rate = screenshotImportLimiter.consume(principal);
+        if (!rate.allowed) {
+          res.status(429).json({
+            error: "Screenshot import is temporarily rate limited. Try again shortly.",
+            retryAfterSeconds: Math.ceil((rate.retryAfterMs ?? 0) / 1_000),
+          });
+          return;
+        }
+        try {
+          const image = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+          const result = await extractWatchlistFromScreenshot(image);
+          res.status(200).json(result);
+        } catch (error) {
+          const failure = error instanceof WatchlistScreenshotImportError
+            ? error
+            : new WatchlistScreenshotImportError("Screenshot import failed.", 500);
+          res.status(failure.status).json({ error: failure.message });
+        }
+      },
+    );
   }
 
   // ── Static files ────────────────────────────────────────────────────────
@@ -720,6 +825,17 @@ else {
       }
       const principal = requestPrincipal(req);
       if (!principal) {
+        done(false, 403, "Forbidden");
+        return;
+      }
+      if (
+        isPrivateWorkspace
+        && !matchesPrivateWorkspacePrincipal(
+          principal,
+          process.env.FIN_WORKSPACE_SESSION_ID,
+          Boolean(PROXY_TOKEN),
+        )
+      ) {
         done(false, 403, "Forbidden");
         return;
       }
@@ -774,7 +890,10 @@ else {
     //                       authenticated user; the runtime is dedicated to
     //                       that account for its whole lifetime)
     const connectedPrincipal = requestPrincipal(request);
-    if (connectedPrincipal?.startsWith("public:")) {
+    if (isPrivateWorkspace) {
+      // `verifyClient` pins this connection to FIN_WORKSPACE_SESSION_ID. The
+      // process binding set at boot must never be replaced by browser headers.
+    } else if (connectedPrincipal?.startsWith("public:")) {
       process.env.TERMINAL_RUNTIME_SESSION_ID = connectedPrincipal.slice("public:".length);
       bindCheckpointSession(process.env.TERMINAL_RUNTIME_SESSION_ID);
     } else if (connectedPrincipal?.startsWith("account:")) {
@@ -837,6 +956,43 @@ else {
           publicWorkerLifecycle?.touch();
           web.sendInput(String(msg.data ?? ""));
           pushFrame(); // ensure a frame after state mutation
+          break;
+        }
+        case "watchlist_import": {
+          const requestId = parseWatchlistImportRequestId(msg.requestId);
+          const rejectWatchlistImport = (message: string) => {
+            if (requestId) {
+              sendToClient({ type: "watchlist_import_result", requestId, ok: false, error: message });
+            }
+            sendToClient({ type: "notify", level: "error", message });
+          };
+          if (publicSessionWorker.enabled) {
+            rejectWatchlistImport("Screenshot watchlist import is unavailable in public sessions.");
+            break;
+          }
+          const request = parseWatchlistImportRequest(msg.data);
+          if (!request || !requestId || !activePanel?.applyWatchlist) {
+            rejectWatchlistImport("Review at least one valid Yahoo Finance symbol before applying the watchlist.");
+            break;
+          }
+          const update = activePanel.applyWatchlist(request.symbols, request.mode);
+          if (typeof activePanel.debugState === "function") {
+            latestCheckpointWorkerState = projectCheckpointWorkerState(activePanel.debugState());
+          }
+          sendToClient({ type: "watchlist_import_result", requestId, ok: true });
+          sendToClient({
+            type: "notify",
+            level: "info",
+            message: request.mode === "replace"
+              ? `Watchlist replaced with ${update.symbols.length} symbol${update.symbols.length === 1 ? "" : "s"}.`
+              : `${update.added} symbol${update.added === 1 ? "" : "s"} added to the watchlist.`,
+          });
+          recordServerCheckpointEvent(checkpointEventLog, "command", {
+            name: "watchlist-import",
+            mode: request.mode,
+            count: request.symbols.length,
+          });
+          pushFrame();
           break;
         }
         case "resize": {
@@ -902,13 +1058,15 @@ else {
 
     ws.on("close", () => {
       console.log("[ws] client disconnected");
+      // A replaced tab closes after its successor has become active. It must
+      // not clear that successor's principal/session binding.
+      if (activeClient !== ws) return;
       // A private-workspace runtime is dedicated to its account; the account
       // session id stays bound so the checkpoint exporter keeps working after
       // the browser disconnects (flush happens on sleep, not on disconnect).
       if (!isPrivateWorkspace) {
         delete process.env.TERMINAL_RUNTIME_SESSION_ID;
       }
-      if (activeClient !== ws) return;
       activeClient = null;
       sendToClient = () => {};
       publicWorkerLifecycle?.disconnectedClient();

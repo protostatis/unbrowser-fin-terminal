@@ -9,7 +9,7 @@ import type { TerminalWebAction } from "./web-interactions";
  *
  * Uses an event-emitter pattern: call .on(type, handler) and receive parsed
  * message objects. Built-in event types mirror the server→client protocol:
- *   frame, notify, select_request, closed
+ *   frame, notify, select_request, watchlist_import_result, closed
  * plus connection lifecycle:
  *   _open, _close, _connecting
  *
@@ -48,10 +48,22 @@ export interface ClosedMessage {
   type: "closed";
 }
 
+export type WatchlistImportResult =
+  | { ok: true }
+  | { ok: false; error: string };
+
+export interface WatchlistImportResultMessage {
+  type: "watchlist_import_result";
+  requestId: string;
+  ok: boolean;
+  error?: string;
+}
+
 export type ServerMessage =
   | FrameMessage
   | NotifyMessage
   | SelectRequestMessage
+  | WatchlistImportResultMessage
   | ClosedMessage;
 
 /* ── Socket class ─────────────────────────────────────────────────────── */
@@ -60,6 +72,7 @@ const RECONNECT_BASE_MS = 500;
 const RECONNECT_MAX_MS = 8_000;
 const MAX_RETRIES = 20;
 const CLIENT_REPLACED_CLOSE_CODE = 4001;
+const WATCHLIST_IMPORT_RESULT_TIMEOUT_MS = 15_000;
 
 /** Server close code for the public demo: seat busy or rate-limited. */
 export const DEMO_BUSY_CLOSE_CODE = 1013;
@@ -72,7 +85,12 @@ export class TerminalSocket {
   private ws: WebSocket | null = null;
   private handlers = new Map<string, Set<Handler>>();
   private retryTimeout: ReturnType<typeof setTimeout> | null = null;
+  private watchlistImportRequests = new Map<string, {
+    resolve: (result: WatchlistImportResult) => void;
+    timeout: ReturnType<typeof setTimeout>;
+  }>();
   private retryCount = 0;
+  private nextWatchlistImportRequestId = 0;
   private _disconnected = false;
 
   /** Read-only connection indicator for quick UI checks. */
@@ -142,6 +160,12 @@ export class TerminalSocket {
       if (this.ws !== ws) return;
       try {
         const msg: ServerMessage = JSON.parse(event.data);
+        if (msg.type === "watchlist_import_result") {
+          this.settleWatchlistImport(
+            msg.requestId,
+            msg.ok === true ? { ok: true } : { ok: false, error: msg.error || "The reviewed watchlist could not be applied." },
+          );
+        }
         this.dispatch(msg.type, msg);
       } catch (err) {
         console.error("TerminalSocket: failed to parse message", err);
@@ -154,6 +178,7 @@ export class TerminalSocket {
       // over the newer connection that replaced it.
       if (this.ws !== ws) return;
       this.ws = null;
+      this.failPendingWatchlistImports("The market session disconnected before the watchlist was applied.");
       const replaced = event.code === CLIENT_REPLACED_CLOSE_CODE;
       // 1013 (demo seat busy / rate-limited) must not trigger the fast
       // reconnect loop either: the waiting room owns retry timing, with
@@ -184,6 +209,7 @@ export class TerminalSocket {
       clearTimeout(this.retryTimeout);
       this.retryTimeout = null;
     }
+    this.failPendingWatchlistImports("The market session disconnected before the watchlist was applied.");
     this.ws?.close();
     this.ws = null;
     this.setConnectionState("disconnected");
@@ -193,6 +219,35 @@ export class TerminalSocket {
 
   sendInput(data: string): void {
     this.send({ type: "input", data });
+  }
+
+  /** Apply a reviewed watchlist and wait for the server's authoritative result. */
+  sendWatchlistImport(
+    mode: "merge" | "replace",
+    symbols: string[],
+  ): Promise<WatchlistImportResult> {
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return Promise.resolve({ ok: false, error: "The market session is disconnected." });
+    }
+    const requestId = `watchlist-${Date.now().toString(36)}-${(++this.nextWatchlistImportRequestId).toString(36)}`;
+    return new Promise<WatchlistImportResult>((resolve) => {
+      const timeout = setTimeout(() => {
+        this.settleWatchlistImport(requestId, {
+          ok: false,
+          error: "The market session did not confirm the watchlist update. Try again.",
+        });
+      }, WATCHLIST_IMPORT_RESULT_TIMEOUT_MS);
+      this.watchlistImportRequests.set(requestId, { resolve, timeout });
+      try {
+        ws.send(JSON.stringify({ type: "watchlist_import", requestId, data: { mode, symbols } }));
+      } catch {
+        this.settleWatchlistImport(requestId, {
+          ok: false,
+          error: "The market session could not receive the watchlist update.",
+        });
+      }
+    });
   }
 
   /** Send a validated semantic browser action to the terminal bridge. */
@@ -221,6 +276,20 @@ export class TerminalSocket {
   private send(data: Record<string, unknown>): void {
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(data));
+    }
+  }
+
+  private settleWatchlistImport(requestId: string, result: WatchlistImportResult): void {
+    const pending = this.watchlistImportRequests.get(requestId);
+    if (!pending) return;
+    clearTimeout(pending.timeout);
+    this.watchlistImportRequests.delete(requestId);
+    pending.resolve(result);
+  }
+
+  private failPendingWatchlistImports(error: string): void {
+    for (const [requestId] of this.watchlistImportRequests) {
+      this.settleWatchlistImport(requestId, { ok: false, error });
     }
   }
 

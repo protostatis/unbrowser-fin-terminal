@@ -7,7 +7,7 @@ import {
   useState,
 } from "react";
 import { createRoot } from "react-dom/client";
-import { TerminalSocket } from "./socket";
+import { TerminalSocket, type WatchlistImportResult } from "./socket";
 import { TerminalFrame } from "./TerminalFrame";
 import { MobileControls } from "./MobileControls";
 import { ContextHud } from "./ContextHud";
@@ -21,6 +21,7 @@ import {
   InteractionOverlay,
   type TerminalWebAction,
 } from "./InteractionOverlay";
+import { WatchlistImport } from "./WatchlistImport";
 import { keyToData } from "./keyboard";
 import { PUBLIC_DEMO, PUBLIC_LIVE_DEMO, REPLAY_DEMO } from "./demo-mode";
 import {
@@ -127,6 +128,7 @@ export function App({
     title: string;
     options: string[];
   } | null>(null);
+  const [watchlistImportOpen, setWatchlistImportOpen] = useState(false);
   const notifyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   /* ── Public demo kiosk state ──────────────────────────────────────────── */
@@ -161,6 +163,9 @@ export function App({
   /* ── Refs for overlays (keyboard handler reads these) ──────────────── */
   const selectReqRef = useRef(selectReq);
   selectReqRef.current = selectReq;
+  const watchlistImportOpenRef = useRef(watchlistImportOpen);
+  watchlistImportOpenRef.current = watchlistImportOpen;
+  const watchlistImportApplyingRef = useRef(false);
 
   /* ── Container / ruler refs for viewport measurement ───────────────── */
   const containerRef = useRef<HTMLDivElement>(null);
@@ -346,6 +351,17 @@ export function App({
     const s = socket;
 
     const handler = (e: KeyboardEvent) => {
+      // The screenshot-review dialog owns keyboard input. It must never type
+      // into the terminal search field while a symbol edit has focus.
+      if (watchlistImportOpenRef.current) {
+        if (e.key === "Escape" && !watchlistImportApplyingRef.current) {
+          e.preventDefault();
+          setWatchlistImportOpen(false);
+          focusTerminal();
+        }
+        return;
+      }
+
       // When a select modal is shown, only Escape is handled (to cancel).
       if (selectReqRef.current) {
         if (e.key === "Escape") {
@@ -426,6 +442,31 @@ export function App({
     socket.sendWebAction(action);
   };
 
+  const handleWatchlistImportOpenChange = (nextOpen: boolean) => {
+    setWatchlistImportOpen(nextOpen);
+    if (!nextOpen) focusTerminal();
+  };
+
+  const handleWatchlistImport = async (
+    mode: "merge" | "replace",
+    symbols: string[],
+  ): Promise<WatchlistImportResult> => {
+    if (
+      connectionStateRef.current !== "connected"
+      || isClosedRef.current
+      || selectReqRef.current
+      || evidenceOpenRef.current
+    ) return { ok: false, error: "The market session is not ready to update the watchlist." };
+    watchlistImportApplyingRef.current = true;
+    try {
+      const result = await socket.sendWatchlistImport(mode, symbols);
+      if (result.ok) focusTerminal();
+      return result;
+    } finally {
+      watchlistImportApplyingRef.current = false;
+    }
+  };
+
   /* ── Render ──────────────────────────────────────────────────────────────── */
 
   const cs = connectionStateRef.current;
@@ -477,6 +518,14 @@ export function App({
         terminalRef={terminalFrameRef}
       />
 
+      {!PUBLIC_LIVE_DEMO && (
+        <WatchlistImport
+          open={watchlistImportOpen}
+          onOpenChange={handleWatchlistImportOpenChange}
+          onApply={handleWatchlistImport}
+        />
+      )}
+
       {cs === "connected" && researchStatus && (
         <div
           className={`research-beacon research-beacon-${researchStatus.tone}`}
@@ -511,6 +560,19 @@ export function App({
             )}
           </div>
         </div>
+      )}
+
+      {/* Importer trigger — top-right corner of the terminal chrome. */}
+      {!PUBLIC_LIVE_DEMO && (
+        <button
+          type="button"
+          className="watchlist-import-trigger"
+          disabled={cs !== "connected" || Boolean(selectReq) || evidenceOpen || isClosedRef.current}
+          onClick={() => handleWatchlistImportOpenChange(true)}
+          title="Import a watchlist from a screenshot"
+        >
+          <span aria-hidden="true">+</span> IMPORTER
+        </button>
       )}
 
       {/* Status line (container retained as the positioning context for the

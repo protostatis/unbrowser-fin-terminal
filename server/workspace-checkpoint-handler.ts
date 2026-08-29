@@ -13,6 +13,7 @@
  * Feature-flagged with FINANCIAL_WORKSPACE_CHECKPOINTS=1.
  */
 
+import { timingSafeEqual } from "node:crypto";
 import type { Request, Response } from "express";
 import express from "express";
 import {
@@ -89,7 +90,7 @@ export function createWorkspaceCheckpointExportHandler(
     const expectedBuf = Buffer.from(expectedToken);
     if (
       suppliedBuf.length !== expectedBuf.length
-      || !suppliedBuf.equals(expectedBuf)
+      || !timingSafeEqual(suppliedBuf, expectedBuf)
     ) {
       response.status(401).json({ error: "unauthorized" });
       return;

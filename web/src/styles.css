@@ -217,6 +217,359 @@ strong {
   pointer-events: none;
 }
 
+/* ── Screenshot watchlist import ─────────────────────────────────────────── */
+
+.watchlist-import-trigger {
+  /* Anchored to the top-right corner of the terminal chrome. The center
+     research beacon reserves right-side space so it never underlaps this. */
+  position: absolute;
+  top: max(5px, env(safe-area-inset-top));
+  right: max(8px, env(safe-area-inset-right));
+  z-index: 58;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 20px;
+  padding: 2px 8px;
+  color: #58a6ff;
+  background: #0d1117;
+  border: 1px solid #30363d;
+  border-left-color: #58a6ff;
+  border-radius: 3px;
+  font: inherit;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  cursor: pointer;
+  pointer-events: auto;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+
+.watchlist-import-trigger:hover,
+.watchlist-import-trigger:focus-visible {
+  color: #c9d1d9;
+  border-color: #58a6ff;
+  background: #101826;
+}
+
+.watchlist-import-trigger:focus-visible,
+.watchlist-import-close:focus-visible,
+.watchlist-import-file-button:focus-visible,
+.watchlist-import-add:focus-visible,
+.watchlist-import-replace:focus-visible,
+.watchlist-import-symbol:focus-visible {
+  outline: 2px solid #58a6ff;
+  outline-offset: 2px;
+}
+
+.watchlist-import-trigger:disabled {
+  color: #6e7681;
+  border-color: #30363d;
+  cursor: not-allowed;
+}
+
+.watchlist-import-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 250;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+  background:
+    linear-gradient(90deg, transparent 49.8%, #58a6ff0d 50%, transparent 50.2%),
+    rgba(3, 6, 10, 0.76);
+  backdrop-filter: blur(3px);
+}
+
+.watchlist-import-modal {
+  width: min(680px, 100%);
+  max-height: min(760px, calc(100dvh - 36px));
+  overflow: auto;
+  padding: 20px;
+  color: #c9d1d9;
+  background: #0d1117;
+  border: 1px solid #30363d;
+  border-top: 3px solid #58a6ff;
+  border-radius: 5px;
+  box-shadow: 0 20px 70px #000c;
+}
+
+.watchlist-import-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.watchlist-import-kicker {
+  margin-bottom: 4px;
+  color: #58a6ff;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.13em;
+}
+
+.watchlist-import-header h2 {
+  margin: 0;
+  color: #f0f6fc;
+  font: inherit;
+  font-size: 17px;
+  font-weight: 700;
+}
+
+.watchlist-import-close {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  color: #8b949e;
+  background: transparent;
+  border: 1px solid #30363d;
+  border-radius: 3px;
+  font: inherit;
+  line-height: 1;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+.watchlist-import-close:hover {
+  color: #f0f6fc;
+  border-color: #f85149;
+}
+
+.watchlist-import-intro,
+.watchlist-import-note,
+.watchlist-import-rejected {
+  margin: 14px 0 0;
+  color: #8b949e;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.watchlist-import-file-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.watchlist-import-file-button {
+  width: 100%;
+  margin-top: 16px;
+  padding: 13px 16px;
+  color: #c9d1d9;
+  background: #101826;
+  border: 1px dashed #58a6ff88;
+  border-radius: 3px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+.watchlist-import-file-button:hover:not(:disabled) {
+  color: #f0f6fc;
+  background: #142033;
+  border-style: solid;
+}
+
+.watchlist-import-file-button:disabled {
+  color: #8b949e;
+  cursor: wait;
+}
+
+.watchlist-import-error {
+  margin-top: 14px;
+  padding: 9px 10px;
+  color: #ff7b72;
+  background: #2d1010;
+  border-left: 3px solid #f85149;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.watchlist-import-review {
+  margin-top: 18px;
+  border-top: 1px solid #30363d;
+}
+
+.watchlist-import-review-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 0 8px;
+  color: #c9d1d9;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+}
+
+.watchlist-import-review-heading span {
+  color: #8b949e;
+  font-size: 10px;
+  letter-spacing: 0;
+}
+
+.watchlist-import-candidates {
+  overflow: hidden;
+  border: 1px solid #30363d;
+  border-radius: 3px;
+}
+
+.watchlist-import-candidate {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) 122px;
+  align-items: center;
+  gap: 9px;
+  min-height: 48px;
+  padding: 7px 9px;
+  background: #0b0e14;
+  border-bottom: 1px solid #21262d;
+}
+
+.watchlist-import-candidate:last-child {
+  border-bottom: 0;
+}
+
+.watchlist-import-candidate:focus-within {
+  background: #101826;
+}
+
+.watchlist-import-candidate input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  accent-color: #58a6ff;
+  touch-action: manipulation;
+}
+
+.watchlist-import-candidate-meta {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  color: #8b949e;
+  font-size: 10px;
+}
+
+.watchlist-import-candidate-name {
+  overflow: hidden;
+  color: #c9d1d9;
+  font-size: 12px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.watchlist-import-symbol {
+  min-width: 0;
+  padding: 6px 7px;
+  color: #58a6ff;
+  background: #010409;
+  border: 1px solid #30363d;
+  border-radius: 2px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  touch-action: manipulation;
+}
+
+.watchlist-import-symbol[aria-invalid="true"] {
+  color: #ff7b72;
+  border-color: #f85149;
+}
+
+.watchlist-import-rejected {
+  margin-top: 8px;
+  color: #d29922;
+}
+
+.watchlist-import-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.watchlist-import-add,
+.watchlist-import-replace {
+  min-height: 32px;
+  padding: 0 12px;
+  border: 1px solid #30363d;
+  border-radius: 3px;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+.watchlist-import-add {
+  color: #0b0e14;
+  background: #58a6ff;
+  border-color: #58a6ff;
+}
+
+.watchlist-import-add:hover {
+  background: #79c0ff;
+  border-color: #79c0ff;
+}
+
+.watchlist-import-replace {
+  color: #d29922;
+  background: transparent;
+  border-color: #d2992288;
+}
+
+.watchlist-import-replace:hover {
+  color: #f0f6fc;
+  background: #2d2410;
+  border-color: #d29922;
+}
+
+.watchlist-import-close:disabled,
+.watchlist-import-add:disabled,
+.watchlist-import-replace:disabled {
+  opacity: 0.58;
+  cursor: wait;
+}
+
+@media (max-width: 520px) {
+  .watchlist-import-backdrop {
+    padding: 8px;
+  }
+
+  .watchlist-import-modal {
+    max-height: calc(100dvh - 16px);
+    padding: 16px;
+  }
+
+  .watchlist-import-review-heading {
+    display: grid;
+  }
+
+  .watchlist-import-candidate {
+    grid-template-columns: 18px minmax(0, 1fr);
+  }
+
+  .watchlist-import-symbol {
+    grid-column: 2;
+  }
+
+  .watchlist-import-actions {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+}
+
 .research-beacon {
   --research-color: #d29922;
   position: absolute;
@@ -226,7 +579,7 @@ strong {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  max-width: calc(100% - 250px);
+  max-width: calc(100% - 320px);
   min-height: 30px;
   padding: 5px 9px;
   color: var(--research-color);
@@ -1149,7 +1502,8 @@ strong {
     align-items: flex-end;
     gap: 6px;
     position: absolute;
-    top: max(8px, env(safe-area-inset-top));
+    /* Sits below the top-right IMPORTER trigger (~24px tall). */
+    top: max(44px, calc(env(safe-area-inset-top) + 36px));
     right: max(8px, env(safe-area-inset-right));
     z-index: 56;
     max-width: 44vw;
@@ -1200,7 +1554,7 @@ strong {
 
   /* Keep the top-center research beacon clear of the top-right column. */
   .research-beacon {
-    max-width: calc(100% - 170px);
+    max-width: calc(100% - 200px);
   }
 }
 
@@ -1626,7 +1980,7 @@ strong {
      re-show it here to avoid losing agent feedback when the deck is gone. */
   .research-beacon {
     display: inline-flex;
-    max-width: calc(100% - 16px);
+    max-width: calc(100% - 210px);
   }
 
   .mobile-controls {
@@ -1641,6 +1995,18 @@ strong {
 
   .terminal-frame {
     touch-action: pan-y pinch-zoom;
+  }
+
+  /* Larger touch targets for the screenshot-import review actions on phones. */
+  .watchlist-import-add,
+  .watchlist-import-replace {
+    min-height: 40px;
+    padding-inline: 16px;
+  }
+
+  .watchlist-import-close {
+    width: 32px;
+    height: 32px;
   }
 }
 

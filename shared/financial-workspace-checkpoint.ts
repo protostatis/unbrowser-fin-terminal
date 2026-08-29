@@ -13,6 +13,8 @@
  * @version 1 — first deployment; additive fields allowed in future 1.x
  */
 
+import { WATCHLIST_MAX_SYMBOLS } from "./watchlist-symbols.js";
+
 /** Maximum serialized checkpoint size (bytes). Reject larger payloads. */
 export const CHECKPOINT_MAX_BYTES = 512 * 1024; // 512 KB
 
@@ -38,7 +40,7 @@ export const CHECKPOINT_MAX_CANVASES = 50;
 export const CHECKPOINT_MAX_PACKETS_PER_CANVAS = 200;
 
 /** Maximum watchlist symbols. */
-export const CHECKPOINT_MAX_WATCHLIST = 500;
+export const CHECKPOINT_MAX_WATCHLIST = WATCHLIST_MAX_SYMBOLS;
 
 /** Bounded string lengths for checkpoint fields. */
 const MAX_SYMBOL_LENGTH = 32;
@@ -448,12 +450,18 @@ function validateContext(value: unknown): value is CheckpointContext {
 function validateInterruptedWork(value: unknown): value is CheckpointInterruptedWork {
   if (!isRecord(value)) return false;
   if (value.activeResearch !== undefined && value.activeResearch !== null) {
+    if (!isRecord(value.activeResearch)) return false;
     const ar = value.activeResearch as Record<string, unknown>;
-    if (ar.symbol !== undefined && !isSafeString(ar.symbol, MAX_SYMBOL_LENGTH)) return false;
-    if (ar.contextLabel !== undefined && !isSafeString(ar.contextLabel, 128, true)) return false;
-    if (ar.activity !== undefined && !isSafeString(ar.activity, 64)) return false;
-    if (ar.phase !== undefined && !isSafeString(ar.phase, 64)) return false;
+    if (ar.symbol !== undefined && (!isSafeString(ar.symbol, MAX_SYMBOL_LENGTH) || containsSecretCanary(ar.symbol))) return false;
+    if (ar.contextLabel !== undefined && (!isSafeString(ar.contextLabel, 128, true) || containsSecretCanary(ar.contextLabel))) return false;
+    if (ar.activity !== undefined && (!isSafeString(ar.activity, 64) || containsSecretCanary(ar.activity))) return false;
+    if (ar.phase !== undefined && (!isSafeString(ar.phase, 64) || containsSecretCanary(ar.phase))) return false;
     if (ar.startedAt !== undefined && !isInteger(ar.startedAt, 0, 9_000_000_000_000)) return false;
+    // Fail closed on secret-like content in any string, including undeclared
+    // fields, matching the canvas validator's whole-object scan.
+    for (const v of Object.values(ar)) {
+      if (typeof v === "string" && containsSecretCanary(v)) return false;
+    }
   }
   return true;
 }
@@ -579,8 +587,8 @@ export function serializeCheckpoint(checkpoint: FinancialTerminalCheckpoint): st
       ...(checkpoint.context.chartScope ? { chartScope: checkpoint.context.chartScope } : {}),
       ...(checkpoint.context.pane ? { pane: checkpoint.context.pane } : {}),
       ...(checkpoint.context.searchQuery ? { searchQuery: checkpoint.context.searchQuery } : {}),
-      ...(checkpoint.context.watchlist?.length
-        ? { watchlist: checkpoint.context.watchlist.slice(0, CHECKPOINT_MAX_WATCHLIST) }
+       ...(checkpoint.context.watchlist !== undefined
+         ? { watchlist: checkpoint.context.watchlist.slice(0, CHECKPOINT_MAX_WATCHLIST) }
         : {}),
     },
     canvases: checkpoint.canvases.slice(0, CHECKPOINT_MAX_CANVASES).map((canvas) => ({
@@ -602,7 +610,33 @@ export function serializeCheckpoint(checkpoint: FinancialTerminalCheckpoint): st
         extractedAt: packet.extractedAt,
       })),
     })),
-    ...(checkpoint.interruptedWork ? { interruptedWork: checkpoint.interruptedWork } : {}),
+    ...(checkpoint.interruptedWork
+      ? {
+          interruptedWork: {
+            ...(checkpoint.interruptedWork.activeResearch
+              ? {
+                  activeResearch: {
+                    ...(checkpoint.interruptedWork.activeResearch.symbol
+                      ? { symbol: checkpoint.interruptedWork.activeResearch.symbol }
+                      : {}),
+                    ...(checkpoint.interruptedWork.activeResearch.contextLabel
+                      ? { contextLabel: checkpoint.interruptedWork.activeResearch.contextLabel }
+                      : {}),
+                    ...(checkpoint.interruptedWork.activeResearch.activity
+                      ? { activity: checkpoint.interruptedWork.activeResearch.activity }
+                      : {}),
+                    ...(checkpoint.interruptedWork.activeResearch.phase
+                      ? { phase: checkpoint.interruptedWork.activeResearch.phase }
+                      : {}),
+                    ...(checkpoint.interruptedWork.activeResearch.startedAt !== undefined
+                      ? { startedAt: checkpoint.interruptedWork.activeResearch.startedAt }
+                      : {}),
+                  },
+                }
+              : {}),
+          },
+        }
+      : {}),
     continuationSummary: checkpoint.continuationSummary,
   };
   return JSON.stringify(clean);
@@ -639,7 +673,7 @@ export function sanitizeCheckpoint(
   }
   if (context.watchlist !== undefined) {
     const watchlist = context.watchlist.filter((symbol) => !containsSecretCanary(symbol));
-    if (watchlist.length > 0) context.watchlist = watchlist;
+    if (watchlist.length > 0 || context.watchlist.length === 0) context.watchlist = watchlist;
     else delete context.watchlist;
   }
 

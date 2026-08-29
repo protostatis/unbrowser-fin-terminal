@@ -71,8 +71,8 @@ export interface CheckpointWorkerState {
   research?: CheckpointResearchState;
   researchQueue?: CheckpointResearchState[];
   dossier?: CheckpointWorkerDossier;
-  /** WATCH-screen symbol list (authoritative watchlist). */
-  available?: string[];
+  /** Canonical ordered watchlist, independent of the visible screen rows. */
+  watchlist?: string[];
 }
 
 // ── Server-side event log (authoritative, not browser-sourced) ──────────────
@@ -190,11 +190,13 @@ function normalizeContext(state: CheckpointWorkerState): CheckpointContext {
   if (state.chartScope && CHART_SCOPES.has(state.chartScope)) context.chartScope = state.chartScope;
   const searchQuery = bounded(state.searchQuery, 64, true);
   if (searchQuery !== undefined) context.searchQuery = searchQuery;
-  if (Array.isArray(state.available) && state.available.length > 0) {
-    const watchlist = state.available
+  if (Array.isArray(state.watchlist)) {
+    const watchlist = state.watchlist
       .filter((s): s is string => typeof s === "string" && s.length > 0 && s.length <= 32)
       .slice(0, CHECKPOINT_MAX_WATCHLIST);
-    if (watchlist.length > 0) context.watchlist = watchlist;
+    // An explicitly empty canonical list is meaningful: restoring it must not
+    // silently revive the default symbols in a new workspace.
+    context.watchlist = watchlist;
   }
   return context;
 }
