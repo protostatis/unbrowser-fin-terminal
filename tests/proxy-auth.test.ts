@@ -3,6 +3,7 @@ import type { IncomingMessage } from "node:http";
 import test from "node:test";
 import {
   matchesProxyToken,
+  matchesPrivateWorkspacePrincipal,
   normalizePrincipal,
   PrincipalLease,
   singleHeader,
@@ -36,4 +37,17 @@ test("principal values are constrained and pinned for the process lifetime", () 
   assert.equal(lease.claim("user-a"), true);
   assert.equal(lease.claim("user-b"), false);
   assert.equal(lease.assignedPrincipal, "user-a");
+});
+
+test("private workspaces accept only their provisioned account principal", () => {
+  assert.equal(
+    matchesPrivateWorkspacePrincipal("account:workspace-a", "workspace-a", true),
+    true,
+  );
+  assert.equal(
+    matchesPrivateWorkspacePrincipal("account:workspace-b", "workspace-a", true),
+    false,
+  );
+  assert.equal(matchesPrivateWorkspacePrincipal("local", "workspace-a", false), true);
+  assert.equal(matchesPrivateWorkspacePrincipal("account:workspace-a", "workspace-a", false), false);
 });

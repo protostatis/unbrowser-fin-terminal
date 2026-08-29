@@ -19,6 +19,7 @@ import type {
   ExtensionUIContext,
   ExtensionCommandContextActions,
 } from "@earendil-works/pi-coding-agent";
+import type { WatchlistUpdate, WatchlistUpdateMode } from "../shared/watchlist-symbols.js";
 import webTheme from "./theme.js";
 
 /** The runtime shape of a MarketTerminal / MarketHub panel instance. */
@@ -26,6 +27,7 @@ export type Panel = {
   render(width: number): string[];
   handleInput(data: string): void;
   debugState?(): unknown;
+  applyWatchlist?(symbols: readonly string[], mode: WatchlistUpdateMode): WatchlistUpdate;
 };
 
 export interface WebUiHooks {

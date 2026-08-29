@@ -16,6 +16,13 @@ import {
 } from "../../shared/unbrowser-mcp.js";
 import { sanitizePublicUrl } from "../../shared/public-url.js";
 import {
+	WATCHLIST_MAX_SYMBOLS,
+	normalizeWatchlistSymbol,
+	updateWatchlistSymbols,
+	type WatchlistUpdate,
+	type WatchlistUpdateMode,
+} from "../../shared/watchlist-symbols.js";
+import {
 	filterKnownBotWallSources,
 } from "../../shared/research-source-policy.js";
 import {
@@ -788,10 +795,12 @@ const MOVER_LIMIT = 100;
 const MOVER_MOVEMENT_WEIGHT = 0.65;
 const MOVER_VOLUME_WEIGHT = 0.35;
 const QUOTE_FETCH_CONCURRENCY = 8;
+const QUOTE_REQUEST_TIMEOUT_MS = 12_000;
 const SNAPSHOT_STALE_AFTER_MS = 5 * 60_000;
 const MAX_SETTLED_RESEARCH_JOBS = 50;
 const DEFAULT_WATCHLIST = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "TSLA", "JPM", "XLE", "TLT", "GLD", "BTC-USD"] as const;
 const MARKET_SCREEN_NAMES = ["MARKET", "SIGNALS", "EVENTS", "MOVERS", "WATCH"] as const;
+const WATCHLIST_SESSION_CUSTOM_TYPE = "market-watchlist";
 const MARKET_SCREEN = {
 	market: 0,
 	signals: 1,
@@ -826,6 +835,40 @@ function readPanicRadarEnabled(): boolean {
 	return true;
 }
 
+function resetWatchlist(): void {
+	// Open panels retain this array by reference, so session resets mutate it.
+	watchlist.splice(0, watchlist.length, ...DEFAULT_WATCHLIST);
+}
+
+/** Restore a bounded snapshot without letting malformed entries erase defaults. */
+function restoreWatchlistSnapshot(value: unknown): boolean {
+	if (!Array.isArray(value)) return false;
+	const symbols = value
+		.filter((symbol): symbol is string => typeof symbol === "string")
+		.map((symbol) => normalizeSymbol(symbol))
+		.filter((symbol): symbol is string => Boolean(symbol))
+		.slice(0, WATCHLIST_MAX_SYMBOLS);
+	if (value.length > 0 && symbols.length === 0) return false;
+	const update = updateWatchlistSymbols([], symbols, "replace", WATCHLIST_MAX_SYMBOLS);
+	watchlist.splice(0, watchlist.length, ...update.symbols);
+	return true;
+}
+
+function applyWatchlistImport(
+	viewWatchlist: string[],
+	symbols: readonly string[],
+	mode: WatchlistUpdateMode,
+): WatchlistUpdate {
+	const update = updateWatchlistSymbols(viewWatchlist, symbols, mode, WATCHLIST_MAX_SYMBOLS);
+	viewWatchlist.splice(0, viewWatchlist.length, ...update.symbols);
+	return update;
+}
+
+function watchlistImportStatus(update: WatchlistUpdate, mode: WatchlistUpdateMode): string {
+	const action = mode === "replace" ? "WATCHLIST REPLACED" : "WATCHLIST UPDATED";
+	const skipped = update.invalid + update.duplicates + update.truncated;
+	return `${action} · ${update.added} ADDED · ${update.symbols.length} ON WATCH${skipped ? ` · ${skipped} SKIPPED` : ""}`;
+}
 function percentileScore(values: number[], value: number): number {
 	if (values.length <= 1) return 1;
 	let below = 0;
@@ -1087,9 +1130,7 @@ const TICKER_SPLIT_MIN_ROWS = 26;
 const TICKER_SPLIT_LEFT_RATIO = 0.45;
 
 function normalizeSymbol(value: string): string | undefined {
-	const symbol = value.trim().toUpperCase();
-	// Standard tickers (AAPL), caret-prefixed indices (^GSPC), Chinese indices (000001.SS)
-	return /^(\^?[A-Z][A-Z0-9.\-]{0,9}|[0-9]{6}\.(SS|SZ))$/.test(symbol) ? symbol : undefined;
+	return normalizeWatchlistSymbol(value);
 }
 
 // ── Research cache pre-warming ───────────────────────────────────────────
@@ -2184,7 +2225,7 @@ export function mockMondayChartPayload(symbol: string): unknown {
 	};
 }
 
-async function fetchQuote(symbol: string, scope: ChartScope = DEFAULT_CHART_SCOPE, signal?: AbortSignal): Promise<Quote> {
+async function fetchQuote(symbol: string, scope: ChartScope = DEFAULT_CHART_SCOPE, signal?: AbortSignal, timeoutMs = QUOTE_REQUEST_TIMEOUT_MS): Promise<Quote> {
 	const cfg = CHART_SCOPE_CONFIGS[scope];
 	if (readMarketMockMonday() && scope === "day") {
 		return parseChartPayloadToQuote(symbol, mockMondayChartPayload(symbol), { ...cfg, chartScope: scope });
@@ -2194,9 +2235,11 @@ async function fetchQuote(symbol: string, scope: ChartScope = DEFAULT_CHART_SCOP
 	url.searchParams.set("interval", cfg.yahooInterval);
 	url.searchParams.set("includePrePost", String(cfg.includePrePost));
 
+	const timeout = AbortSignal.timeout(timeoutMs);
+	const requestSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
 	const response = await fetch(url, {
 		headers: { accept: "application/json", "user-agent": "signal-terminal-mvp/0.1" },
-		signal,
+		signal: requestSignal,
 	});
 	if (!response.ok) throw new Error(`quote request returned HTTP ${response.status}`);
 
@@ -2425,15 +2468,24 @@ async function unbrowserHeadlines(pi: ExtensionAPI, query: string, signal?: Abor
 	};
 }
 
-async function fetchQuotes(symbols: readonly string[], scope: ChartScope = DEFAULT_CHART_SCOPE, signal?: AbortSignal): Promise<Quote[]> {
+export async function fetchQuotes(
+	symbols: readonly string[],
+	scope: ChartScope = DEFAULT_CHART_SCOPE,
+	signal?: AbortSignal,
+	timeoutMs = QUOTE_REQUEST_TIMEOUT_MS,
+): Promise<Quote[]> {
 	const results: Array<Quote | undefined> = Array.from({ length: symbols.length });
 	let cursor = 0;
 	const workerCount = Math.min(QUOTE_FETCH_CONCURRENCY, symbols.length);
+	// One deadline bounds the entire board/watchlist refresh, rather than
+	// allowing each worker's sequential requests to consume a full timeout.
+	const refreshTimeout = AbortSignal.timeout(timeoutMs);
+	const refreshSignal = signal ? AbortSignal.any([signal, refreshTimeout]) : refreshTimeout;
 	await Promise.all(Array.from({ length: workerCount }, async () => {
-		while (cursor < symbols.length && !signal?.aborted) {
+		while (cursor < symbols.length && !refreshSignal.aborted) {
 			const index = cursor++;
 			try {
-				results[index] = await fetchQuote(symbols[index]!, scope, signal);
+				results[index] = await fetchQuote(symbols[index]!, scope, refreshSignal, timeoutMs);
 			} catch {
 				// A partial universe is still useful; individual quote failures are
 				// omitted and retried on the next market refresh.
@@ -4604,6 +4656,7 @@ class MarketTerminal {
 		private readonly tickerNavigation?: TickerNavigation,
 		private readonly returnState?: MarketHubNavigationState,
 		initialTickerLayout?: TickerLayout,
+		private readonly persistWatchlist?: () => void,
 	) {
 		this.tab = Math.max(0, Math.min(1, initialTab));
 		if (initialTickerLayout) this.selectTickerLayout(initialTickerLayout);
@@ -4698,6 +4751,14 @@ class MarketTerminal {
 		this.status = status;
 	}
 
+	applyWatchlist(symbols: readonly string[], mode: WatchlistUpdateMode): WatchlistUpdate {
+		const update = applyWatchlistImport(this.viewWatchlist, symbols, mode);
+		this.persistWatchlist?.();
+		this.status = watchlistImportStatus(update, mode);
+		this.tui.requestRender();
+		return update;
+	}
+
 	private isWatched(): boolean {
 		return this.viewWatchlist.includes(this.symbol);
 	}
@@ -4706,10 +4767,14 @@ class MarketTerminal {
 		const index = this.viewWatchlist.indexOf(this.symbol);
 		if (index >= 0) {
 			this.viewWatchlist.splice(index, 1);
+			this.persistWatchlist?.();
 			this.status = `${this.symbol} REMOVED FROM WATCH`;
 		} else {
-			this.viewWatchlist.push(this.symbol);
-			this.status = `${this.symbol} ADDED TO WATCH · REOPEN MARKET MAP TO VIEW`;
+			const update = applyWatchlistImport(this.viewWatchlist, [this.symbol], "merge");
+			if (update.added > 0) this.persistWatchlist?.();
+			this.status = update.added > 0
+				? `${this.symbol} ADDED TO WATCH · REOPEN MARKET MAP TO VIEW`
+				: `WATCHLIST FULL · ${WATCHLIST_MAX_SYMBOLS} SYMBOL LIMIT`;
 		}
 	}
 
@@ -5808,6 +5873,7 @@ class MarketHub {
 		private readonly researchActions?: ResearchActions,
 		initialResearch?: ResearchJob,
 		initialNavigation?: MarketHubNavigationState,
+		private readonly persistWatchlist?: () => void,
 	) {
 		this.snapshot = initialSnapshot;
 		this.screen = Math.max(0, Math.min(MARKET_SCREEN_NAMES.length - 1, initialScreen));
@@ -6077,6 +6143,16 @@ class MarketHub {
 
 	setStatus(status: string): void {
 		this.status = status;
+	}
+
+	applyWatchlist(symbols: readonly string[], mode: WatchlistUpdateMode): WatchlistUpdate {
+		const update = applyWatchlistImport(this.viewWatchlist, symbols, mode);
+		this.persistWatchlist?.();
+		this.clampSelection();
+		this.status = watchlistImportStatus(update, mode);
+		this.tui.requestRender();
+		this.startRefresh();
+		return update;
 	}
 
 	private entries(): Array<{ type: "quote"; quote: Quote } | { type: "headline"; headline: Headline } | { type: "event"; lane: EventLane }> {
@@ -6687,11 +6763,15 @@ class MarketHub {
 				const idx = this.viewWatchlist.indexOf(sym);
 				if (idx >= 0) {
 					this.viewWatchlist.splice(idx, 1);
+					this.persistWatchlist?.();
 					this.clampSelection();
 					this.status = `${sym} REMOVED FROM WATCH`;
 				} else {
-					this.viewWatchlist.push(sym);
-					this.status = `${sym} ADDED TO WATCH`;
+					const update = applyWatchlistImport(this.viewWatchlist, [sym], "merge");
+					if (update.added > 0) this.persistWatchlist?.();
+					this.status = update.added > 0
+						? `${sym} ADDED TO WATCH`
+						: `WATCHLIST FULL · ${WATCHLIST_MAX_SYMBOLS} SYMBOL LIMIT`;
 				}
 			}
 		}
@@ -7453,6 +7533,7 @@ class MarketHub {
 			} : undefined,
 			selected: entry?.type === "quote" ? entry.quote.symbol : entry?.type === "headline" ? entry.headline.title : entry?.type === "event" ? entry.lane.title : undefined,
 			watched: entry?.type === "quote" ? this.viewWatchlist.includes(entry.quote.symbol) : undefined,
+			watchlist: [...this.viewWatchlist],
 			available: this.entries().map((item) => item.type === "quote" ? item.quote.symbol : item.type === "headline" ? item.headline.title : item.lane.title),
 			chartScope: this.chartScope,
 			signalsFocus: this.screen === MARKET_SCREEN.signals ? this.signalsFocus : undefined,
@@ -8211,6 +8292,19 @@ function restoreSessionCanvases(ctx: ExtensionContext): boolean {
 	return archiveChanged;
 }
 
+/** Restore the latest session-local watchlist snapshot on the active branch. */
+function restoreSessionWatchlist(ctx: ExtensionContext): boolean {
+	let restored = false;
+	for (const entry of ctx.sessionManager.getBranch()) {
+		if (entry.type !== "custom" || entry.customType !== WATCHLIST_SESSION_CUSTOM_TYPE) continue;
+		const data = entry.data && typeof entry.data === "object" && !Array.isArray(entry.data)
+			? entry.data as Record<string, unknown>
+			: undefined;
+		if (restoreWatchlistSnapshot(data?.symbols)) restored = true;
+	}
+	return restored;
+}
+
 // ── Private-workspace checkpoint import ──────────────────────────────────────
 
 /** Custom-entry type carrying a validated workspace checkpoint. */
@@ -8310,18 +8404,7 @@ function restoreCheckpointCanvases(ctx: ExtensionContext): boolean {
 		const scope = normalizeChartScope(context?.chartScope);
 		const createdAt = typeof checkpoint.createdAt === "number" ? checkpoint.createdAt : Date.now();
 
-		const watchlistRaw = Array.isArray(context?.watchlist) ? context.watchlist : [];
-		if (watchlistRaw.length > 0) {
-			const symbols = watchlistRaw
-				.filter((s): s is string => typeof s === "string")
-				.map((s) => normalizeSymbol(s))
-				.filter((s): s is string => Boolean(s))
-				.slice(0, 500);
-			if (symbols.length > 0) {
-				watchlist = symbols;
-				restored = true;
-			}
-		}
+		if (restoreWatchlistSnapshot(context?.watchlist)) restored = true;
 
 		const canvasesRaw = Array.isArray(checkpoint.canvases) ? checkpoint.canvases : [];
 		for (const canvasRaw of canvasesRaw.slice(0, 50)) {
@@ -8348,6 +8431,7 @@ async function rebuildCanvasState(ctx: ExtensionContext): Promise<void> {
 		if (ctx.mode === "tui") ctx.ui.notify(`Research archive unavailable: ${error instanceof Error ? error.message : String(error)}`, "warning");
 	}
 	const archiveChanged = restoreSessionCanvases(ctx);
+	restoreSessionWatchlist(ctx);
 	const checkpointRestored = restoreCheckpointCanvases(ctx);
 	if ((archiveChanged || checkpointRestored) && archivePath) {
 		try {
@@ -8372,6 +8456,7 @@ async function openMarketPanel(
 	returnStatus?: string,
 	initialTab = 0,
 	researchActions?: ResearchActions,
+	onWatchlistChange?: () => void,
 	initialArchivedCanvas?: Canvas,
 	initialScope: ChartScope = DEFAULT_CHART_SCOPE,
 	tickerNavigation?: TickerNavigation,
@@ -8398,7 +8483,7 @@ async function openMarketPanel(
 	let terminal: MarketTerminal | undefined;
 	const result = await ctx.ui.custom<TerminalResult>((tui, theme, _keybindings, done) => {
 		terminal = new MarketTerminal(
-			tui, theme, symbol, quote, (s, signal) => fetchQuote(symbol, s, signal), done, initialTab, initialLiveCanvas, watchlist, researchActions, initialResearch, scope, tickerNavigation, returnState, initialTickerLayout,
+			tui, theme, symbol, quote, (s, signal) => fetchQuote(symbol, s, signal), done, initialTab, initialLiveCanvas, watchlist, researchActions, initialResearch, scope, tickerNavigation, returnState, initialTickerLayout, onWatchlistChange,
 		);
 		if (initialError) terminal.setStatus(`Initial quote unavailable: ${initialError}`);
 		else if (returnStatus) terminal.setStatus(returnStatus);
@@ -8423,6 +8508,7 @@ async function openMarketMap(
 	returnStatus?: string,
 	initialScreen = 0,
 	researchActions?: ResearchActions,
+	onWatchlistChange?: () => void,
 	initialArchivedCanvas?: Canvas,
 	initialNavigation?: MarketHubNavigationState,
 ): Promise<TerminalResult | undefined> {
@@ -8437,7 +8523,7 @@ async function openMarketMap(
 	let terminal: MarketHub | undefined;
 	const result = await ctx.ui.custom<TerminalResult>((tui, theme, _keybindings, done) => {
 		terminal = new MarketHub(
-			tui, theme, snapshot, (s, signal) => fetchMarketSnapshot(pi, s, signal), done, initialScreen, initialLiveCanvas, watchlist, researchActions, initialResearch, initialNavigation,
+			tui, theme, snapshot, (s, signal) => fetchMarketSnapshot(pi, s, signal), done, initialScreen, initialLiveCanvas, watchlist, researchActions, initialResearch, initialNavigation, onWatchlistChange,
 		);
 		if (returnStatus) terminal.setStatus(returnStatus);
 		else terminal.setStatus("LOADING MARKET MAP…");
@@ -8842,6 +8928,10 @@ function strictResultLine(payload: {
 }
 
 export default function (pi: ExtensionAPI) {
+	const persistWatchlist = () => {
+		pi.appendEntry(WATCHLIST_SESSION_CUSTOM_TYPE, { symbols: [...watchlist] });
+	};
+
 	const researchPrompt = (job: ResearchJob): string => {
 		if (job.pairedTarget) {
 			return buildResearchPromptPaired(
@@ -9785,6 +9875,9 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const restoreSessionState = async (ctx: ExtensionContext, reason?: SessionStartEvent["reason"]): Promise<void> => {
+		// Every start/tree transition begins from defaults, then restores only the
+		// active branch's session snapshot or workspace checkpoint below.
+		resetWatchlist();
 		resetResearchJobs();
 		if (isResearchWorkerProcess) return;
 		await ensureArchiveLoaded(ctx, true);
@@ -10663,6 +10756,7 @@ export default function (pi: ExtensionAPI) {
 					returnStatus,
 					initialTab,
 					actions,
+					persistWatchlist,
 					next.archivedCanvas,
 					scope,
 					next.tickerNavigation,
@@ -10674,7 +10768,7 @@ export default function (pi: ExtensionAPI) {
 			if (next.action === "back") {
 				const scope = next.chartScope ?? returnState.chartScope;
 				returnState = { ...returnState, chartScope: scope };
-				next = await openMarketMap(pi, ctx, "RETURNED FROM TICKER", returnState.screen, actions, undefined, returnState);
+				next = await openMarketMap(pi, ctx, "RETURNED FROM TICKER", returnState.screen, actions, persistWatchlist, undefined, returnState);
 				continue;
 			}
 			actions.start(next);
@@ -10809,7 +10903,7 @@ export default function (pi: ExtensionAPI) {
 			const actions = researchActions(ctx);
 			const requested = args.trim();
 			if (!requested) {
-				await handleTerminalResult(await openMarketMap(pi, ctx, undefined, 0, actions), ctx, actions);
+				await handleTerminalResult(await openMarketMap(pi, ctx, undefined, 0, actions, persistWatchlist), ctx, actions);
 				return;
 			}
 			const symbol = normalizeSymbol(requested.split(/\s+/)[0] || "");
@@ -10818,7 +10912,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			const watchHint = watchlist.includes(symbol) ? `${symbol} IS ON WATCH · E REMOVES` : `${symbol} OPEN · PRESS E TO ADD TO WATCH`;
-			await handleTerminalResult(await openMarketPanel(ctx, symbol, watchHint, 0, actions), ctx, actions);
+			await handleTerminalResult(await openMarketPanel(ctx, symbol, watchHint, 0, actions, persistWatchlist), ctx, actions);
 		},
 	});
 
@@ -10856,9 +10950,9 @@ export default function (pi: ExtensionAPI) {
 			const canvas = history[position]!.canvas;
 			const actions = researchActions(ctx);
 			if (symbol === "MARKET") {
-				await handleTerminalResult(await openMarketMap(pi, ctx, `ARCHIVE AS OF ${archiveAsOf(canvas)}`, isEventResearchKey(canvasResearchKey(canvas)) ? 2 : 1, actions, canvas), ctx, actions);
+				await handleTerminalResult(await openMarketMap(pi, ctx, `ARCHIVE AS OF ${archiveAsOf(canvas)}`, isEventResearchKey(canvasResearchKey(canvas)) ? 2 : 1, actions, persistWatchlist, canvas), ctx, actions);
 			} else {
-				await handleTerminalResult(await openMarketPanel(ctx, symbol, `ARCHIVE AS OF ${archiveAsOf(canvas)}`, 1, actions, canvas), ctx, actions);
+				await handleTerminalResult(await openMarketPanel(ctx, symbol, `ARCHIVE AS OF ${archiveAsOf(canvas)}`, 1, actions, persistWatchlist, canvas), ctx, actions);
 			}
 		},
 	});

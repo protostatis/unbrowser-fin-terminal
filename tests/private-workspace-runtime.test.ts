@@ -113,6 +113,45 @@ test("importCheckpointIntoFreshSession seeds a fresh session from a valid checkp
   assert.match(result.continuationSeed, /NKE/);
 });
 
+test("import strips undeclared and nested payload fields through the shared codec", () => {
+  const checkpoint = {
+    version: 1,
+    id: "fcp-e2e-strip",
+    source: { sessionId: "public-session-1", generation: 3 },
+    createdAt: 1_700_000_000_000,
+    expiresAt: 1_700_000_000_000 + 86_400_000,
+    eventLog: [],
+    canvases: [],
+    continuationSummary: "Continue from a saved checkpoint: NKE.",
+    extra: "top-level-secret",
+    context: {
+      symbol: "NKE",
+      undeclared: { api_key: "sk-nested-secret-123456" },
+    },
+    interruptedWork: {
+      activeResearch: {
+        symbol: "NKE",
+        phase: "running",
+        undeclared: { password: "nested-value" },
+      },
+    },
+  };
+  const result = importCheckpointIntoFreshSession({ checkpoint, cwd: process.cwd() });
+  assert.deepEqual(result.checkpoint.context, { symbol: "NKE" });
+  assert.equal(result.checkpoint.extra, undefined, "top-level undeclared field must be stripped");
+  assert.equal(
+    (result.checkpoint.interruptedWork as { activeResearch?: Record<string, unknown> } | undefined)?.activeResearch?.undeclared,
+    undefined,
+    "nested undeclared interrupted-work fields must be stripped",
+  );
+  const branch = result.sessionManager.getBranch();
+  const custom = branch.find((entry) => entry.type === "custom" && entry.customType === "financial-workspace-checkpoint");
+  assert.ok(custom, "custom checkpoint entry must exist in the fresh session");
+  const stored = custom.data as Record<string, unknown>;
+  assert.equal(stored.extra, undefined, "stored entry must not carry top-level undeclared fields");
+  assert.deepEqual(stored.context, { symbol: "NKE" }, "stored entry must carry only declared context fields");
+});
+
 // ---------------------------------------------------------------------------
 // Blocker 1/5 — TERMINAL_RUNTIME_MODE=private-workspace runtime mode contract
 // ---------------------------------------------------------------------------

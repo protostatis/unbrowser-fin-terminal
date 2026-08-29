@@ -74,6 +74,8 @@ export interface TerminalFrameState {
   status?: string;
   selectedIndex?: number;
   selected?: string;
+  /** Canonical ordered watchlist, independent of the current screen rows. */
+  watchlist?: string[];
   available?: string[];
   signalsFocus?: "headlines" | "story";
   eventsFocus?: "lanes" | "briefing";

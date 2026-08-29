@@ -17,8 +17,13 @@ import {
   recordServerCheckpointEvent,
   resetServerCheckpointEventLog,
   workerGenerationEpoch,
+  type CheckpointWorkerState,
 } from "../server/workspace-checkpoint-export.js";
-import { CHECKPOINT_EXPORT_PATH } from "../shared/financial-workspace-checkpoint.js";
+import {
+  CHECKPOINT_MAX_WATCHLIST,
+  CHECKPOINT_EXPORT_PATH,
+  serializeCheckpoint,
+} from "../shared/financial-workspace-checkpoint.js";
 
 const CONTROL_TOKEN = "test-control-token-0123456789012345678901";
 const WORKER_PROXY_TOKEN = "test-worker-proxy-token-01234567890123456";
@@ -46,7 +51,7 @@ function workerContext(): WorkerCheckpointExportContext {
       screen: "MARKET",
       symbol: "NKE",
       chartScope: "day",
-      available: ["NKE", "AAPL"],
+      watchlist: ["NKE", "AAPL"],
       research: { active: false, phase: "settled", outcome: "complete", symbol: "NKE" },
       dossier: {
         title: "NKE Retail Brief",
@@ -375,7 +380,7 @@ test("a canary in a watchlist entry is dropped while the clean symbols export", 
     state: {
       screen: "MARKET",
       symbol: "NKE",
-      available: ["NKE", "AAPL", "worker-a1b2c3d4-e5f6a7b8-c9d0e1f2-a3b4c5d6"],
+      watchlist: ["NKE", "AAPL", "worker-a1b2c3d4-e5f6a7b8-c9d0e1f2-a3b4c5d6"],
     },
     sessionId: "public-session-123",
     generation: 7,
@@ -395,15 +400,45 @@ test("the builder caps the event log, watchlist, and packets at the shared const
     state: {
       screen: "MARKET",
       symbol: "NKE",
-      available: Array.from({ length: 2_000 }, (_unused, index) => `SYM${index % 700}`),
+      watchlist: Array.from({ length: 2_000 }, (_unused, index) => `SYM${index % 700}`),
     },
     sessionId: "public-session-123",
     generation: 7,
     eventLog,
   });
   assert.ok(checkpoint.eventLog.length <= 1_000, "event log respects the shared cap");
-  assert.ok((checkpoint.context.watchlist?.length ?? 0) <= 500, "watchlist respects the shared cap");
+  assert.ok((checkpoint.context.watchlist?.length ?? 0) <= CHECKPOINT_MAX_WATCHLIST, "watchlist respects the shared cap");
   assert.ok(checkpoint.eventLog.length === 1_000);
+});
+
+test("the checkpoint exports the canonical watchlist, not the current screen rows", () => {
+  const checkpoint = buildAuthoritativeCheckpoint({
+    state: {
+      screen: "SIGNALS",
+      watchlist: ["BTC-USD", "ETH-USD"],
+      // Runtime frame state may still carry visible headline rows, but the
+      // checkpoint contract must ignore them.
+      available: ["Federal Reserve minutes", "Oil supply update"],
+    } as unknown as CheckpointWorkerState,
+    sessionId: "public-session-123",
+    generation: 7,
+    eventLog: createServerCheckpointEventLog(),
+  });
+
+  assert.deepEqual(checkpoint.context.watchlist, ["BTC-USD", "ETH-USD"]);
+});
+
+test("an explicitly empty canonical watchlist survives checkpoint serialization", () => {
+  const checkpoint = buildAuthoritativeCheckpoint({
+    state: { screen: "WATCH", watchlist: [] },
+    sessionId: "public-session-123",
+    generation: 7,
+    eventLog: createServerCheckpointEventLog(),
+  });
+
+  assert.deepEqual(checkpoint.context.watchlist, []);
+  const serialized = JSON.parse(serializeCheckpoint(checkpoint)) as { context?: { watchlist?: string[] } };
+  assert.deepEqual(serialized.context?.watchlist, []);
 });
 
 test("an aggregate checkpoint at the field caps still passes the byte gate or is rejected consistently", () => {

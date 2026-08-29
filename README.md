@@ -287,6 +287,35 @@ unavailable. Rows render a dominant `PRE-MKT`/`POST-MKT` tag (or `MIXED` during
 session transitions) in the MOVERS title and mark the volume leg's provenance on
 each row.
 
+### Screenshot watchlist import
+
+Signed-in live and private-workspace web sessions include **SCAN LIST** in the
+terminal chrome. Upload a PNG, JPEG, or WebP screenshot and the scanner returns
+an editable review table. It imports only ordered Yahoo Finance symbols: no
+balances, quantities, prices, transactions, or account data are written. A
+crypto row such as `BTC` is mapped to `BTC-USD`; review and correct every
+symbol before choosing **ADD SELECTED** or **REPLACE WATCHLIST**. Watchlists
+are capped at 50 symbols so market refreshes remain interactive.
+
+The optional vision request is disabled until it is explicitly configured. Set
+a vision-capable model and a dedicated import key. The built-in OpenRouter URL
+may instead reuse the existing OpenRouter key source:
+
+```bash
+export WATCHLIST_IMPORT_MODEL=google/gemini-2.5-flash
+export WATCHLIST_IMPORT_API_KEY_FILE=/run/secrets/watchlist-import-key
+# Optional: defaults to https://openrouter.ai/api/v1/chat/completions
+export WATCHLIST_IMPORT_URL=https://openrouter.ai/api/v1/chat/completions
+# Only that exact default URL may use OPENROUTER_API_KEY / OPENROUTER_API_KEY_FILE.
+```
+
+The image is processed in memory, is never written to disk by the terminal,
+and is sent only to that configured HTTPS vision endpoint; redirects are not
+followed. Requests are limited to six per active principal per ten minutes.
+Public demo seats deliberately do not expose this feature. Standard live
+watchlists remain session-scoped; a private workspace persists the resulting
+list through its existing checkpoint flow.
+
 Changing screens, selections, pane focus, or chart scope does not stop research.
 Each symbol/scope/BRIEF-or-WHY context gets its own job and canvas identity. The
 terminal dispatches up to six FIFO jobs to isolated one-shot Pi worker sessions,
