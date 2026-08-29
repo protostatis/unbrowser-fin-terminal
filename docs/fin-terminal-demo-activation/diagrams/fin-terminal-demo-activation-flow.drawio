@@ -1,0 +1,32 @@
+<mxfile host="app.diagrams.net" modified="2026-08-01T00:00:00.000Z" agent="OpenCode" version="26.0.11">
+  <diagram id="fin-terminal-demo-activation-flow" name="Demo Activation and Source Check">
+    <mxGraphModel dx="2200" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="2200" pageHeight="900" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="step-1" value="Open replay demo&#xa;Read immutable curated dossier" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#eef4ff;strokeColor=#5b8def;strokeWidth=2;fontSize=15;" vertex="1" parent="1"><mxGeometry x="40" y="190" width="170" height="100" as="geometry"/></mxCell>
+        <mxCell id="step-2" value="Inspect evidence&#xa;Select item; temporary follows stay in tab" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#eef4ff;strokeColor=#5b8def;strokeWidth=2;fontSize=15;" vertex="1" parent="1"><mxGeometry x="280" y="190" width="170" height="100" as="geometry"/></mxCell>
+        <mxCell id="step-3" value="Choose durable action&#xa;Check sources again, Save, or Follow" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff7db;strokeColor=#d8a437;strokeWidth=2;fontSize=15;" vertex="1" parent="1"><mxGeometry x="520" y="190" width="170" height="100" as="geometry"/></mxCell>
+        <mxCell id="step-4" value="Create expiring intent&#xa;Exact parent artifact and bounded action" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff7db;strokeColor=#d8a437;strokeWidth=2;fontSize=15;" vertex="1" parent="1"><mxGeometry x="760" y="190" width="170" height="100" as="geometry"/></mxCell>
+        <mxCell id="step-5" value="Sign in or register&#xa;Existing UnchainedSky identity" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff7db;strokeColor=#d8a437;strokeWidth=2;fontSize=15;" vertex="1" parent="1"><mxGeometry x="1000" y="190" width="170" height="100" as="geometry"/></mxCell>
+        <mxCell id="decision-1" value="Active Fin Terminal&#xa;entitlement?" style="rhombus;whiteSpace=wrap;html=1;fillColor=#fff7db;strokeColor=#d8a437;strokeWidth=2;fontSize=15;fontStyle=1;" vertex="1" parent="1"><mxGeometry x="1240" y="190" width="160" height="100" as="geometry"/></mxCell>
+        <mxCell id="step-6" value="Activate entitlement and workspace&#xa;Claim intent once" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff7db;strokeColor=#d8a437;strokeWidth=2;fontSize=15;" vertex="1" parent="1"><mxGeometry x="1440" y="190" width="170" height="100" as="geometry"/></mxCell>
+        <mxCell id="step-7" value="Open parent and run/rejoin one source check&#xa;Show queued/checking state" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dff4e6;strokeColor=#2e9c61;strokeWidth=2;fontSize=15;" vertex="1" parent="1"><mxGeometry x="1680" y="190" width="190" height="100" as="geometry"/></mxCell>
+        <mxCell id="step-8" value="Compare outcome&#xa;Changed, unchanged, partial, blocked, or failed" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dff4e6;strokeColor=#2e9c61;strokeWidth=2;fontSize=15;" vertex="1" parent="1"><mxGeometry x="1940" y="190" width="190" height="100" as="geometry"/></mxCell>
+        <mxCell id="branch-1" value="No / pending / suspended&#xa;Explain access state; retain public parent; no job" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe5e1;strokeColor=#c65d4d;strokeWidth=2;fontSize=14;" vertex="1" parent="1"><mxGeometry x="1225" y="410" width="190" height="86" as="geometry"/></mxCell>
+        <mxCell id="branch-2" value="Partial, blocked, or failed&#xa;Preserve parent; report limitation and safe retry" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe5e1;strokeColor=#c65d4d;strokeWidth=2;fontSize=14;" vertex="1" parent="1"><mxGeometry x="1940" y="410" width="190" height="86" as="geometry"/></mxCell>
+        <mxCell id="e1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#4e7fd1;strokeWidth=2.5;endArrow=block;" edge="1" parent="1" source="step-1" target="step-2"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e2" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#4e7fd1;strokeWidth=2.5;endArrow=block;" edge="1" parent="1" source="step-2" target="step-3"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e3" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#d8a437;strokeWidth=2.5;endArrow=block;" edge="1" parent="1" source="step-3" target="step-4"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e4" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#d8a437;strokeWidth=2.5;endArrow=block;" edge="1" parent="1" source="step-4" target="step-5"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e5" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#d8a437;strokeWidth=2.5;endArrow=block;" edge="1" parent="1" source="step-5" target="decision-1"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e6" value="yes" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#2e9c61;strokeWidth=2.5;endArrow=block;" edge="1" parent="1" source="decision-1" target="step-7"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e7" value="activate" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#d8a437;strokeWidth=2.5;endArrow=block;" edge="1" parent="1" source="decision-1" target="step-6"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e8" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#2e9c61;strokeWidth=2.5;endArrow=block;" edge="1" parent="1" source="step-6" target="step-7"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e9" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#2e9c61;strokeWidth=2.5;endArrow=block;" edge="1" parent="1" source="step-7" target="step-8"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e10" value="no" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#c65d4d;strokeWidth=2.5;endArrow=block;" edge="1" parent="1" source="decision-1" target="branch-1"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e11" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeColor=#c65d4d;strokeWidth=2.5;endArrow=block;" edge="1" parent="1" source="step-8" target="branch-2"><mxGeometry relative="1" as="geometry"/></mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

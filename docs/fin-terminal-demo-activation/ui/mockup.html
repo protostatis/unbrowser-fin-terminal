@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fin Terminal Replay — Minimal UI Reference</title>
+  <style>
+    :root {
+      --bg: #0b0e14;
+      --surface: #0d1117;
+      --raised: #161b22;
+      --border: #30363d;
+      --border-soft: #21262d;
+      --text: #c9d1d9;
+      --muted: #8b949e;
+      --dim: #6e7681;
+      --accent: #58a6ff;
+      --success: #3fb950;
+      --warning: #d29922;
+      --error: #f85149;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; background: var(--bg); }
+    body { color: var(--text); font-family: var(--mono); overflow: hidden; }
+    button { font: inherit; }
+
+    /* Mirrors the current terminal container/frame/status composition. */
+    .terminal {
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      min-width: 720px;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 14px;
+      line-height: 1.2;
+    }
+
+    .terminal-frame {
+      flex: 1;
+      min-height: 0;
+      overflow: hidden;
+      padding: 8px 12px;
+    }
+
+    .term-row {
+      min-height: calc(1em * 1.2);
+      overflow: hidden;
+      white-space: pre;
+    }
+
+    .tc-accent { color: var(--accent); }
+    .tc-text { color: var(--text); }
+    .tc-muted { color: var(--muted); }
+    .tc-dim { color: var(--dim); }
+    .tc-success { color: var(--success); }
+    .tc-warning { color: var(--warning); }
+    .tc-error { color: var(--error); }
+    .tc-bg-selected { padding: 0 3px; color: #fff; background: #1f6feb; border-radius: 2px; }
+
+    .demo-banner {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      z-index: 20;
+      padding: 4px 8px;
+      color: var(--bg);
+      background: var(--warning);
+      border-radius: 3px;
+      box-shadow: 0 4px 16px #0009;
+      font-size: 9px;
+      font-weight: 800;
+      letter-spacing: .06em;
+    }
+
+    .pilot-callout {
+      position: absolute;
+      left: 12px;
+      bottom: 31px;
+      z-index: 30;
+      width: min(346px, calc(100% - 24px));
+      padding: 9px 10px;
+      color: var(--text);
+      background: #0d1117f2;
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--accent);
+      box-shadow: 0 6px 22px #0009;
+      font-size: 11px;
+    }
+
+    .pilot-callout-label { color: var(--accent); font-size: 9px; font-weight: 800; letter-spacing: .09em; }
+    .pilot-callout-copy { margin: 5px 0 8px; color: var(--muted); line-height: 1.45; }
+    .pilot-callout button {
+      padding: 5px 8px;
+      color: var(--text);
+      background: #11233a;
+      border: 1px solid #315b91;
+      border-radius: 3px;
+      cursor: pointer;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: .04em;
+    }
+    .pilot-callout button:hover, .pilot-callout button:focus-visible { background: #1f6feb; border-color: var(--accent); outline: none; }
+
+    .status-line {
+      position: relative;
+      display: flex;
+      flex-shrink: 0;
+      align-items: center;
+      min-height: 24px;
+      gap: 6px;
+      padding: 3px 12px;
+      color: var(--muted);
+      background: rgba(11, 14, 20, .88);
+      border-top: 1px solid var(--border-soft);
+      font-size: 11px;
+    }
+    .status-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--success); box-shadow: 0 0 4px #3fb95080; }
+    .evidence-chip {
+      position: absolute;
+      right: 12px;
+      top: 50%;
+      transform: translateY(-50%);
+      padding: 2px 8px;
+      color: var(--muted);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: .08em;
+    }
+    .evidence-chip b { color: var(--success); }
+
+    .select-overlay {
+      position: absolute;
+      inset: 0;
+      z-index: 50;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 12px;
+      background: rgba(0, 0, 0, .6);
+    }
+    [data-state="activation"] .select-overlay { display: flex; }
+    [data-state="activation"] .pilot-callout { display: none; }
+
+    .select-modal {
+      width: min(480px, 100%);
+      padding: 20px;
+      background: var(--raised);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      box-shadow: 0 20px 70px #000c;
+    }
+    .select-kicker { color: var(--accent); font-size: 10px; font-weight: 800; letter-spacing: .09em; }
+    .select-title { margin: 8px 0; color: var(--text); font-size: 15px; font-weight: 700; }
+    .select-copy { margin: 0 0 14px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+    .preserved-action { margin: 0 0 12px; padding: 8px 10px; color: var(--muted); background: var(--surface); border-left: 2px solid var(--success); font-size: 11px; line-height: 1.45; }
+    .preserved-action strong { color: var(--text); }
+    .select-options { display: flex; flex-direction: column; gap: 5px; }
+    .select-option, .select-cancel {
+      padding: 8px 12px;
+      border-radius: 4px;
+      cursor: pointer;
+      text-align: left;
+    }
+    .select-option { color: var(--text); background: #11233a; border: 1px solid #315b91; font-size: 13px; }
+    .select-option:hover, .select-option:focus-visible { background: #1f6feb; border-color: var(--accent); outline: none; }
+    .select-cancel { margin-top: 12px; margin-left: auto; color: var(--muted); background: transparent; border: 1px solid var(--border-soft); font-size: 12px; }
+    .select-cancel:hover, .select-cancel:focus-visible { color: var(--text); border-color: var(--border); outline: none; }
+
+    @media (max-width: 900px) {
+      .terminal { min-width: 0; font-size: 12px; }
+      .pilot-callout { bottom: 31px; }
+      .term-row { white-space: normal; min-height: 1.4em; }
+      .evidence-chip { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <!-- Visual reference only. It does not represent a new terminal layout or make network calls. -->
+  <div class="terminal" id="app" data-state="replay">
+    <div class="terminal-frame" role="application" aria-label="Existing terminal replay reference">
+      <div class="term-row"><span class="tc-accent">SIGNAL</span><span class="tc-muted"> // MARKET ARCADE</span></div>
+      <div class="term-row"><span class="tc-dim">────────────────────────────────────────────────────────────────────────────────────────────────────────</span></div>
+      <div class="term-row"><span class="tc-text"><strong>MARKET MAP</strong></span><span class="tc-muted">  ·  approved replay snapshot  ·  delayed market context</span></div>
+      <div class="term-row"> </div>
+      <div class="term-row"><span class="tc-muted">SELECTED</span>  <span class="tc-bg-selected">NVDA</span>  <span class="tc-success">+3.4%</span>   <span class="tc-muted">Semis · replay generated 09:37 ET</span></div>
+      <div class="term-row"><span class="tc-dim">────────────────────────────────────────────────────────────────────────────────────────────────────────</span></div>
+      <div class="term-row"><span class="tc-accent">THE READ</span></div>
+      <div class="term-row"><span class="tc-text">A curated evidence replay keeps the observed move, cited facts,</span></div>
+      <div class="term-row"><span class="tc-text">alternative scenarios, and uncertainty visible in the existing terminal.</span></div>
+      <div class="term-row"> </div>
+      <div class="term-row"><span class="tc-muted">MARKET SNAPSHOT</span>  delayed · 14m</div>
+      <div class="term-row"><span class="tc-muted">DOSSIER GENERATED</span>  09:37 ET</div>
+      <div class="term-row"><span class="tc-muted">SOURCES LAST CHECKED</span>  09:36 ET · approved replay artifact</div>
+      <div class="term-row"><span class="tc-success">EVIDENCE COMPLETE</span>  4 packets · Source Locker available</div>
+      <div class="term-row"> </div>
+      <div class="term-row"><span class="tc-muted">[Enter]</span> Open selected market view    <span class="tc-muted">[K]</span> Why it matters    <span class="tc-muted">[Esc]</span> Close overlay</div>
+      <div class="term-row"> </div>
+      <div class="term-row"><span class="tc-dim">REPLAY ONLY — no terminal seat, WebSocket, agent session, model call, or fresh source call.</span></div>
+    </div>
+
+    <div class="demo-banner" role="status">REPLAY DEMO · NO LIVE SOURCE CALLS</div>
+
+    <aside class="pilot-callout" aria-label="Pilot workspace action">
+      <div class="pilot-callout-label">PILOT WORKSPACE</div>
+      <div class="pilot-callout-copy">Save this approved replay or a follow to your existing UnchainedSky account. Fresh source checks are not enabled in this pilot.</div>
+      <button id="activate" type="button">ACTIVATE PILOT WORKSPACE →</button>
+    </aside>
+
+    <div class="status-line" role="status" aria-live="polite">
+      <span class="status-dot" aria-hidden="true"></span>
+      <span>120×40 · replay status · tab-local temporary follows</span>
+      <span class="evidence-chip"><b>●</b> EVIDENCE COMPLETE · 4</span>
+    </div>
+
+    <section class="select-overlay" role="dialog" aria-modal="true" aria-labelledby="activation-title">
+      <div class="select-modal">
+        <div class="select-kicker">FIN TERMINAL PILOT</div>
+        <h1 class="select-title" id="activation-title">Activate a pilot workspace?</h1>
+        <p class="select-copy">Use your existing UnchainedSky account. This creates a private place for the selected replay and follows; it does not change your global account type or start a source check.</p>
+        <div class="preserved-action">PRESERVED ACTION<br><strong>NVDA replay · Save dossier / Follow</strong></div>
+        <div class="select-options">
+          <button class="select-option" type="button">Continue with UnchainedSky →</button>
+        </div>
+        <button class="select-cancel" id="cancel" type="button">Back to replay</button>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    const app = document.getElementById('app');
+    const allowedStates = new Set(['replay', 'activation']);
+    function setState(next) {
+      const state = allowedStates.has(next) ? next : 'replay';
+      app.dataset.state = state;
+      history.replaceState({}, '', `${location.pathname}?state=${state}`);
+    }
+    document.getElementById('activate').addEventListener('click', () => setState('activation'));
+    document.getElementById('cancel').addEventListener('click', () => setState('replay'));
+    setState(new URLSearchParams(location.search).get('state'));
+  </script>
+</body>
+</html>

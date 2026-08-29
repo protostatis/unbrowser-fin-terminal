@@ -42,6 +42,8 @@ test("public gateway rejects malformed, oversized, and unsupported browser proto
     message({ type: "command", name: "market", args: "AAPL\n/quit" }),
     message({ type: "select_response", id: "select-1", value: "x".repeat(513) }),
     message({ type: "unknown" }),
+    message({ type: "input", data: "j", apiKey: "sk-or-secret" }),
+    message({ type: "command", name: "market", args: "AAPL", model: "openrouter/unsafe" }),
   ]) {
     assert.equal(isAllowedPublicClientMessage(value), false, value);
   }
@@ -64,6 +66,8 @@ test("public gateway validates bounded worker-to-browser messages", () => {
     message({ type: "notify", level: "debug", message: "no" }),
     message({ type: "select_request", id: "select-1", title: "Choose", options: "yes" }),
     message({ type: "unknown" }),
+    message({ type: "frame", rows: ["row"], width: 120, rows_count: 1, state: { model: "secret" } }),
+    message({ type: "notify", level: "info", message: "ok", token: "secret" }),
   ]) {
     assert.equal(isAllowedPublicWorkerMessage(value), false, value);
   }

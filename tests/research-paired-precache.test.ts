@@ -13,6 +13,11 @@ import {
   marketScoutTransportMode,
   readMarketScoutLocalCliEnabled,
   readMarketScoutEnabled,
+  readMarketScoutDispatchEnabled,
+  readMarketScoutDispatchPolicy,
+  readMarketScoutModelId,
+  MARKET_SCOUT_MODEL_ID,
+  boundResearchQuestion,
   readPrecacheEnabled,
   readPrecacheStrategy,
   splitPairedCanvas,
@@ -169,7 +174,33 @@ test("shadow event scouting is opt-in and hard-disabled in public workers", () =
   assert.equal(readMarketScoutEnabled({ MARKET_SCOUT_ENABLED: "1", PUBLIC_SESSION_WORKER: "1" }), false);
   assert.equal(readMarketScoutEnabled({ MARKET_SCOUT_ENABLED: "1", MARKET_RESEARCH_WORKER: "1" }), false);
   assert.equal(readMarketScoutEnabled({ MARKET_SCOUT_ENABLED: "1", TERMINAL_RUNTIME_MODE: "public-gateway" }), false);
+  assert.equal(readMarketScoutEnabled({ MARKET_SCOUT_ENABLED: "1", TERMINAL_RUNTIME_MODE: "private-workspace" }), false);
+  assert.equal(readMarketScoutEnabled({ MARKET_SCOUT_ENABLED: "1", FINANCIAL_WORKSPACE_CHECKPOINTS: "1" }), false);
   assert.throws(() => readMarketScoutEnabled({ MARKET_SCOUT_ENABLED: "maybe" }), /MARKET_SCOUT_ENABLED/);
+});
+
+test("scout dispatch is separately opt-in, bounded, and pinned to the free model", () => {
+  assert.equal(readMarketScoutDispatchEnabled({}), false);
+  assert.equal(readMarketScoutDispatchEnabled({ MARKET_SCOUT_ENABLED: "1" }), false);
+  assert.equal(readMarketScoutDispatchEnabled({ MARKET_SCOUT_ENABLED: "1", MARKET_SCOUT_DISPATCH_ENABLED: "on" }), true);
+  assert.equal(readMarketScoutDispatchEnabled({ MARKET_SCOUT_ENABLED: "1", MARKET_SCOUT_DISPATCH_ENABLED: "1", PUBLIC_SESSION_WORKER: "1" }), false);
+  assert.equal(readMarketScoutModelId({}), MARKET_SCOUT_MODEL_ID);
+  assert.throws(
+    () => readMarketScoutModelId({ MARKET_SCOUT_MODEL_ID: "openai/gpt-5" }),
+    /must be nvidia\/nemotron-3\.5-lightning:free/,
+  );
+  assert.deepEqual(readMarketScoutDispatchPolicy({}), { perRunCap: 1, dailyCap: 4 });
+  assert.throws(() => readMarketScoutDispatchPolicy({ MARKET_SCOUT_DISPATCH_PER_RUN: "2" }), /MARKET_SCOUT_DISPATCH_PER_RUN.*pinned/);
+  assert.throws(() => readMarketScoutDispatchPolicy({ MARKET_SCOUT_DISPATCH_DAILY_CAP: "7" }), /MARKET_SCOUT_DISPATCH_DAILY_CAP.*pinned/);
+  assert.throws(() => readMarketScoutDispatchPolicy({ MARKET_SCOUT_DISPATCH_DAILY_CAP: "0" }), /MARKET_SCOUT_DISPATCH_DAILY_CAP/);
+});
+
+test("scout trigger instructions survive job question bounding", () => {
+  const instruction = " Verify this event first before writing the factual brief.";
+  const question = `${"event context ".repeat(300).slice(0, 4_000 - instruction.length)}${instruction}`;
+  const bounded = boundResearchQuestion(question);
+  assert.equal(bounded.length, 4_000);
+  assert.ok(bounded.endsWith(instruction), "the verification instruction is retained at the bound");
 });
 
 test("market scout CLI transport requires explicit development opt-in", () => {
@@ -694,6 +725,42 @@ test("single-strategy IPC requests are accepted and interactive ones still rejec
     origin: "precache",
     tokenLimit: 100_000,
   }), false, "synthetic paired key without pairedTarget is rejected");
+
+  assert.equal(isValidResearchRequest({
+    symbol: "NVDA",
+    question: "TRIGGER DATA ONLY: verify this event before building the brief",
+    chartScope: "day",
+    researchKey: "v1/ticker/brief",
+    intent: "brief",
+    contextLabel: "NVDA BRIEF",
+    origin: "scout",
+    modelProvider: "openrouter",
+    modelId: "nvidia/nemotron-3.5-lightning:free",
+    scoutCandidateId: `trg-${"a".repeat(32)}`,
+  }), true);
+  assert.equal(isValidResearchRequest({
+    symbol: "NVDA",
+    question: "question",
+    chartScope: "day",
+    researchKey: "v1/ticker/brief",
+    intent: "brief",
+    contextLabel: "NVDA BRIEF",
+    origin: "scout",
+    modelProvider: "openrouter",
+    modelId: "openai/gpt-5",
+    scoutCandidateId: `trg-${"a".repeat(32)}`,
+  }), false, "scout jobs are pinned to the free model at the protocol boundary");
+  assert.equal(isValidResearchRequest({
+    symbol: "NVDA",
+    question: "question",
+    chartScope: "day",
+    researchKey: "v1/ticker/brief",
+    intent: "brief",
+    contextLabel: "NVDA BRIEF",
+    origin: "scout",
+    modelProvider: "openrouter",
+    modelId: "nvidia/nemotron-3.5-lightning:free",
+  }), false, "scout jobs require a durable candidate identity");
 });
 
 // ── Ledger failure telemetry ──────────────────────────────────────────────

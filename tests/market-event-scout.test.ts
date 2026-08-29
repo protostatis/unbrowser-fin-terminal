@@ -470,7 +470,7 @@ test("shadow scout baselines first, records only unseen actionable events, and p
     );
 
     const state = await readMarketEventScoutState(statePath, now);
-    assert.equal(state.version, 2);
+    assert.equal(state.version, 3);
     assert.equal(state.sources[0]?.baselineComplete, true);
     assert.equal(state.sources[0]?.newItems, 1);
     assert.equal(state.sources[0]?.admitted, 1);
@@ -480,6 +480,155 @@ test("shadow scout baselines first, records only unseen actionable events, and p
     assert.equal(state.triggerDryRun.totals.wouldTrigger, 1);
     assert.equal(state.triggerDryRun.days[0]?.aggregate.wouldTrigger, 1);
     assert.equal(client.calls, 4);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("real trigger dispatch is opt-in, durable, capped, and settles by candidate ID", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "market-scout-dispatch-test-"));
+  const statePath = join(directory, "scout.json");
+  let now = Date.parse("2026-08-07T12:05:00Z");
+  const repeat = rss(
+      rssItem({ guid: "dispatch-1", symbol: "AAPL", published: "Fri, 07 Aug 2026 12:06:00 GMT" }),
+      rssItem({ guid: "dispatch-2", symbol: "MSFT", published: "Fri, 07 Aug 2026 12:06:30 GMT" }),
+    );
+  const bodies = [rss(rssItem({ guid: "dispatch-baseline", symbol: "NVDA" })), repeat, repeat];
+  const dispatched: string[] = [];
+  const client = { async readDocument() { return document(bodies.shift() ?? repeat); } };
+  const makeScout = (accept = true) => new MarketEventScout({
+    client,
+    statePath,
+    sources: [HALT_SOURCE],
+    getTrackedSymbols: () => ["NVDA", "AAPL", "MSFT"],
+    now: () => now,
+    dispatch: {
+      modelId: "nvidia/nemotron-3.5-lightning:free",
+      policy: { perRunCap: 1, dailyCap: 4 },
+      dispatch(candidate) {
+        dispatched.push(candidate.id);
+        return accept
+          ? { accepted: true, jobId: `job-${dispatched.length}` }
+          : { accepted: false, error: "free endpoint unavailable" };
+      },
+    },
+  });
+
+  try {
+    const scout = makeScout();
+    await scout.run({ force: true });
+    now += 2 * 60_000;
+    const first = await scout.run({ force: true });
+    assert.equal(first.dispatchEnqueued, 1, "per-run cap admits one job");
+    assert.equal(first.dispatchPending, 1, "the second eligible candidate remains in the outbox");
+    let state = await readMarketEventScoutState(statePath, now);
+    assert.equal(state.triggerDispatches.filter((record) => record.status === "enqueued").length, 1);
+    assert.equal(state.triggerDispatches.filter((record) => record.status === "pending").length, 1);
+
+    const firstCandidate = state.triggerDispatches.find((record) => record.status === "enqueued")!;
+    await scout.settleDispatch(firstCandidate.candidateId, "complete");
+    state = await readMarketEventScoutState(statePath, now);
+    assert.equal(state.triggerDispatches.find((record) => record.candidateId === firstCandidate.candidateId)?.status, "settled");
+
+    now += 2 * 60_000;
+    const second = await scout.run({ force: true });
+    assert.equal(second.dispatchEnqueued, 1, "the next poll drains one pending candidate");
+    assert.equal(dispatched.length, 2);
+
+    const restarted = makeScout();
+    now += 2 * 60_000;
+    await restarted.run({ force: true });
+    assert.equal(dispatched.length, 3, "an enqueued record is recovered once after a parent restart");
+    assert.equal(new Set(dispatched).size, 2, "recovery dispatches the previously pending candidate, not the settled one");
+
+    const restartStorm = makeScout();
+    now += 2 * 60_000;
+    await restartStorm.run({ force: true });
+    assert.equal(dispatched.length, 4, "a second restart consumes the next bounded daily attempt");
+    const cappedRestart = makeScout();
+    now += 2 * 60_000;
+    const capped = await cappedRestart.run({ force: true });
+    assert.equal(capped.dispatchEnqueued, 0, "restart storms cannot bypass the daily attempt cap");
+    assert.equal(dispatched.length, 4);
+    state = await readMarketEventScoutState(statePath, now);
+    const retried = state.triggerDispatches.find((record) => record.candidateId !== firstCandidate.candidateId)!;
+    assert.equal(retried.dispatchDays?.length, 3);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("retryable dispatch contention stays pending without becoming terminal loss", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "market-scout-dispatch-defer-test-"));
+  const statePath = join(directory, "scout.json");
+  let now = Date.parse("2026-08-07T12:05:00Z");
+  const bodies = [
+    rss(rssItem({ guid: "defer-baseline", symbol: "NVDA" })),
+    rss(rssItem({ guid: "defer-1", symbol: "AAPL", published: "Fri, 07 Aug 2026 12:06:00 GMT" })),
+    rss(rssItem({ guid: "defer-1", symbol: "AAPL", published: "Fri, 07 Aug 2026 12:06:00 GMT" })),
+  ];
+  let attempts = 0;
+  const client = { async readDocument() { return document(bodies.shift() ?? bodies.at(-1)!); } };
+  try {
+    const scout = new MarketEventScout({
+      client,
+      statePath,
+      sources: [HALT_SOURCE],
+      getTrackedSymbols: () => ["NVDA", "AAPL"],
+      now: () => now,
+      dispatch: {
+        modelId: "nvidia/nemotron-3.5-lightning:free",
+        dispatch() {
+          attempts += 1;
+          return attempts === 1
+            ? { accepted: false, retryable: true, error: "research queue busy" }
+            : { accepted: true, jobId: `deferred-job-${attempts}` };
+        },
+      },
+    });
+    await scout.run({ force: true });
+    now += 2 * 60_000;
+    const deferred = await scout.run({ force: true });
+    assert.equal(deferred.dispatchFailed, 0);
+    assert.equal(deferred.dispatchPending, 1);
+    assert.equal((await readMarketEventScoutState(statePath, now)).triggerDispatches[0]?.status, "pending");
+    now += 2 * 60_000;
+    const retried = await scout.run({ force: true });
+    assert.equal(retried.dispatchEnqueued, 1);
+    assert.equal(attempts, 2);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("dispatch rejection is recorded as a terminal failed outcome", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "market-scout-dispatch-failure-test-"));
+  const statePath = join(directory, "scout.json");
+  let now = Date.parse("2026-08-07T12:05:00Z");
+  const bodies = [
+    rss(rssItem({ guid: "failure-baseline", symbol: "NVDA" })),
+    rss(rssItem({ guid: "failure-1", symbol: "AAPL", published: "Fri, 07 Aug 2026 12:06:00 GMT" })),
+  ];
+  const client = { async readDocument() { return document(bodies.shift()!); } };
+  try {
+    const scout = new MarketEventScout({
+      client,
+      statePath,
+      sources: [HALT_SOURCE],
+      getTrackedSymbols: () => ["NVDA", "AAPL"],
+      now: () => now,
+      dispatch: {
+        modelId: "nvidia/nemotron-3.5-lightning:free",
+        dispatch: () => ({ accepted: false, error: "rate limited" }),
+      },
+    });
+    await scout.run({ force: true });
+    now += 2 * 60_000;
+    const result = await scout.run({ force: true });
+    assert.equal(result.dispatchFailed, 1);
+    const state = await readMarketEventScoutState(statePath, now);
+    assert.equal(state.triggerDispatches[0]?.status, "failed");
+    assert.equal(state.triggerDispatches[0]?.error, "rate limited");
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -551,7 +700,7 @@ test("v1 journals migrate without replaying retained decisions as trigger candid
       decisions: [retainedDecision],
     }), "utf8");
     const migrated = await readMarketEventScoutState(statePath, now);
-    assert.equal(migrated.version, 2);
+    assert.equal(migrated.version, 3);
     assert.equal(migrated.decisions.length, 1);
     assert.equal(migrated.triggerDryRun.candidates.length, 0);
     assert.equal(migrated.triggerDryRun.totals.evaluated, 0);
@@ -565,8 +714,104 @@ test("v1 journals migrate without replaying retained decisions as trigger candid
     const baseline = await scout.run({ force: true });
     assert.equal(baseline.candidateEvaluated, 0);
     const raw = JSON.parse(await readFile(statePath, "utf8")) as { version: number };
-    assert.equal(raw.version, 2, "the next atomic scout write persists v2");
+    assert.equal(raw.version, 3, "the next atomic scout write persists v3");
     assert.equal((await scout.getState()).triggerDryRun.candidates.length, 0);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("v2 journals preserve dry-run evidence but never backfill the dispatch outbox", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "market-scout-v2-migration-test-"));
+  const statePath = join(directory, "scout.json");
+  let now = Date.parse("2026-08-07T12:05:00Z");
+  const bodies = [
+    rss(rssItem({ guid: "v2-baseline", symbol: "NVDA" })),
+    rss(rssItem({ guid: "v2-event", symbol: "AAPL", published: "Fri, 07 Aug 2026 12:06:00 GMT" })),
+  ];
+  const client = { async readDocument() { return document(bodies.shift()!); } };
+  try {
+    const seed = new MarketEventScout({
+      client,
+      statePath,
+      sources: [HALT_SOURCE],
+      getTrackedSymbols: () => ["NVDA", "AAPL"],
+      now: () => now,
+    });
+    await seed.run({ force: true });
+    now += 2 * 60_000;
+    await seed.run({ force: true });
+    const raw = JSON.parse(await readFile(statePath, "utf8")) as Record<string, unknown>;
+    delete raw.triggerDispatches;
+    raw.version = 2;
+    await writeFile(statePath, JSON.stringify(raw), "utf8");
+
+    const migrated = await readMarketEventScoutState(statePath, now);
+    assert.equal(migrated.version, 3);
+    assert.equal(migrated.triggerDryRun.candidates.length, 1);
+    assert.equal(migrated.triggerDryRun.totals.wouldTrigger, 1);
+    assert.deepEqual(migrated.triggerDispatches, []);
+
+    const dispatched: string[] = [];
+    const dispatchingScout = new MarketEventScout({
+      client,
+      statePath,
+      sources: [HALT_SOURCE],
+      getTrackedSymbols: () => ["NVDA", "AAPL"],
+      now: () => now,
+      dispatch: {
+        modelId: "nvidia/nemotron-3.5-lightning:free",
+        dispatch(candidate) {
+          dispatched.push(candidate.id);
+          return { accepted: true, jobId: "v2-migration-job" };
+        },
+      },
+    });
+    const result = await dispatchingScout.run({ force: true });
+    assert.equal(result.dispatchEnqueued, 0, "retained v2 candidates are not replayed as new dispatches");
+    assert.deepEqual(dispatched, []);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("persisted dispatch records reject a paid or alternate model ID", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "market-scout-model-journal-test-"));
+  const statePath = join(directory, "scout.json");
+  try {
+    await writeFile(statePath, JSON.stringify({
+      version: 3,
+      updatedAt: Date.parse("2026-08-07T12:00:00Z"),
+      sources: [],
+      decisions: [],
+      triggerDryRun: {
+        policy: DEFAULT_MARKET_EVENT_TRIGGER_POLICY,
+        candidates: [],
+        days: [],
+        cooldowns: [],
+        totals: {
+          evaluated: 0,
+          mapped: 0,
+          wouldTrigger: 0,
+          gated: 0,
+          missingPublishedAt: 0,
+          routes: { tickerBrief: 0, macroEventBrief: 0, marketStoryBrief: 0, unsupported: 0 },
+          associations: { structuredSymbol: 0, explicitSymbol: 0, marketWide: 0, unresolved: 0 },
+          gates: { notAdmitted: 0, unsupportedRoute: 0, belowPriority: 0, expired: 0, targetCooldown: 0, dailyCap: 0 },
+        },
+      },
+      triggerDispatches: [{
+        candidateId: `trg-${"a".repeat(32)}`,
+        status: "enqueued",
+        attempt: 1,
+        createdAt: Date.parse("2026-08-07T12:00:00Z"),
+        updatedAt: Date.parse("2026-08-07T12:00:00Z"),
+        modelId: "openai/gpt-5",
+        dispatchDays: ["2026-08-07"],
+        jobId: "paid-model-job",
+      }],
+    }), "utf8");
+    await assert.rejects(readMarketEventScoutState(statePath), /invalid record/);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

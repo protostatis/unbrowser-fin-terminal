@@ -11,8 +11,13 @@
     "dev:web": "vite",
     "start": "node dist-server/server/index.js",
     "build": "tsc -p tsconfig.server.json && vite build",
+    "build:browser-session": "vite build --config vite.browser-session.config.ts",
     "typecheck": "tsc -p tsconfig.extension.json --noEmit && tsc -p tsconfig.server.json --noEmit && tsc -p web/tsconfig.json --noEmit",
-    "test": "tsx --test tests/*.test.ts"
+    "test": "tsx --test tests/*.test.ts",
+    "test:nemo": "tsx scripts/test-nemo.ts",
+    "test:e2e": "playwright test",
+    "capture:trace": "tsx scripts/capture-pi-trace.ts",
+    "replay:trace": "tsx scripts/replay-pi-trace.ts"
   },
   "dependencies": {
     "@earendil-works/pi-ai": "0.83.0",
@@ -27,6 +32,7 @@
     "ws": "^8.18.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.1",
     "@types/express": "^4.17.21",
     "@types/node": "^20.14.0",
     "@types/react": "^18.3.3",

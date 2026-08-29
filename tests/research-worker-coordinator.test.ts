@@ -261,6 +261,49 @@ test("enqueue dispatches immediately when a slot is free", () => {
   assert.equal(workers[0].sentMessages[0].type, "run");
 });
 
+test("scout requests select a model in the isolated worker without changing parent config", () => {
+  let workerEnv: Record<string, string> | undefined;
+  const worker = new FakeWorker();
+  const { coordinator } = createTestCoordinator({
+    workerFactory: (env) => {
+      workerEnv = env;
+      return worker;
+    },
+  });
+  const result = coordinator.enqueue("job-scout", {
+    ...sampleRequest,
+    origin: "scout",
+    modelProvider: "openrouter",
+    modelId: "nvidia/nemotron-3.5-lightning:free",
+    scoutCandidateId: `trg-${"a".repeat(32)}`,
+    intent: "brief",
+    researchKey: "v1/ticker/brief",
+  });
+  assert.equal(result.accepted, true);
+  assert.deepEqual(workerEnv, {
+    MARKET_RESEARCH_WORKER: "1",
+    MARKET_MODEL_PROVIDER: "openrouter",
+    MARKET_MODEL_ID: "nvidia/nemotron-3.5-lightning:free",
+    OPENROUTER_MODEL: "nvidia/nemotron-3.5-lightning:free",
+  });
+});
+
+test("coordinator rejects a paid or otherwise non-pinned scout model", () => {
+  const { coordinator, workers } = createTestCoordinator();
+  const result = coordinator.enqueue("job-scout-paid", {
+    ...sampleRequest,
+    origin: "scout",
+    modelProvider: "openrouter",
+    modelId: "openai/gpt-5",
+    scoutCandidateId: `trg-${"b".repeat(32)}`,
+    intent: "brief",
+    researchKey: "v1/ticker/brief",
+  });
+  assert.equal(result.accepted, false);
+  assert.equal(result.reason, "invalid-research-request");
+  assert.equal(workers.length, 0);
+});
+
 test("worker concurrency defaults to six and rejects unsafe environment values", () => {
   assert.equal(readResearchWorkerConcurrency({}), 6);
   assert.equal(readResearchWorkerConcurrency({ MARKET_RESEARCH_CONCURRENCY: "1" }), 1);

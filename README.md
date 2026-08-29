@@ -44,7 +44,7 @@ Then use:
 /market                 Open the Market Map
 /market AAPL            Open a ticker panel
 /market-history AAPL    Browse archived research
-/market-scout status    Inspect event health and no-dispatch trigger evidence
+/market-scout status    Inspect event health and guarded trigger dispatch
 /market-scout sync      Poll event sources that are currently due
 /market-debug market    Open deterministic debug fixtures
 ```
@@ -72,6 +72,16 @@ When OpenRouter is configured, the default model is
 provider-neutral pair `MARKET_MODEL_PROVIDER` and `MARKET_MODEL_ID`. Production
 deployments should mount a dedicated key and set `OPENROUTER_API_KEY_FILE`
 instead of placing the key directly in Compose environment metadata.
+
+For one opt-in live provider smoke request using the budget scout model, set
+`OPENROUTER_API_KEY` (or `OPENROUTER_API_KEY_FILE`) and run:
+
+```bash
+npm run test:nemo
+```
+
+The regular `npm test` and browser conformance tests remain deterministic and
+never contact OpenRouter.
 
 The public hosted MCP endpoint is shared and suitable only for public pages. A
 production deployment should use a dedicated Docker-internal isolated endpoint,
@@ -356,6 +366,10 @@ can use a short-lived `unbrowser` CLI session only when explicitly enabled with
 | Variable | Default | Meaning |
 |---|---|---|
 | `MARKET_SCOUT_ENABLED` | `0` | Enable the singleton background scheduler with `1/true/on`. Public and research workers remain hard-disabled. |
+| `MARKET_SCOUT_DISPATCH_ENABLED` | `0` | Separate default-off switch for real trigger jobs; requires the singleton scout and remains disabled in public/disposable workers. |
+| `MARKET_SCOUT_MODEL_ID` | `nvidia/nemotron-3.5-lightning:free` | Fixed free NVIDIA model used by scout jobs; alternate or paid IDs are rejected. |
+| `MARKET_SCOUT_DISPATCH_PER_RUN` | `1` | Maximum real trigger jobs accepted by one poll. |
+| `MARKET_SCOUT_DISPATCH_DAILY_CAP` | `4` | Maximum real trigger attempts per UTC day. |
 | `MARKET_SCOUT_LOCAL_CLI` | `0` | Explicit development-only fallback when `UNBROWSER_MCP_URL` is absent. Ignored in production. |
 
 The first successful poll of each source establishes a baseline and emits no
@@ -366,16 +380,18 @@ High-confidence items are labeled `admit-shadow`; ambiguous items are retained
 as `watch`; unsupported or stale items are counted as `suppress` but not stored
 in the recent-decision list.
 
-This is intentionally observation-only. Every new non-suppressed decision is
-also mapped into an immutable dry-run BRIEF candidate for a ticker, the macro
-EVENT lane, or SIGNALS/Market Story. A fixed simulation policy records whether
-the candidate would trigger or would be gated by disposition, route coverage,
-priority, freshness, target cooldown, or daily volume. It never starts agent
-research, reserves tokens, writes research canvases, or scrapes unattended
-search-result pages. Use `/market-scout status` to inspect source health,
-candidate volume, route coverage, and gate pressure, and
-`/market-scout sync` to poll only sources whose configured interval is due. The
-bounded atomic journal is
+This remains observation-only unless the separate execution kill switch is
+enabled. Every new non-suppressed decision is mapped into an immutable dry-run
+BRIEF candidate for a ticker, the macro EVENT lane, or SIGNALS/Market Story. A
+fixed simulation policy records whether the candidate would trigger or would be
+gated by disposition, route coverage, priority, freshness, target cooldown, or
+daily volume. With `MARKET_SCOUT_DISPATCH_ENABLED=1`, only newly-created
+`would-trigger` candidates enter the durable candidate-ID outbox. Dispatch is
+restricted to `nvidia/nemotron-3.5-lightning:free`, accepts at most one job per
+poll and four attempts per UTC day by default, and fails closed without a paid
+fallback. Use `/market-scout status` to inspect source health, candidate volume,
+route coverage, gate pressure, and outbox state, and `/market-scout sync` to poll
+only sources whose configured interval is due. The bounded atomic journal is
 `$MARKET_DATA_DIR/market-event-scout.json` (or `.pi/market-event-scout.json`).
 The scheduler is off by default and is always disabled in disposable public
 workers and the public gateway, even if the environment variable is set.

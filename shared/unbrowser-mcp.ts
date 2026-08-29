@@ -322,7 +322,11 @@ export class UnbrowserMcpClient {
 
   constructor(endpoint: string, options: UnbrowserMcpClientOptions = {}) {
     this.endpoint = normalizeUnbrowserMcpUrl(endpoint);
-    this.fetchImpl = options.fetch ?? fetch;
+		// Keep the global receiver intact in browser workers. A native browser
+		// fetch can reject when it is later called as `this.fetchImpl(...)` with
+		// the client instance as `this` ("Illegal invocation"). Injected test
+		// transports are already ordinary functions and remain untouched.
+		this.fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis);
     this.requestTimeoutMs = positiveInteger(options.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS);
     this.maxResponseBytes = positiveInteger(options.maxResponseBytes, DEFAULT_MAX_RESPONSE_BYTES);
     this.maxExtractChars = positiveInteger(options.maxExtractChars, DEFAULT_MAX_EXTRACT_CHARS);

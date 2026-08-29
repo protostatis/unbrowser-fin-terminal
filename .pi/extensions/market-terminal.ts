@@ -1,9 +1,7 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, SessionStartEvent, Theme } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth, visibleWidth, type OverlayHandle } from "@earendil-works/pi-tui";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import { dirname, isAbsolute, join } from "node:path";
 import { Type } from "typebox";
 import {
 	ResearchCandidateRegistry,
@@ -60,54 +58,117 @@ import {
 } from "../../shared/research-precache-ledger.js";
 import { collectResearchWorkerUsage, isTokenGuardTriggered } from "../../shared/research-worker-usage.js";
 import {
-	DEFAULT_MARKET_EVENT_SOURCES,
-	MarketEventScout,
+	 DEFAULT_MARKET_EVENT_SOURCES,
+  proposeMarketEventTriggerRoute,
+  DEFAULT_MARKET_EVENT_TRIGGER_DISPATCH_POLICY,
+  MARKET_SCOUT_MODEL_ID,
+  MarketEventScout,
 	marketEventScoutFilePath,
 	readMarketEventScoutState,
 	type MarketEventDocumentClient,
 	type MarketEventScoutRunResult,
-	type MarketEventTriggerCandidate,
+ type MarketEventTriggerCandidate,
+  type MarketEventTriggerDispatcher,
 } from "../../shared/market-event-scout.js";
+export { MARKET_SCOUT_MODEL_ID } from "../../shared/market-event-scout.js";
 
-type ChartScope = "day" | "week" | "month" | "year" | "max";
-type ResearchIntent = "brief" | "why";
-type ResearchIdentity = { researchKey: string; intent: ResearchIntent; contextLabel: string };
+// ── kernel imports (stage 1) ──
+import {
+	CHART_SCOPE_CONFIGS,
+	DEFAULT_CHART_SCOPE,
+	SCOPE_KEYS,
+	SCOPE_LABEL_ORDER,
+	mockMondayChartPayload,
+	normalizeChartScope,
+	parseChartPayloadToQuote,
+	readMarketMockMonday,
+	type ChartScope,
+	type ChartSession,
+	type Quote,
+} from "../../shared/kernel/quotes.js";
+import {
+	MOVER_LIMIT,
+	MOVER_UNIVERSE,
+	eligibleMoverQuotes,
+	moverVolumeRowLabel,
+	rankMovers,
+	type RankedMover,
+} from "../../shared/kernel/movers.js";
+import {
+	cleanText,
+} from "../../shared/kernel/text.js";
+import {
+	dollars,
+	quoteTimestampLabel,
+	safeChartTimezone,
+	technicalCanvasBlocks,
+	technicalSnapshot,
+	type Canvas,
+	type CanvasBlock,
+	type CanvasBulletItem,
+	type CanvasChartAnnotation,
+	type CanvasChartBlock,
+	type CanvasMetricItem,
+	type CanvasNewsItem,
+	type CanvasSourceItem,
+	type CanvasStage,
+	type CanvasTableBlock,
+	type DossierCitation,
+	type DossierHint,
+	type EvidencePacket,
+	type EvidenceStatus,
+	type ResearchIntent,
+	type TechnicalSnapshot,
+} from "../../shared/kernel/technicals.js";
+import { sourceIdForUrl } from "../../shared/kernel/hash.js";
+import {
+	createNodeKernelPorts,
+	QUOTE_FETCH_CONCURRENCY,
+	QUOTE_REQUEST_TIMEOUT_MS,
+	type KernelPorts,
+} from "../../shared/kernel/ports.js";
+import {
+	DEFAULT_WATCHLIST,
+	MarketState,
+	type ArchivedResearch,
+	type CanvasQualityCode,
+	type CanvasQualityTelemetry,
+	type PairedCacheIdentity,
+	type PairedCacheTarget,
+	type PrecacheCanaryState,
+	type PrecacheResearchRequest,
+	type PrecacheReservationRef,
+	type ResearchActivity,
+	type ResearchArchiveFile,
+	type ResearchGeneration,
+	type ResearchIdentity,
+	type ResearchJob,
+	type ResearchOutcome,
+	type ResearchPromptVariant,
+	type ResearchSchedulerPhase,
+} from "../../shared/kernel/state.js";
+
+// ── kernel re-exports (stage 1) ──
+export { parseChartPayloadToQuote, readMarketMockMonday, mockMondayChartPayload } from "../../shared/kernel/quotes.js";
+export {
+	moverVolume,
+	moverEligible,
+	compactMoverVolume,
+	moverVolumeRowLabel,
+	eligibleMoverQuotes,
+	rankMovers,
+} from "../../shared/kernel/movers.js";
+export type { MoverVolumeBasis, MoverVolumeResolution } from "../../shared/kernel/movers.js";
+// Re-exported from the kernel so the 61-name export surface stays identical.
+export type { CanvasQualityCode, CanvasQualityTelemetry, PrecacheResearchRequest } from "../../shared/kernel/state.js";
+
 type TickerLayout = "quote" | "research" | "split";
-
-/** Paired pre-cache target carrying exact BRIEF and WHY identities. */
-type PairedCacheIdentity = { researchKey: string; intent: ResearchIntent; contextLabel: string; question: string };
-type PairedCacheTarget = {
-	brief: PairedCacheIdentity;
-	why: PairedCacheIdentity;
-	neededBrief: boolean;
-	neededWhy: boolean;
-};
-type PrecacheReservationRef = { ledgerPath: string; ledgerDate: string; pairKey: string; attempt: number };
 
 const LEGACY_RESEARCH_KEY = "legacy";
 
 function normalizeResearchKey(value: unknown): string {
 	const key = typeof value === "string" ? value.trim().toLowerCase() : "";
 	return /^v\d+\/[a-z0-9][a-z0-9/-]{0,118}[a-z0-9]$/.test(key) ? key : LEGACY_RESEARCH_KEY;
-}
-
-const CHART_SCOPE_CONFIGS: Record<ChartScope, { label: string; yahooRange: string; yahooInterval: string; includePrePost: boolean; key: number }> = {
-	day:   { label: "DAY",   yahooRange: "1d",  yahooInterval: "5m",  includePrePost: true,  key: 1 },
-	week:  { label: "WEEK",  yahooRange: "5d",  yahooInterval: "15m", includePrePost: false, key: 2 },
-	month: { label: "MONTH", yahooRange: "1mo", yahooInterval: "60m", includePrePost: false, key: 3 },
-	year:  { label: "YEAR",  yahooRange: "1y",  yahooInterval: "1d",  includePrePost: false, key: 4 },
-	max:   { label: "TOTAL", yahooRange: "max", yahooInterval: "1mo", includePrePost: false, key: 5 },
-};
-
-const SCOPE_KEYS: Record<number, ChartScope> = { 1: "day", 2: "week", 3: "month", 4: "year", 5: "max" };
-
-const DEFAULT_CHART_SCOPE: ChartScope = "day";
-
-const SCOPE_LABEL_ORDER: ChartScope[] = ["day", "week", "month", "year", "max"];
-const CHART_SCOPE_SET = new Set<ChartScope>(SCOPE_LABEL_ORDER);
-
-function normalizeChartScope(value: unknown): ChartScope {
-	return typeof value === "string" && CHART_SCOPE_SET.has(value as ChartScope) ? value as ChartScope : DEFAULT_CHART_SCOPE;
 }
 
 function canvasKey(symbol: string, scope: ChartScope, researchKey: string = LEGACY_RESEARCH_KEY): string {
@@ -126,178 +187,7 @@ function scopeBarMilliseconds(scope: ChartScope): number {
 					: 30 * 24 * 60 * 60_000;
 }
 
-type ChartSession = "pre" | "regular" | "post" | "unknown";
-
-type Quote = {
-	symbol: string;
-	name: string;
-	exchange: string;
-	currency: string;
-	price: number;
-	change: number | null;
-	changePercent: number | null;
-	previousClose: number | null;
-	dayLow: number | null;
-	dayHigh: number | null;
-	volume: number | null;
-	preMarketVolume: number | null;
-	postMarketVolume: number | null;
-	marketState: string;
-	updatedAt: number | null;
-	points: number[];
-	pointTimes: number[];
-	pointSessions: ChartSession[];
-	pointVolumes: number[];
-	pointOpens: number[];
-	pointHighs: number[];
-	pointLows: number[];
-	timezone: string;
-	interval: string;
-	source: string;
-	chartScope: ChartScope;
-};
-
-type RankedMover = {
-	quote: Quote;
-	score: number;
-	movementPercentile: number;
-	volumePercentile: number;
-	dollarVolume: number;
-	/** Which session the $VOL leg measured: "pre" | "post" | "regular". */
-	volumeSource: "pre" | "post" | "regular";
-	/** True when the volume leg fell back to a different session as a liquidity proxy. */
-	volumeProxied: boolean;
-	/** Volume basis chosen for the whole snapshot: "live" or "proxy". */
-	volumeBasis: MoverVolumeBasis;
-	/** True when no candidate had usable volume — the score is movement-only. */
-	moveOnly: boolean;
-};
-
-type TechnicalSignal = "bullish" | "neutral" | "bearish";
-type TechnicalSnapshot = {
-	symbol: string;
-	currency: string;
-	asOf: number;
-	interval: string;
-	timezone: string;
-	chartScope: ChartScope;
-	price: number;
-	changePercent: number | null;
-	previousClose: number | null;
-	signal: TechnicalSignal;
-	sma20: number | null;
-	ema12: number | null;
-	ema26: number | null;
-	rsi14: number | null;
-	macd: number | null;
-	macdSignal: number | null;
-	macdHistogram: number | null;
-	momentum1h: number | null;
-	lastBarReturn: number | null;
-	lastBarReturnLabel: string;
-	closeLow: number | null;
-	closeHigh: number | null;
-	rangeBars: number;
-	score: number;
-	signalCount: number;
-	sessionPolicy: string;
-	pricePoints: number[];
-	priceTimes: number[];
-	priceSessions: ChartSession[];
-	rsiPoints: number[];
-	rsiTimes: number[];
-	rsiSessions: ChartSession[];
-	trendPoints: number[];
-	trendTimes: number[];
-	trendSessions: ChartSession[];
-	macdHistogramPoints: number[];
-	macdHistogramTimes: number[];
-	macdHistogramSessions: ChartSession[];
-	source: string;
-};
-
-type CanvasMetricItem = { label: string; value: string; delta?: string; note?: string; sourceIds?: string[] };
-type CanvasTableBlock = { id?: string; kind: "table"; title?: string; columns: string[]; rows: string[][]; totalRows?: number; sourceIds?: string[]; dossierHint?: DossierHint };
-type CanvasNewsItem = { headline: string; source?: string; url?: string; note?: string; sourceIds?: string[] };
-type CanvasBulletItem = { text: string; role?: "fact" | "interpretation" | "risk" | "catalyst"; sourceIds?: string[] };
-type CanvasSourceItem = { id: string; label: string; url: string; status?: "search-only" | "fetched" | "challenged" | "failed" | "limited" };
-type DossierHint = "read" | "evidence" | "unknowns" | "scenarios" | "technical" | "sources";
-type EvidenceStatus = "pending" | "available" | "partial" | "blocked" | "none";
-type EvidencePacket = {
-	sourceId: string;
-	sourceTitle: string;
-	sourceDomain: string;
-	sourceUrl: string;
-	excerpt: string;
-	retrievalStatus: "fetched" | "challenged" | "limited" | "failed";
-	extractedAt: number;
-	extractionMode: string;
-	truncated: boolean;
-	failureNote?: string;
-};
-type DossierCitation = { sourceId: string; quote: string };
-type CanvasChartAnnotation = { label: string; value: number; role?: "support" | "resistance" | "signal" };
-type CanvasChartBlock = {
-	id?: string;
-	kind: "chart";
-	title?: string;
-	symbol?: string;
-	points: number[];
-	pointTimes?: number[];
-	pointSessions?: ChartSession[];
-	reference?: number;
-	interval?: string;
-	timezone?: string;
-	currency?: string;
-	asOf?: number;
-	format?: "price" | "percent" | "number";
-	minValue?: number;
-	maxValue?: number;
-	height?: number;
-	chartStyle?: "points" | "line" | "histogram";
-	chartScope?: ChartScope;
-	annotations?: CanvasChartAnnotation[];
-	sourceIds?: string[];
-	dossierHint?: DossierHint;
-};
-type CanvasBlock =
-	| { id?: string; kind: "text"; title?: string; text: string; sourceIds?: string[]; dossierHint?: DossierHint }
-	| { id?: string; kind: "metrics"; title?: string; items: CanvasMetricItem[]; sourceIds?: string[]; dossierHint?: DossierHint }
-	| CanvasTableBlock
-	| { id?: string; kind: "news"; title?: string; items: CanvasNewsItem[]; sourceIds?: string[]; dossierHint?: DossierHint }
-	| { id?: string; kind: "bullets"; title?: string; items: CanvasBulletItem[]; sourceIds?: string[]; dossierHint?: DossierHint }
-	| { id?: string; kind: "sources"; title?: string; items: CanvasSourceItem[]; sourceIds?: string[]; dossierHint?: DossierHint }
-	| CanvasChartBlock;
-type CanvasStage = "partial" | "complete";
-type Canvas = {
-	symbol: string;
-	title: string;
-	content: string;
-	blocks?: CanvasBlock[];
-	updatedAt: number;
-	researchId?: string;
-	stage?: CanvasStage;
-	chartScope?: ChartScope;
-	researchKey?: string;
-	intent?: ResearchIntent;
-	contextLabel?: string;
-	evidencePackets?: EvidencePacket[];
-	evidenceBlocker?: string;
-	evidenceCitations?: DossierCitation[];
-};
 type CanvasDossierRead = { summary: string; sourceIds: string[]; citations: DossierCitation[] };
-type ArchivedResearch = {
-	archiveId: string;
-	symbol: string;
-	question?: string;
-	asOf: number;
-	archivedAt: number;
-	canvas: Canvas;
-	chartScope?: ChartScope;
-	quality?: CanvasQualityTelemetry;
-	generation?: ResearchGeneration;
-};
-type ResearchArchiveFile = { version: 1; updatedAt: number; entries: ArchivedResearch[] };
 type Headline = { title: string; url: string; source: string };
 type EventLaneId = "earnings" | "macro" | "global-relay";
 type EventLane = {
@@ -356,10 +246,8 @@ type TerminalResult =
 		tickerLayout?: TickerLayout;
 		chartScope: ChartScope;
 	}
-	| ({ action: "research"; symbol: string; question: string; returnTo: "quote" | "market"; forceRefresh?: boolean; chartScope: ChartScope; origin?: "precache"; pairedTarget?: PairedCacheTarget; tokenLimit?: number; precacheReservation?: PrecacheReservationRef } & ResearchIdentity);
+	| ({ action: "research"; symbol: string; question: string; returnTo: "quote" | "market"; forceRefresh?: boolean; chartScope: ChartScope; origin?: "precache" | "scout"; pairedTarget?: PairedCacheTarget; tokenLimit?: number; precacheReservation?: PrecacheReservationRef; modelProvider?: "openrouter"; modelId?: string; scoutCandidateId?: string } & ResearchIdentity);
 type ResearchRequest = Extract<TerminalResult, { action: "research" }>;
-type ResearchOutcome = "queued" | "running" | "partial" | "complete" | "failed" | "cancelled";
-type ResearchActivity = "seeding" | "fetching" | "extracting" | "synthesizing";
 export type DiscoveryCandidate = {
 	id: string;
 	title: string;
@@ -368,31 +256,6 @@ export type DiscoveryCandidate = {
 	status: "search-only";
 	candidateId?: string;
 };
-type ResearchSchedulerPhase = "queued" | "dispatched" | "running" | "cancelling" | "settled";
-type ResearchPromptVariant = "legacy" | "compact" | "compact-strict" | "paired-v1";
-type ResearchJob = {
-	id: string;
-	symbol: string;
-	question: string;
-	returnTo: "quote" | "market";
-	outcome: ResearchOutcome;
-	activity: ResearchActivity;
-	startedAt: number;
-	updatedAt: number;
-	slotHeld: boolean;
-	phase: ResearchSchedulerPhase;
-	settledAt?: number;
-	toolName?: string;
-	error?: string;
-	publishedBlocks: number;
-	evidencePackets?: EvidencePacket[];
-	chartScope: ChartScope;
-	origin?: "precache";
-	promptVariant?: ResearchPromptVariant;
-	pairedTarget?: PairedCacheTarget;
-	tokenLimit?: number;
-	precacheReservation?: PrecacheReservationRef;
-} & ResearchIdentity;
 type ResearchActionResponse = { accepted: boolean; status: string; job?: ResearchJob };
 type ResearchActions = {
 	start: (request: ResearchRequest) => ResearchActionResponse;
@@ -543,20 +406,15 @@ const publicSessionResearchLimit = (() => {
 	}
 	return value;
 })();
-let publicSessionResearchRuns = 0;
-const canvases = new Map<string, Canvas>();
-const researchArchive = new Map<string, ArchivedResearch[]>();
-const researchJobs = new Map<string, ResearchJob>();
-const latestResearchBySymbol = new Map<string, string>();
-const researchQueue: string[] = [];
-const toolResearchJobs = new Map<string, string>();
-const researchCandidates = new ResearchCandidateRegistry({ maxExtractions: 4, ttlMs: 15 * 60_000 });
-const researchExtracts = new Map<string, Map<string, string>>();
-const workerSubmittedResearch = new Set<string>();
-const workerFinalizations = new Set<string>();
-/** Complete strict pair splits held until both archive mutation and validation finish. */
-const pendingPairedCanvases = new Map<string, { brief: Canvas; why: Canvas }>();
-const isResearchWorkerProcess = process.env.MARKET_RESEARCH_WORKER === "1";
+
+/** Instance-based container for every mutable research/UI-adjacent value (per-session MarketState; module-scope singleton in the Pi runtime). */
+let state = new MarketState(createNodeKernelPorts());
+let runtimeConfigured = false;
+// The Node worker gets this from process.env before module import. Browser
+// workers additionally pass the role explicitly through the runtime seam so a
+// bundled module cannot accidentally initialize as the parent coordinator.
+let isResearchWorkerProcess = process.env.MARKET_RESEARCH_WORKER === "1";
+let isBrowserSession = false;
 type WorkerBridge = {
 	parentJobId: string;
 	attemptId: string;
@@ -566,17 +424,7 @@ type WorkerBridge = {
 };
 let workerBridge: WorkerBridge | undefined;
 let researchWorkerCoordinator: ResearchWorkerCoordinator | undefined;
-let archiveCwd: string | undefined;
-let archivePath: string | undefined;
-let archiveReady: Promise<void> | undefined;
-let archiveWriteQueue: Promise<void> = Promise.resolve();
-let runningResearchId: string | undefined;
-let researchSequence = 0;
 let activeTerminal: MarketTerminal | MarketHub | undefined;
-/** Once-per-bootstrap guard for the research cache pre-warm; cleared by resetResearchJobs. */
-let precacheWarmState = false;
-/** Pre-warm candidates not yet submitted to the research queue; drained progressively. */
-let precachePending: PrecacheResearchRequest[] = [];
 /** Settle-driven re-pump hook for the pre-warm dispatcher; wired inside the extension factory. */
 let requestPrecachePump: (() => void) | undefined;
 /** Host-side quality feedback for completed pre-warm jobs; wired inside the extension factory. */
@@ -585,15 +433,47 @@ let reportPrecacheQuality: ((counts: PrecacheOutcomeCounts & { jobId: string }) 
 const PRECACHE_DEGRADED_THRESHOLD = 3;
 /** Cooldown while the pre-warm circuit is open (configured-but-broken extractor outage). */
 const PRECACHE_CIRCUIT_COOLDOWN_MS = 15 * 60_000;
-let precacheDegradedStreak = 0;
-let precacheCircuitOpenUntil = 0;
-/** The first warm job acts as an extraction canary; the rest of the plan waits for its verdict. */
-type PrecacheCanaryState = "none" | "required" | "active" | "passed";
-let precacheCanaryState: PrecacheCanaryState = "none";
-let precacheCanaryJobId: string | undefined;
-/** Bumped on resetResearchJobs; warm continuations verify it after every await. */
-let warmGeneration = 0;
-let precacheLedgerWriteQueue: Promise<void> = Promise.resolve();
+
+/**
+ * Replace the default Node ports before registering the extension.
+ *
+ * Pi continues to use the default Node ports. The browser alpha imports the
+ * module dynamically, calls this once, and then invokes the same default
+ * extension factory. Keeping the seam here avoids a second browser copy of
+ * the 9k-line extension while still making storage/transport/worker ownership
+ * explicit at the host boundary.
+ */
+export function configureMarketTerminalRuntime(
+	ports: KernelPorts,
+	options: { workerProcess?: boolean; browserSession?: boolean } = {},
+): void {
+	if (runtimeConfigured) {
+		throw new Error("Market terminal runtime is already configured");
+	}
+	state = new MarketState(ports);
+	if (options.workerProcess !== undefined) isResearchWorkerProcess = options.workerProcess;
+	if (options.browserSession !== undefined) isBrowserSession = options.browserSession;
+	workerBridge = undefined;
+	researchWorkerCoordinator = undefined;
+	activeTerminal = undefined;
+	requestPrecachePump = undefined;
+	reportPrecacheQuality = undefined;
+	runtimeConfigured = true;
+}
+
+/** Reset the browser seam after a complete session shutdown so reconnecting in
+ * the same tab creates a fresh state container. Pi never calls this. */
+export function resetMarketTerminalRuntime(): void {
+	if (!runtimeConfigured) return;
+	state = new MarketState(createNodeKernelPorts());
+	isBrowserSession = false;
+	workerBridge = undefined;
+	researchWorkerCoordinator = undefined;
+	activeTerminal = undefined;
+	requestPrecachePump = undefined;
+	reportPrecacheQuality = undefined;
+	runtimeConfigured = false;
+}
 
 export type PrecacheOutcomeCounts = {
 	outcome: ResearchOutcome;
@@ -782,23 +662,9 @@ const MARKET_BOARDS = [
 	{ label: "ETHER", symbol: "ETH-USD", group: "CRYPTO" },
 	{ label: "SOLANA", symbol: "SOL-USD", group: "CRYPTO" },
 ] as const;
-const MOVER_UNIVERSE = [
-	"AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AMD", "AVGO", "NFLX", "ORCL", "CRM", "PLTR", "INTC", "MU", "QCOM",
-	"ADBE", "NOW", "PANW", "CRWD", "AMAT", "LRCX", "KLAC", "ADI", "TXN", "MRVL", "ARM", "SMCI", "DELL", "IBM", "CSCO", "UBER", "ABNB", "SNOW",
-	"JPM", "BAC", "GS", "V", "MA", "COIN", "BRK-B", "MS", "C", "WFC", "AXP", "SCHW", "BLK", "COF", "HOOD", "PYPL", "SOFI",
-	"XOM", "CVX", "COP", "SLB", "EOG", "OXY", "MPC", "VLO",
-	"LLY", "UNH", "JNJ", "PFE", "ABBV", "MRK", "AMGN", "GILD", "TMO", "ABT", "MDT", "BMY", "CVS", "HCA",
-	"WMT", "COST", "HD", "DIS", "NKE", "MCD", "F", "GM", "TGT", "LOW", "SBUX", "CMG", "BKNG", "MAR", "RCL", "CCL", "DAL", "UAL", "LULU", "ROST", "TJX", "KO", "PEP", "PM",
-	"BA", "CAT", "GE", "T", "VZ", "DE", "RTX", "LMT", "HON", "UPS", "FDX", "ETN", "CMCSA", "TMUS", "SNAP", "PINS", "ROKU", "NEE", "FCX", "NEM",
-] as const;
-const MOVER_LIMIT = 100;
-const MOVER_MOVEMENT_WEIGHT = 0.65;
-const MOVER_VOLUME_WEIGHT = 0.35;
-const QUOTE_FETCH_CONCURRENCY = 8;
-const QUOTE_REQUEST_TIMEOUT_MS = 12_000;
+
 const SNAPSHOT_STALE_AFTER_MS = 5 * 60_000;
 const MAX_SETTLED_RESEARCH_JOBS = 50;
-const DEFAULT_WATCHLIST = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "TSLA", "JPM", "XLE", "TLT", "GLD", "BTC-USD"] as const;
 const MARKET_SCREEN_NAMES = ["MARKET", "SIGNALS", "EVENTS", "MOVERS", "WATCH"] as const;
 const WATCHLIST_SESSION_CUSTOM_TYPE = "market-watchlist";
 const MARKET_SCREEN = {
@@ -808,22 +674,16 @@ const MARKET_SCREEN = {
 	movers: 3,
 	watch: 4,
 } as const;
-// Mutable, session-scoped watchlist so users can add/remove tickers in-terminal.
-let watchlist: string[] = [...DEFAULT_WATCHLIST];
 
-/** Shared, process-scoped crypto pulse cache (stale-while-revalidate). */
-const CRYPTO_PULSE_CACHE = new CryptoPulseCache(60_000);
 
 /** Test seam: override the crypto pulse fetch with deterministic fixtures. */
 let cryptoPulseFetchImpl: FetchLike | undefined;
 export function setCryptoPulseFetchImplForTest(fetchImpl: FetchLike | undefined): void {
 	cryptoPulseFetchImpl = fetchImpl;
 	// Reset the shared snapshot cache so tests never reuse another fixture's data.
-	CRYPTO_PULSE_CACHE.clear();
+	state.CRYPTO_PULSE_CACHE.clear();
 }
 
-/** Monotonic request sequence so a superseded refresh can never write stale UI. */
-let cryptoPulseRequestSequence = 0;
 
 /** Env-gated kill switch for the undocumented PanicRadar frontend API. */
 function readPanicRadarEnabled(): boolean {
@@ -836,8 +696,7 @@ function readPanicRadarEnabled(): boolean {
 }
 
 function resetWatchlist(): void {
-	// Open panels retain this array by reference, so session resets mutate it.
-	watchlist.splice(0, watchlist.length, ...DEFAULT_WATCHLIST);
+	state.resetWatchlist();
 }
 
 /** Restore a bounded snapshot without letting malformed entries erase defaults. */
@@ -850,7 +709,7 @@ function restoreWatchlistSnapshot(value: unknown): boolean {
 		.slice(0, WATCHLIST_MAX_SYMBOLS);
 	if (value.length > 0 && symbols.length === 0) return false;
 	const update = updateWatchlistSymbols([], symbols, "replace", WATCHLIST_MAX_SYMBOLS);
-	watchlist.splice(0, watchlist.length, ...update.symbols);
+	state.watchlist.splice(0, state.watchlist.length, ...update.symbols);
 	return true;
 }
 
@@ -868,172 +727,6 @@ function watchlistImportStatus(update: WatchlistUpdate, mode: WatchlistUpdateMod
 	const action = mode === "replace" ? "WATCHLIST REPLACED" : "WATCHLIST UPDATED";
 	const skipped = update.invalid + update.duplicates + update.truncated;
 	return `${action} · ${update.added} ADDED · ${update.symbols.length} ON WATCH${skipped ? ` · ${skipped} SKIPPED` : ""}`;
-}
-function percentileScore(values: number[], value: number): number {
-	if (values.length <= 1) return 1;
-	let below = 0;
-	let equal = 0;
-	for (const candidate of values) {
-		if (candidate < value) below++;
-		else if (candidate === value) equal++;
-	}
-	return (below + Math.max(0, equal - 1) / 2) / (values.length - 1);
-}
-
-function positiveFinite(value: number | null | undefined): number | null {
-	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
-}
-
-function isExtendedSession(marketState: string): boolean {
-	const state = (marketState || "").toUpperCase();
-	return state.startsWith("PRE") || state.startsWith("POST");
-}
-
-/** Volume basis for an entire mover snapshot:
- *  - "live"  → each PRE/POST quote ranks on its own extended-session volume;
- *              quotes whose extended volume is missing rank movement-only ($VOL 0).
- *  - "proxy" → PRE/POST quotes without extended-session volume rank on the
- *              regular-session figure, uniformly, always labeled as a proxy.
- * A snapshot picks ONE basis so a pre-market move is never pitted against a
- * previous-session proxy inside the same percentile distribution. */
-export type MoverVolumeBasis = "live" | "proxy";
-
-export type MoverVolumeResolution = {
-	/** Shares used for the $VOL leg of the mover score. */
-	volume: number;
-	/** Which session the volume figure actually measures. */
-	session: "pre" | "post" | "regular";
-	/** True when the volume leg fell back to a different session than the one the quote trades in. */
-	proxied: boolean;
-};
-
-/**
- * Session-aware volume for mover scoring.
- *
- * - PRE → prefer live pre-market volume; under the "proxy" basis, fall back to
- *   the regular-session volume (proxy signal) when Yahoo ships no pre-market
- *   volume. Under the "live" basis, a missing pre-market volume resolves to 0
- *   so the quote ranks movement-first instead of inheriting a foreign figure.
- * - POST → same, preferring post-market volume.
- * - regular → the regular-session volume, unchanged from the legacy formula.
- */
-export function moverVolume(quote: Quote, basis: MoverVolumeBasis = "proxy"): MoverVolumeResolution {
-	const state = (quote.marketState || "").toUpperCase();
-	const regular = positiveFinite(quote.volume);
-	if (state.startsWith("PRE")) {
-		const pre = positiveFinite(quote.preMarketVolume);
-		if (pre !== null) return { volume: pre, session: "pre", proxied: false };
-		if (basis === "proxy" && regular !== null) return { volume: regular, session: "regular", proxied: true };
-		return { volume: 0, session: "pre", proxied: false };
-	}
-	if (state.startsWith("POST")) {
-		const post = positiveFinite(quote.postMarketVolume);
-		if (post !== null) return { volume: post, session: "post", proxied: false };
-		if (basis === "proxy" && regular !== null) return { volume: regular, session: "regular", proxied: true };
-		return { volume: 0, session: "post", proxied: false };
-	}
-	return { volume: regular ?? 0, session: "regular", proxied: false };
-}
-
-/**
- * Extended sessions may carry a real pre/post-market move while Yahoo has not
- * yet populated any volume field. Those quotes stay eligible (movement-first),
- * because dropping them makes the pre-market mover list vanish entirely.
- */
-export function moverEligible(marketState: string, volume: number | null): boolean {
-	if (isExtendedSession(marketState)) return true;
-	return positiveFinite(volume) !== null;
-}
-
-/** Compact volume always ≤ 5 chars ("1.2M", "988K", "45M", "900"), offsets the
- *  session tag so the row label stays inside the fixed 11-char field. */
-export function compactMoverVolume(volume: number): string {
-	if (volume >= 1_000_000) {
-		const millions = volume / 1_000_000;
-		return `${millions >= 100 ? String(Math.round(millions)) : String(Math.round(millions * 10) / 10)}M`;
-	}
-	if (volume >= 1_000) {
-		const thousands = volume / 1_000;
-		return `${thousands >= 100 ? String(Math.round(thousands)) : String(Math.round(thousands * 10) / 10)}K`;
-	}
-	return String(Math.round(volume));
-}
-
-/** Short, honest volume-leg label for a mover row.
- *  Live extended-session volume: "VOL PM 1.2M" / "VOL AF 988K".
- *  Proxied (regular-session figure): "VOL 8.1M~" — always marked, never dressed as extended volume.
- *  Movement-only (no usable volume): "VOL --". */
-export function moverVolumeRowLabel(quote: Quote, basis: MoverVolumeBasis = "proxy"): string {
-	const resolution = moverVolume(quote, basis);
-	if (resolution.volume <= 0) return "VOL --";
-	const sessionLabel = resolution.proxied ? "" : resolution.session === "pre" ? "PM " : resolution.session === "post" ? "AF " : "";
-	const proxyMark = resolution.proxied ? "~" : "";
-	return `VOL ${sessionLabel}${compactMoverVolume(resolution.volume)}${proxyMark}`;
-}
-
-export function eligibleMoverQuotes(quotes: Quote[]): Quote[] {
-	const eligibleSymbols = new Set<string>(MOVER_UNIVERSE);
-	return quotes.filter((quote) =>
-		eligibleSymbols.has(quote.symbol)
-		&& typeof quote.changePercent === "number"
-		&& Number.isFinite(quote.changePercent)
-		&& Number.isFinite(quote.price)
-		&& quote.price > 0
-		&& moverEligible(quote.marketState, quote.volume),
-	);
-}
-
-export function rankMovers(quotes: Quote[], limit = MOVER_LIMIT): RankedMover[] {
-	const candidates = eligibleMoverQuotes(quotes);
-	// One basis per snapshot: if ANY candidate carries a live extended-session
-	// volume figure, everyone else in an extended session ranks movement-first
-	// rather than inheriting a regular-session proxy into a mixed distribution.
-	// When NO candidate has live extended volume, extended quotes uniformly use
-	// the regular-session figure as a labeled liquidity proxy.
-	const hasLiveExtendedVolume = candidates.some(
-		(quote) => (quote.marketState || "").toUpperCase().startsWith("PRE")
-			? positiveFinite(quote.preMarketVolume) !== null
-			: (quote.marketState || "").toUpperCase().startsWith("POST")
-				? positiveFinite(quote.postMarketVolume) !== null
-				: false,
-	);
-	const basis: MoverVolumeBasis = hasLiveExtendedVolume ? "live" : "proxy";
-	const withVolume = candidates.map((quote) => ({ quote, volume: moverVolume(quote, basis) }));
-	const movements = withVolume.map((entry) => Math.abs(entry.quote.changePercent!));
-	const dollarVolumes = withVolume.map((entry) => entry.quote.price * entry.volume.volume);
-	// When no candidate has any usable volume (e.g. a pre-market move with no
-	// extended volume anywhere), the $VOL leg is meaningless; flag the snapshot
-	// as move-only so the UI stops implying 65/35 liquidity scoring.
-	const moveOnly = dollarVolumes.every((dollarVolume) => dollarVolume <= 0);
-	return withVolume
-		.map(({ quote, volume }): RankedMover => {
-			const movement = Math.abs(quote.changePercent!);
-			const dollarVolume = quote.price * volume.volume;
-			const movementPercentile = percentileScore(movements, movement);
-			const volumePercentile = moveOnly
-				? 0
-				: percentileScore(dollarVolumes, dollarVolume);
-			// Move-only snapshots score purely on movement; otherwise 65/35.
-			const score = moveOnly
-				? movementPercentile
-				: movementPercentile * MOVER_MOVEMENT_WEIGHT + volumePercentile * MOVER_VOLUME_WEIGHT;
-			return {
-				quote,
-				score,
-				movementPercentile,
-				volumePercentile,
-				dollarVolume,
-				volumeSource: volume.session,
-				volumeProxied: volume.proxied,
-				volumeBasis: basis,
-				moveOnly,
-			};
-		})
-		.sort((a, b) => b.score - a.score
-			|| Math.abs(b.quote.changePercent!) - Math.abs(a.quote.changePercent!)
-			|| b.dollarVolume - a.dollarVolume
-			|| a.quote.symbol.localeCompare(b.quote.symbol))
-		.slice(0, Math.max(0, limit));
 }
 
 function selectionWindow<T>(items: readonly T[], selected: number, capacity: number): { start: number; items: T[] } {
@@ -1068,6 +761,78 @@ const EVENT_LANES: readonly EventLane[] = [
 		whyQuestion: "Explain how the current Asia and crypto handoff could transmit into the next US session: distinguish evidence from inference, map cross-asset channels, give bull/base/bear scenarios, and name triggers and disconfirming evidence.",
 	},
 ] as const;
+
+export function marketScoutDispatchRequest(candidate: MarketEventTriggerCandidate, modelId: string): ResearchRequest | undefined {
+	const route = proposeMarketEventTriggerRoute({
+		id: candidate.decisionId,
+		sourceId: candidate.sourceId,
+		sourceLabel: candidate.sourceId,
+		eventId: candidate.decisionId,
+		observedAt: candidate.observedAt,
+		...(candidate.publishedAt !== undefined ? { publishedAt: candidate.publishedAt } : {}),
+		title: candidate.title,
+		...(candidate.url ? { url: candidate.url } : {}),
+		eventClass: candidate.eventClass,
+		association: candidate.association,
+		symbols: candidate.route?.kind === "ticker-brief" ? [candidate.route.symbol] : [],
+		target: candidate.route?.kind === "ticker-brief"
+			? { kind: "ticker", symbol: candidate.route.symbol }
+			: candidate.route?.kind === "macro-event-brief"
+				? { kind: "market", lane: "macro" }
+				: candidate.route?.kind === "market-story-brief"
+					? { kind: "market", lane: "story" }
+					: undefined,
+		disposition: candidate.disposition,
+		priority: candidate.priority,
+		reasonCodes: candidate.decisionReasonCodes,
+	});
+	if (!route) return undefined;
+
+	const title = candidate.title.replace(/\s+/g, " ").slice(0, 150);
+	const source = candidate.url?.slice(0, 180) || "none";
+	const published = new Date(candidate.publishedAt ?? candidate.observedAt).toISOString();
+	const anchor = `TRIGGER DATA ONLY: title=${JSON.stringify(title)}; published=${published}; source=${JSON.stringify(source)}.`;
+	if (route.kind === "ticker-brief") {
+		return {
+			action: "research",
+			symbol: route.symbol,
+			question: `${anchor} Verify this event first, then build a source-verified factual brief of the latest company developments, catalysts, key numbers, dates, and unknowns.`,
+			returnTo: "market",
+			chartScope: DEFAULT_CHART_SCOPE,
+			...tickerResearchIdentity(route.symbol, "brief"),
+			origin: "scout",
+			modelProvider: "openrouter",
+			modelId,
+			scoutCandidateId: candidate.id,
+		};
+	}
+	if (route.kind === "macro-event-brief") {
+		return {
+			action: "research",
+			symbol: "MARKET",
+			question: `${anchor} Verify this catalyst first, then build a source-verified macro monitor covering rates, inflation, growth, oil, transmission channels, and unknowns.`,
+			returnTo: "market",
+			chartScope: DEFAULT_CHART_SCOPE,
+			...eventResearchIdentity(EVENT_LANES.find((lane) => lane.id === "macro")!, "brief"),
+			origin: "scout",
+			modelProvider: "openrouter",
+			modelId,
+			scoutCandidateId: candidate.id,
+		};
+	}
+	return {
+		action: "research",
+		symbol: "MARKET",
+		question: `${anchor} Verify this catalyst first, then build a source-verified market story with evidence, transmission channels, and unknowns.`,
+		returnTo: "market",
+		chartScope: DEFAULT_CHART_SCOPE,
+		...marketStoryIdentity("brief"),
+		origin: "scout",
+		modelProvider: "openrouter",
+		modelId,
+		scoutCandidateId: candidate.id,
+	};
+}
 
 function eventResearchIdentity(lane: EventLane, intent: ResearchIntent): ResearchIdentity {
 	return {
@@ -1156,21 +921,6 @@ export function headlineWhyQuestion(title: string): string {
 	return `Analyze why this headline matters and how it could transmit across markets: ${title}. Separate evidence from inference, provide alternative scenarios, and identify disconfirming evidence.`;
 }
 
-export type PrecacheResearchRequest = {
-	symbol: string;
-	question: string;
-	chartScope: ChartScope;
-	researchKey: string;
-	intent: ResearchIntent;
-	contextLabel: string;
-	/** Optional paired target for warm contexts (BRIEF + WHY in one run). */
-	pairedTarget?: PairedCacheTarget;
-	/** Per-run token ceiling reserved for this paired attempt. */
-	tokenLimit?: number;
-	/** Parent-only durable reservation correlation; never sent to the worker. */
-	precacheReservation?: PrecacheReservationRef;
-};
-
 /**
  * A canvas is "fresh to the current date" when it was published on the same
  * UTC calendar date as `now`. Pre-warming rebuilds a candidate only when the
@@ -1218,7 +968,7 @@ export function buildPairedPrecachePlan(options: PairedPrecachePlanOptions): Pre
 		};
 		plan.push({
 			symbol,
-			question: "Build paired BRIEF and WHY canvases from one shared evidence pass.",
+			question: "Build paired BRIEF and WHY state.canvases from one shared evidence pass.",
 			chartScope: DEFAULT_CHART_SCOPE,
 			researchKey: `v1/paired/${pairKey.slice("pair-".length)}`,
 			intent: "brief",
@@ -1381,13 +1131,53 @@ export function readPrecacheEnabled(): boolean {
 
 /** Shadow scouting is opt-in and never runs in disposable/public workers. */
 export function readMarketScoutEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-	if (env.MARKET_RESEARCH_WORKER === "1" || env.PUBLIC_SESSION_WORKER === "1" || env.TERMINAL_RUNTIME_MODE === "public-gateway") return false;
+	if (env.MARKET_RESEARCH_WORKER === "1" || env.PUBLIC_SESSION_WORKER === "1"
+		|| env.TERMINAL_RUNTIME_MODE === "public-gateway" || env.TERMINAL_RUNTIME_MODE === "private-workspace"
+		|| env.FINANCIAL_WORKSPACE_CHECKPOINTS === "1") return false;
 	const raw = env.MARKET_SCOUT_ENABLED?.trim();
 	if (raw === undefined || raw === "") return false;
 	const value = raw.toLowerCase();
 	if (value === "1" || value === "true" || value === "on") return true;
 	if (value === "0" || value === "false" || value === "off") return false;
-	throw new Error("MARKET_SCOUT_ENABLED must be 1/true/on or 0/false/off");
+  throw new Error("MARKET_SCOUT_ENABLED must be 1/true/on or 0/false/off");
+}
+
+/** Real event dispatch is a separate, default-off kill switch. */
+export function readMarketScoutDispatchEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+	if (!readMarketScoutEnabled(env)) return false;
+	const raw = env.MARKET_SCOUT_DISPATCH_ENABLED?.trim();
+	if (raw === undefined || raw === "") return false;
+	const value = raw.toLowerCase();
+	if (value === "1" || value === "true" || value === "on") return true;
+	if (value === "0" || value === "false" || value === "off") return false;
+	throw new Error("MARKET_SCOUT_DISPATCH_ENABLED must be 1/true/on or 0/false/off");
+}
+
+export function readMarketScoutModelId(env: NodeJS.ProcessEnv = process.env): string {
+	const configured = env.MARKET_SCOUT_MODEL_ID?.trim();
+	if (configured && configured !== MARKET_SCOUT_MODEL_ID) {
+		throw new Error(`MARKET_SCOUT_MODEL_ID must be ${MARKET_SCOUT_MODEL_ID}`);
+	}
+	return MARKET_SCOUT_MODEL_ID;
+}
+
+function readMarketScoutDispatchCap(
+	env: NodeJS.ProcessEnv,
+	name: "MARKET_SCOUT_DISPATCH_PER_RUN" | "MARKET_SCOUT_DISPATCH_DAILY_CAP",
+	fallback: number,
+): number {
+	const raw = env[name]?.trim();
+	if (!raw) return fallback;
+	const value = Number(raw);
+	if (value !== fallback) throw new Error(`${name} is pinned to ${fallback}`);
+	return value;
+}
+
+export function readMarketScoutDispatchPolicy(env: NodeJS.ProcessEnv = process.env): { perRunCap: number; dailyCap: number } {
+	return {
+		perRunCap: readMarketScoutDispatchCap(env, "MARKET_SCOUT_DISPATCH_PER_RUN", DEFAULT_MARKET_EVENT_TRIGGER_DISPATCH_POLICY.perRunCap),
+		dailyCap: readMarketScoutDispatchCap(env, "MARKET_SCOUT_DISPATCH_DAILY_CAP", DEFAULT_MARKET_EVENT_TRIGGER_DISPATCH_POLICY.dailyCap),
+	};
 }
 
 /** Development-only opt-in; production never silently falls back from MCP. */
@@ -1452,18 +1242,6 @@ export function readPrecacheQualityGate(): boolean {
 	throw new Error("MARKET_PRECACHE_QUALITY_GATE must be 1/true/on or 0/false/off");
 }
 
-function dollars(value: number | null, currency = "USD"): string {
-	if (value === null || !Number.isFinite(value)) return "--";
-	try {
-		return new Intl.NumberFormat("en-US", {
-			style: "currency",
-			currency,
-			maximumFractionDigits: 2,
-		}).format(value);
-	} catch {
-		return `${currency} ${value.toFixed(2)}`;
-	}
-}
 
 function compactNumber(value: number | null): string {
 	if (value === null || !Number.isFinite(value)) return "--";
@@ -1521,12 +1299,6 @@ function isViewportNavigationInput(data: string): boolean {
 // Turn raw unbrowser bot-wall telemetry into a calm, user-facing note.
 function challengeNote(challenge?: string): string {
 	return challenge ? `Some sources may be limited (bot wall detected)` : `Discovery clear`;
-}
-
-function cleanText(value: unknown): string {
-	return String(value ?? "")
-		.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F\x1B\u202A-\u202E\u2066-\u2069]/g, "")
-		.replace(/\r\n?/g, "\n");
 }
 
 /**
@@ -1976,275 +1748,9 @@ function renderArcadeController(lines: string[], width: number, th: Theme, fit: 
 	lines.push(fit(th.fg(opts.cancel ? "warning" : "dim", parts.join(sep))));
 }
 
-/**
- * Pure parser for a Yahoo chart v8 response → Quote.
- *
- * The chart API does not reliably ship meta.marketState / preMarketPrice /
- * postMarketPrice (verified against the live endpoint: the current meta carries
- * neither). The session is therefore DERIVED from the chart's own bars: each
- * bar is tagged pre/regular/post against currentTradingPeriod, and the last
- * bar determines the live session (REGULAR/PRE/POST). The extended price is the
- * last close in that session's bars (the chart includes pre/post bars when
- * includePrePost=true). meta.marketState, when present, still wins — some
- * deployments/response variants return it.
- */
-function normalizeMarketState(raw: string): string {
-	const upper = raw.toUpperCase().replace("PREPRE", "PRE").replace("POSTPOST", "POST");
-	if (upper === "PRE" || upper === "POST" || upper === "REGULAR" || upper === "CLOSED") return upper;
-	return "UNKNOWN";
-}
-
-export function parseChartPayloadToQuote(
-	symbol: string,
-	payload: unknown,
-	cfg: { yahooInterval: string; includePrePost: boolean; chartScope: ChartScope },
-): Quote {
-	const chart = (payload as {
-		chart?: { result?: Array<{ meta?: Record<string, unknown>; timestamp?: Array<number | null>; indicators?: { quote?: Array<{ close?: Array<number | null>; open?: Array<number | null>; high?: Array<number | null>; low?: Array<number | null>; volume?: Array<number | null> }> } }> };
-	})?.chart?.result?.[0];
-	const meta = chart?.meta;
-	if (!chart || !meta) throw new Error("quote response contained no chart data");
-
-	const rawCloses = chart.indicators?.quote?.[0]?.close ?? [];
-	const rawOpens = chart.indicators?.quote?.[0]?.open ?? [];
-	const rawHighs = chart.indicators?.quote?.[0]?.high ?? [];
-	const rawLows = chart.indicators?.quote?.[0]?.low ?? [];
-	const rawVolumes = chart.indicators?.quote?.[0]?.volume ?? [];
-	const rawTimes = chart.timestamp ?? [];
-	const validCloses = rawCloses.filter((value): value is number => typeof value === "number" && Number.isFinite(value));
-	const tradingPeriods = meta.currentTradingPeriod && typeof meta.currentTradingPeriod === "object"
-		? meta.currentTradingPeriod as Record<string, unknown>
-		: {};
-	const periodBounds = (key: "pre" | "regular" | "post"): { start: number; end: number } | undefined => {
-		const value = tradingPeriods[key];
-		if (!value || typeof value !== "object") return undefined;
-		const period = value as Record<string, unknown>;
-		return typeof period.start === "number" && typeof period.end === "number"
-			? { start: period.start, end: period.end }
-			: undefined;
-	};
-	const pre = cfg.includePrePost ? periodBounds("pre") : undefined;
-	const regular = periodBounds("regular");
-	const post = cfg.includePrePost ? periodBounds("post") : undefined;
-	const sessionAt = (timestampSeconds: number): ChartSession => {
-		if (regular && timestampSeconds >= regular.start && timestampSeconds < regular.end) return "regular";
-		if (pre && timestampSeconds >= pre.start && timestampSeconds < pre.end) return "pre";
-		if (post && timestampSeconds >= post.start && timestampSeconds <= post.end) return "post";
-		return "unknown";
-	};
-	const alignedPoints: number[] = [];
-	const alignedTimes: number[] = [];
-	const alignedSessions: ChartSession[] = [];
-	const alignedVolumes: number[] = [];
-	const alignedOpens: number[] = [];
-	const alignedHighs: number[] = [];
-	const alignedLows: number[] = [];
-	for (let index = 0; index < rawCloses.length; index++) {
-		const close = rawCloses[index];
-		const timestamp = rawTimes[index];
-		if (typeof close !== "number" || !Number.isFinite(close) || typeof timestamp !== "number" || !Number.isFinite(timestamp)) continue;
-		alignedPoints.push(close);
-		alignedTimes.push(timestamp * 1000);
-		alignedSessions.push(sessionAt(timestamp));
-		const volume = rawVolumes[index];
-		alignedVolumes.push(typeof volume === "number" && Number.isFinite(volume) ? volume : 0);
-		const open = rawOpens[index];
-		const high = rawHighs[index];
-		const low = rawLows[index];
-		alignedOpens.push(typeof open === "number" && Number.isFinite(open) ? open : close);
-		alignedHighs.push(typeof high === "number" && Number.isFinite(high) ? high : close);
-		alignedLows.push(typeof low === "number" && Number.isFinite(low) ? low : close);
-	}
-	const hasTimedSeries = alignedPoints.length >= 2;
-	const closes = hasTimedSeries ? alignedPoints : validCloses;
-	const pointTimes = hasTimedSeries ? alignedTimes : [];
-	const pointSessions = hasTimedSeries ? alignedSessions : [];
-	const number = (key: string): number | null => (typeof meta[key] === "number" ? (meta[key] as number) : null);
-	const metaState = typeof meta.marketState === "string" ? normalizeMarketState(meta.marketState) : "UNKNOWN";
-	// Derive the session from the last tagged bar: includePrePost=true carries
-	// pre/post bars, so the last bar tells us which session is live without
-	// trusting meta keys that the current endpoint omits. A single valid bar
-	// (e.g. the first data point of an early pre-market refresh) is enough.
-	const lastSession = alignedPoints.length > 0 ? alignedSessions.at(-1) : undefined;
-	const derivedState = lastSession === "pre" ? "PRE" : lastSession === "post" ? "POST" : lastSession === "regular" ? "REGULAR" : "CLOSED";
-	const marketState = metaState !== "UNKNOWN" ? metaState : derivedState;
-	// Last close of the active session — the live price including pre/post bars.
-	const lastSessionClose = alignedPoints.length > 0 ? alignedPoints.at(-1) : undefined;
-	const extendedPrice = marketState === "POST"
-		? number("postMarketPrice") ?? (lastSession === "post" ? lastSessionClose : null) ?? null
-		: marketState === "PRE" ? number("preMarketPrice") ?? (lastSession === "pre" ? lastSessionClose : null) ?? null : null;
-	const price = extendedPrice ?? number("regularMarketPrice") ?? closes.at(-1);
-	if (price === undefined || price === null) throw new Error("quote response contained no market price");
-	const previousClose = number("previousClose") ?? number("chartPreviousClose");
-	const change = previousClose === null ? null : price - previousClose;
-	// Pre/post volume is not part of the public chart meta; the bars also tag it
-	// null there. Opportunistic capture keeps the mover volume leg honest when a
-	// future/alternate feed does ship it. Volumes are aligned with sessions at
-	// build time, so skipped invalid bars cannot misalign the sum.
-	const extendedTime = marketState === "POST"
-		? number("postMarketTime")
-		: marketState === "PRE" ? number("preMarketTime") : null;
-	const lastBarTimestampMs = alignedTimes.length > 0 ? alignedTimes.at(-1) ?? null : null;
-	const regularTimeMs = number("regularMarketTime") !== null ? number("regularMarketTime")! * 1000 : null;
-	// During extended sessions prefer the latest pre/post bar time over the
-	// (stale) regular-session timestamp; otherwise prefer meta.
-	const updatedAtMs = extendedTime !== null ? extendedTime * 1000
-		: marketState === "PRE" || marketState === "POST"
-			? lastBarTimestampMs ?? regularTimeMs
-			: regularTimeMs ?? lastBarTimestampMs;
-	const barVolume = (session: ChartSession): number | null => {
-		if (alignedVolumes.length === 0) return null;
-		let sum = 0;
-		for (let index = 0; index < alignedSessions.length; index++) {
-			if (alignedSessions[index] !== session) continue;
-			const volume = alignedVolumes[index]!;
-			if (volume > 0) sum += volume;
-		}
-		return sum > 0 ? sum : null;
-	};
-
-	return {
-		symbol,
-		name: typeof meta.longName === "string" ? meta.longName : typeof meta.shortName === "string" ? meta.shortName : symbol,
-		exchange: typeof meta.fullExchangeName === "string" ? meta.fullExchangeName : "--",
-		currency: typeof meta.currency === "string" && meta.currency.trim() ? meta.currency.trim().toUpperCase() : "XXX",
-		price,
-		change,
-		changePercent: change === null || previousClose === null || previousClose === 0 ? null : (change / previousClose) * 100,
-		previousClose,
-		dayLow: number("regularMarketDayLow"),
-		dayHigh: number("regularMarketDayHigh"),
-		volume: number("regularMarketVolume"),
-		preMarketVolume: number("preMarketVolume") ?? barVolume("pre"),
-		postMarketVolume: number("postMarketVolume") ?? barVolume("post"),
-		marketState,
-		updatedAt: updatedAtMs ?? pointTimes.at(-1) ?? null,
-		points: closes,
-		pointTimes,
-		pointSessions,
-		pointVolumes: hasTimedSeries && alignedVolumes.length === closes.length ? alignedVolumes : [],
-		pointOpens: hasTimedSeries && alignedOpens.length === closes.length ? alignedOpens : [],
-		pointHighs: hasTimedSeries && alignedHighs.length === closes.length ? alignedHighs : [],
-		pointLows: hasTimedSeries && alignedLows.length === closes.length ? alignedLows : [],
-		timezone: typeof meta.exchangeTimezoneName === "string" ? meta.exchangeTimezoneName : "UTC",
-		interval: typeof meta.dataGranularity === "string" ? meta.dataGranularity : cfg.yahooInterval,
-		source: "Yahoo Finance chart API (public/delayed; verify before trading)",
-		chartScope: cfg.chartScope,
-	};
-}
-
-/**
- * Monday pre-market mock.
- *
- * The public Yahoo chart API cannot be observed in a PRE session on weekends
- * (the last bar is Friday's post bar), so tests that need "as of Monday
- * pre-market" behavior build a synthetic chart payload. Set
- * MARKET_MOCK_MONDAY=1 to serve these instead of the live feed — useful for
- * local dev, demos, and verifying the PRE session path through the REAL parser
- * and mover pipeline on any day of the week.
- *
- * Deterministic: the same symbol always produces the same Friday close, pre
- * move, and volume, so snapshots are reproducible across runs.
- */
-export function readMarketMockMonday(env: NodeJS.ProcessEnv = process.env): boolean {
-	return (env.MARKET_MOCK_MONDAY ?? "").trim() === "1";
-}
-
-// Monday 2026-08-24, EDT = UTC-4.
-const MOCK_MON_0000_ET = 1_787_529_600;
-const MOCK_PRE_START = MOCK_MON_0000_ET + 4 * 3_600;       // 04:00 ET
-const MOCK_REGULAR_START = MOCK_MON_0000_ET + 9.5 * 3_600; // 09:30 ET
-const MOCK_REGULAR_END = MOCK_MON_0000_ET + 16 * 3_600;    // 16:00 ET
-const MOCK_MON_BARS = 5;
-
-function mockSymbolHash(symbol: string): number {
-	let hash = 0;
-	for (const char of symbol) hash = ((hash << 5) - hash + char.charCodeAt(0)) >>> 0;
-	return hash;
-}
-
-/** Deterministic per-symbol Monday pre-market fixture. */
-function mockMondaySymbol(symbol: string): { fridayClose: number; preMovePct: number; fridayVol: number } {
-	const hash = mockSymbolHash(symbol);
-	// Spread the 32-bit hash across independent bands so price/move/volume vary
-	// for short symbols too (`hash >>> 16` collapses for 4–6 char names).
-	const priceBand = (hash ^ (hash << 9 >>> 0)) % 960;
-	const moveBand = ((hash * 2654435761) >>> 0) % 160;
-	const volBand = ((hash ^ (hash << 13 >>> 0)) >>> 8) % 115_000_000;
-	const fridayClose = 40 + priceBand;
-	const preMovePct = Math.round(moveBand - 80) / 10; // −8.0..+7.9
-	const fridayVol = 5_000_000 + volBand;
-	return { fridayClose, preMovePct, fridayVol };
-}
-
-export function mockMondayChartPayload(symbol: string): unknown {
-	const vm = mockMondaySymbol(symbol);
-	const preClose = vm.fridayClose * (1 + vm.preMovePct / 100);
-
-	// A Monday pre-market chart (range=1d, includePrePost) carries PRE bars from
-	// 04:00 ET up to ~08:55 ET — with the public feed shipping 0 volume for them.
-	// meta.regularMarketVolume supplies Friday's session volume for the proxy leg.
-	const preTimestamps: number[] = [];
-	const preCloses: number[] = [];
-	for (let i = 0; i < MOCK_MON_BARS; i++) {
-		const last = i === MOCK_MON_BARS - 1;
-		preTimestamps.push(last
-			? MOCK_PRE_START + 295 * 60 // 08:55 ET, just before open
-			: MOCK_PRE_START + i * 60 * 60); // 05:00, 06:00, 07:00, 08:00 ET
-		preCloses.push(last ? preClose : vm.fridayClose * (1 + vm.preMovePct / 100 / 2));
-	}
-
-	return {
-		chart: {
-			result: [{
-				meta: {
-					symbol,
-					currency: "USD",
-					longName: `${symbol} Inc.`,
-					shortName: symbol,
-					fullExchangeName: "NasdaqGS",
-					exchangeTimezoneName: "America/New_York",
-					dataGranularity: "5m",
-					regularMarketPrice: vm.fridayClose,
-					regularMarketVolume: vm.fridayVol,
-					regularMarketTime: MOCK_REGULAR_END,
-					previousClose: vm.fridayClose,
-					chartPreviousClose: vm.fridayClose,
-					currentTradingPeriod: {
-						pre: { start: MOCK_PRE_START, end: MOCK_REGULAR_START, timezone: "America/New_York", gmtoffset: -14400 },
-						regular: { start: MOCK_REGULAR_START, end: MOCK_REGULAR_END, timezone: "America/New_York", gmtoffset: -14400 },
-						post: { start: MOCK_REGULAR_END, end: MOCK_REGULAR_END + 4 * 3_600, timezone: "America/New_York", gmtoffset: -14400 },
-					},
-					// Deliberately NO marketState / preMarketPrice / preMarketVolume,
-					// exactly like the live public endpoint (verified 2026-08-22).
-				},
-				timestamp: preTimestamps,
-				indicators: { quote: [{ close: preCloses, volume: preTimestamps.map(() => 0) }] },
-			}],
-		},
-	};
-}
-
+// Module wrapper delegating to the injected transport port (export surface unchanged).
 async function fetchQuote(symbol: string, scope: ChartScope = DEFAULT_CHART_SCOPE, signal?: AbortSignal, timeoutMs = QUOTE_REQUEST_TIMEOUT_MS): Promise<Quote> {
-	const cfg = CHART_SCOPE_CONFIGS[scope];
-	if (readMarketMockMonday() && scope === "day") {
-		return parseChartPayloadToQuote(symbol, mockMondayChartPayload(symbol), { ...cfg, chartScope: scope });
-	}
-	const url = new URL(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}`);
-	url.searchParams.set("range", cfg.yahooRange);
-	url.searchParams.set("interval", cfg.yahooInterval);
-	url.searchParams.set("includePrePost", String(cfg.includePrePost));
-
-	const timeout = AbortSignal.timeout(timeoutMs);
-	const requestSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
-	const response = await fetch(url, {
-		headers: { accept: "application/json", "user-agent": "signal-terminal-mvp/0.1" },
-		signal: requestSignal,
-	});
-	if (!response.ok) throw new Error(`quote request returned HTTP ${response.status}`);
-
-	const payload = await response.json();
-	return parseChartPayloadToQuote(symbol, payload, { ...cfg, chartScope: scope });
+	return state.ports.transport.fetchQuote(symbol, scope, signal, timeoutMs);
 }
 
 export function extractSearchCandidates(samples: Array<{ text?: unknown; href?: unknown }>, limit = 8): {
@@ -2270,7 +1776,7 @@ export function extractSearchCandidates(samples: Array<{ text?: unknown; href?: 
 		} catch {
 			continue;
 		}
-		const url = sanitizeUrl(destination);
+		const url = sanitizePublicUrl(destination);
 		if (!url || seen.has(url)) continue;
 		seen.add(url);
 		let text = cleanText(link.text || "").replace(/\s+/g, " ").trim();
@@ -2310,8 +1816,7 @@ export function grantAllowedExtractionCandidates(
 }
 
 function configuredUnbrowserMcpUrl(): string | undefined {
-	const value = process.env.UNBROWSER_MCP_URL?.trim();
-	return value || undefined;
+	return state.ports.transport.unbrowserEndpoint();
 }
 
 function requireUnbrowserMcpClient(): UnbrowserMcpClient {
@@ -2496,7 +2001,7 @@ export async function fetchQuotes(
 }
 
 async function fetchMarketSnapshot(pi: ExtensionAPI, scope: ChartScope = DEFAULT_CHART_SCOPE, signal?: AbortSignal, headlineQuery = "US stock market latest news earnings macro rates"): Promise<MarketSnapshot> {
-	const allSymbols = [...new Set([...MARKET_BOARDS.map((item) => item.symbol), ...MOVER_UNIVERSE, ...watchlist])];
+	const allSymbols = [...new Set([...MARKET_BOARDS.map((item) => item.symbol), ...MOVER_UNIVERSE, ...state.watchlist])];
 	const [quotes, news] = await Promise.all([
 		fetchQuotes(allSymbols, scope, signal),
 		unbrowserHeadlines(pi, headlineQuery, signal)
@@ -2517,16 +2022,6 @@ async function fetchMarketSnapshot(pi: ExtensionAPI, scope: ChartScope = DEFAULT
 		updatedAt: Date.now(),
 		chartScope: scope,
 	};
-}
-
-function safeChartTimezone(timezone: string | undefined): string {
-	if (!timezone) return "UTC";
-	try {
-		new Intl.DateTimeFormat("en-US", { timeZone: timezone }).format(0);
-		return timezone;
-	} catch {
-		return "UTC";
-	}
 }
 
 function chartTimeLabel(timestamp: number, timezone: string): string {
@@ -2581,18 +2076,6 @@ function chartTimezoneLabel(timestamp: number, timezone: string): string {
 		timeZoneName: "short",
 	}).formatToParts(timestamp);
 	return parts.find((part) => part.type === "timeZoneName")?.value || (timezone === "UTC" ? "UTC" : "TIME");
-}
-
-function quoteTimestampLabel(timestamp: number | null, timezone: string): string {
-	if (!timestamp) return "time unavailable";
-	return new Intl.DateTimeFormat("en-US", {
-		month: "short",
-		day: "numeric",
-		hour: "2-digit",
-		minute: "2-digit",
-		timeZone: safeChartTimezone(timezone),
-		timeZoneName: "short",
-	}).format(timestamp);
 }
 
 type ChartGuide = { value: number; label?: string; render?: (text: string) => string };
@@ -2837,381 +2320,6 @@ function chartGuides(block: CanvasChartBlock, th: Theme): ChartGuide[] {
 	}));
 }
 
-function smaSeries(points: number[], period: number): Array<number | null> {
-	const result: Array<number | null> = Array.from({ length: points.length }, () => null);
-	if (points.length < period) return result;
-	let sum = 0;
-	for (let index = 0; index < points.length; index++) {
-		sum += points[index]!;
-		if (index >= period) sum -= points[index - period]!;
-		if (index >= period - 1) result[index] = sum / period;
-	}
-	return result;
-}
-
-function emaSeries(points: number[], period: number): Array<number | null> {
-	const result: Array<number | null> = Array.from({ length: points.length }, () => null);
-	if (points.length < period) return result;
-	const seed = points.slice(0, period).reduce((sum, value) => sum + value, 0) / period;
-	result[period - 1] = seed;
-	const multiplier = 2 / (period + 1);
-	for (let index = period; index < points.length; index++) {
-		result[index] = (points[index]! - result[index - 1]!) * multiplier + result[index - 1]!;
-	}
-	return result;
-}
-
-function rsiSeries(points: number[], period = 14): Array<{ index: number; value: number }> {
-	const result: Array<{ index: number; value: number }> = [];
-	if (points.length <= period) return result;
-	let gains = 0;
-	let losses = 0;
-	for (let index = 1; index <= period; index++) {
-		const change = points[index]! - points[index - 1]!;
-		if (change > 0) gains += change;
-		else if (change < 0) losses -= change;
-	}
-	let averageGain = gains / period;
-	let averageLoss = losses / period;
-	const valueFor = () => averageGain === 0 && averageLoss === 0
-		? 50
-		: averageLoss === 0 ? 100 : averageGain === 0 ? 0 : 100 - 100 / (1 + averageGain / averageLoss);
-	result.push({ index: period, value: valueFor() });
-	for (let index = period + 1; index < points.length; index++) {
-		const change = points[index]! - points[index - 1]!;
-		const gain = Math.max(0, change);
-		const loss = Math.max(0, -change);
-		averageGain = ((averageGain * (period - 1)) + gain) / period;
-		averageLoss = ((averageLoss * (period - 1)) + loss) / period;
-		result.push({ index, value: valueFor() });
-	}
-	return result;
-}
-
-function sampledIndices(length: number, limit = 48): number[] {
-	if (length <= limit) return Array.from({ length }, (_, index) => index);
-	return Array.from({ length: limit }, (_, index) => Math.min(length - 1, Math.round((index / (limit - 1)) * (length - 1))));
-}
-
-function sampleIndexedValues(series: Array<number | null>, limit = 48): { indices: number[]; values: number[] } {
-	const available = series.flatMap((value, index) => value === null || !Number.isFinite(value) ? [] : [{ index, value }]);
-	const sample = sampledIndices(available.length, limit).map((index) => available[index]!);
-	return { indices: sample.map((item) => item.index), values: sample.map((item) => item.value) };
-}
-
-function technicalSnapshot(quote: Quote): TechnicalSnapshot {
-	const scope = quote.chartScope;
-	const points = quote.points.filter((value) => Number.isFinite(value));
-	if (points.length < 1) throw new Error("Technical analysis requires at least one valid chart close");
-	const sma20Values = smaSeries(points, 20);
-	const ema12Series = emaSeries(points, 12);
-	const ema26Series = emaSeries(points, 26);
-	const macdSeries = points.map((_, index) => ema12Series[index] !== null && ema26Series[index] !== null ? ema12Series[index]! - ema26Series[index]! : null);
-	const validMacd = macdSeries.filter((value): value is number => value !== null);
-	const macdSignalSeries = emaSeries(validMacd, 9);
-	let macdIndex = 0;
-	const macdHistogramSeries = macdSeries.map((value) => {
-		if (value === null) return null;
-		const signal = macdSignalSeries[macdIndex++] ?? null;
-		return signal === null ? null : value - signal;
-	});
-	const trendDistanceSeries = points.map((value, index) => {
-		const average = sma20Values[index];
-		return average === null || average === 0 ? null : ((value / average) - 1) * 100;
-	});
-	const rsi = rsiSeries(points, 14);
-	const sma20 = sma20Values.at(-1) ?? null;
-	const ema12 = ema12Series.at(-1) ?? null;
-	const ema26 = ema26Series.at(-1) ?? null;
-	const macd = validMacd.at(-1) ?? null;
-	const macdSignal = macdSignalSeries.at(-1) ?? null;
-	const macdHistogram = macd !== null && macdSignal !== null ? macd - macdSignal : null;
-	const rsi14 = rsi.at(-1)?.value ?? null;
-	const timed = quote.pointTimes.length === points.length;
-	const sessioned = quote.pointSessions.length === points.length;
-	let momentum1h: number | null = null;
-	let lastBarReturn: number | null = null;
-	let lastBarReturnLabel = scope === "day" ? "1h momentum" : `${quote.interval} return`;
-
-	// Day scope: compute same-session ~1h momentum as before
-	if (scope === "day" && timed && sessioned) {
-		const lastIndex = points.length - 1;
-		const lastTime = quote.pointTimes[lastIndex]!;
-		const session = quote.pointSessions[lastIndex]!;
-		let anchorIndex = -1;
-		let bestDistance = Number.POSITIVE_INFINITY;
-		if (session !== "unknown") {
-			for (let index = lastIndex - 1; index >= 0; index--) {
-				if (quote.pointSessions[index] !== session) continue;
-				const distance = Math.abs(lastTime - quote.pointTimes[index]! - 60 * 60_000);
-				if (distance < bestDistance) {
-					bestDistance = distance;
-					anchorIndex = index;
-				}
-			}
-		}
-		if (anchorIndex >= 0 && bestDistance <= 15 * 60_000 && points[anchorIndex] !== 0) momentum1h = ((points[lastIndex]! / points[anchorIndex]!) - 1) * 100;
-	}
-
-	// Non-day scopes: compute last-bar return (compare last close to second-to-last close)
-	if (scope !== "day" && points.length >= 2) {
-		const prev = points[points.length - 2]!;
-		const last = points[points.length - 1]!;
-		if (prev !== 0) lastBarReturn = ((last / prev) - 1) * 100;
-	}
-
-	const levelWindow = points.slice(-Math.min(48, points.length));
-	const closeLow = levelWindow.length > 0 ? Math.min(...levelWindow) : null;
-	const closeHigh = levelWindow.length > 0 ? Math.max(...levelWindow) : null;
-	const calculationPrice = points.at(-1)!;
-	const calculationAsOf = timed ? quote.pointTimes.at(-1)! : quote.updatedAt ?? Date.now();
-	let score = 0;
-	let signalCount = 0;
-	if (sma20 !== null) {
-		signalCount++;
-		const tolerance = Math.max(Math.abs(sma20) * 1e-6, 1e-8);
-		score += calculationPrice > sma20 + tolerance ? 1 : calculationPrice < sma20 - tolerance ? -1 : 0;
-	}
-	if (rsi14 !== null) {
-		signalCount++;
-		score += rsi14 >= 55 ? 1 : rsi14 <= 45 ? -1 : 0;
-	}
-	if (macdHistogram !== null) {
-		signalCount++;
-		const tolerance = Math.max(Math.abs(calculationPrice) * 1e-9, 1e-10);
-		score += macdHistogram > tolerance ? 1 : macdHistogram < -tolerance ? -1 : 0;
-	}
-	const signal: TechnicalSignal = score >= 2 ? "bullish" : score <= -2 ? "bearish" : "neutral";
-	const priceSample = sampledIndices(points.length);
-	const rsiSample = sampledIndices(rsi.length);
-	const trendSample = sampleIndexedValues(trendDistanceSeries);
-	const macdHistogramSample = sampleIndexedValues(macdHistogramSeries);
-	return {
-		symbol: quote.symbol,
-		currency: quote.currency,
-		asOf: calculationAsOf,
-		interval: quote.interval,
-		timezone: quote.timezone,
-		chartScope: scope,
-		price: calculationPrice,
-		changePercent: quote.previousClose === null || quote.previousClose === 0 ? null : ((calculationPrice / quote.previousClose) - 1) * 100,
-		previousClose: quote.previousClose,
-		signal,
-		sma20,
-		ema12,
-		ema26,
-		rsi14,
-		macd,
-		macdSignal,
-		macdHistogram,
-		momentum1h,
-		lastBarReturn,
-		lastBarReturnLabel,
-		closeLow,
-		closeHigh,
-		rangeBars: levelWindow.length,
-		score,
-		signalCount,
-		sessionPolicy: scope === "day" ? "extended-hours-inclusive aligned closes" : `${CHART_SCOPE_CONFIGS[scope].label} chart closes, ${quote.interval} bars`,
-		pricePoints: priceSample.map((index) => points[index]!),
-		priceTimes: timed ? priceSample.map((index) => quote.pointTimes[index]!) : [],
-		priceSessions: sessioned ? priceSample.map((index) => quote.pointSessions[index]!) : [],
-		rsiPoints: rsiSample.map((index) => rsi[index]!.value),
-		rsiTimes: timed ? rsiSample.map((index) => quote.pointTimes[rsi[index]!.index]!) : [],
-		rsiSessions: sessioned ? rsiSample.map((index) => quote.pointSessions[rsi[index]!.index]!) : [],
-		trendPoints: trendSample.values,
-		trendTimes: timed ? trendSample.indices.map((index) => quote.pointTimes[index]!) : [],
-		trendSessions: sessioned ? trendSample.indices.map((index) => quote.pointSessions[index]!) : [],
-		macdHistogramPoints: macdHistogramSample.values,
-		macdHistogramTimes: timed ? macdHistogramSample.indices.map((index) => quote.pointTimes[index]!) : [],
-		macdHistogramSessions: sessioned ? macdHistogramSample.indices.map((index) => quote.pointSessions[index]!) : [],
-		source: quote.source,
-	};
-}
-
-function technicalCanvasBlocks(snapshot: TechnicalSnapshot): CanvasBlock[] {
-	const scope = snapshot.chartScope;
-	const scopeLabel = CHART_SCOPE_CONFIGS[scope].label;
-	const isDay = scope === "day";
-	const metric = (label: string, value: number | null, formatter: (input: number) => string): CanvasMetricItem | undefined => value === null
-		? undefined
-		: { label, value: formatter(value), sourceIds: ["TA1"] };
-	const priceMetric = (label: string, value: number | null) => metric(label, value, (input) => dollars(input, snapshot.currency));
-	const numberMetric = (label: string, value: number | null) => metric(label, value, (input) => input.toFixed(2));
-	const annotations: CanvasChartAnnotation[] = [];
-	if (snapshot.closeLow !== null) annotations.push({ label: `${snapshot.rangeBars}-bar close low`, value: snapshot.closeLow, role: "signal" });
-	if (snapshot.closeHigh !== null) annotations.push({ label: `${snapshot.rangeBars}-bar close high`, value: snapshot.closeHigh, role: "signal" });
-	const blocks: CanvasBlock[] = [];
-	if (snapshot.pricePoints.length >= 2) {
-		const chartTitle = isDay
-			? "Price Action · Extended Hours Included"
-			: `Price Action · ${scopeLabel} Chart · ${snapshot.interval} bars`;
-		blocks.push({
-			id: "ta-price",
-			kind: "chart",
-			title: chartTitle,
-			symbol: snapshot.symbol,
-			points: snapshot.pricePoints,
-			...(snapshot.priceTimes.length === snapshot.pricePoints.length ? { pointTimes: snapshot.priceTimes } : {}),
-			...(snapshot.priceSessions.length === snapshot.pricePoints.length ? { pointSessions: snapshot.priceSessions } : {}),
-			reference: isDay ? (snapshot.previousClose ?? undefined) : undefined,
-			interval: snapshot.interval,
-			timezone: snapshot.timezone,
-			currency: snapshot.currency,
-			asOf: snapshot.asOf,
-			format: "price",
-			height: 7,
-			annotations,
-			chartScope: scope,
-			sourceIds: ["TA1"],
-		});
-	}
-	const taTitlePrefix = `${scopeLabel} scope`;
-	const momentumItem = isDay
-		? metric(`${snapshot.lastBarReturnLabel}`, snapshot.momentum1h, (input) => `${input >= 0 ? "+" : ""}${input.toFixed(2)}%`)
-		: metric(snapshot.lastBarReturnLabel, snapshot.lastBarReturn, (input) => `${input >= 0 ? "+" : ""}${input.toFixed(2)}%`);
-	blocks.push({
-			id: "ta-metrics",
-			kind: "metrics",
-			title: `TA Heuristic · ${scopeLabel} · ${snapshot.signal.toUpperCase()} · ${snapshot.score}/${snapshot.signalCount}`,
-			items: [
-				priceMetric("Last aligned close", snapshot.price),
-				priceMetric("SMA 20 bars", snapshot.sma20),
-				priceMetric("EMA 12 bars", snapshot.ema12),
-				priceMetric("EMA 26 bars", snapshot.ema26),
-				numberMetric("RSI 14 bars (Wilder)", snapshot.rsi14),
-				metric("MACD 12/26 bars", snapshot.macd, (input) => input.toFixed(3)),
-				metric("MACD signal 9 bars", snapshot.macdSignal, (input) => input.toFixed(3)),
-				metric("MACD histogram", snapshot.macdHistogram, (input) => input.toFixed(3)),
-				momentumItem,
-			].filter((item): item is CanvasMetricItem => Boolean(item)),
-		});
-	if (snapshot.trendPoints.length >= 2) {
-		const extent = Math.max(0.1, ...snapshot.trendPoints.map((value) => Math.abs(value)));
-		blocks.push({
-			id: "ta-trend",
-			kind: "chart",
-			title: `Trend Distance · Close vs SMA 20 · ${scopeLabel}`,
-			symbol: snapshot.symbol,
-			points: snapshot.trendPoints,
-			...(snapshot.trendTimes.length === snapshot.trendPoints.length ? { pointTimes: snapshot.trendTimes } : {}),
-			...(snapshot.trendSessions.length === snapshot.trendPoints.length ? { pointSessions: snapshot.trendSessions } : {}),
-			reference: 0,
-			interval: snapshot.interval,
-			timezone: snapshot.timezone,
-			asOf: snapshot.asOf,
-			format: "percent",
-			minValue: -extent,
-			maxValue: extent,
-			height: 7,
-			chartStyle: "line",
-			chartScope: scope,
-			sourceIds: ["TA1"],
-		});
-	}
-	if (snapshot.rsiPoints.length >= 2) {
-		blocks.push({
-			id: "ta-rsi",
-			kind: "chart",
-			title: `RSI 14 · Wilder · ${scopeLabel} bars`,
-			symbol: snapshot.symbol,
-			points: snapshot.rsiPoints,
-			...(snapshot.rsiTimes.length === snapshot.rsiPoints.length ? { pointTimes: snapshot.rsiTimes } : {}),
-			...(snapshot.rsiSessions.length === snapshot.rsiPoints.length ? { pointSessions: snapshot.rsiSessions } : {}),
-			reference: 50,
-			interval: snapshot.interval,
-			timezone: snapshot.timezone,
-			asOf: snapshot.asOf,
-			format: "number",
-			minValue: 0,
-			maxValue: 100,
-			height: 7,
-			chartStyle: "line",
-			annotations: [
-				{ label: "Overbought", value: 70, role: "resistance" },
-				{ label: "Oversold", value: 30, role: "support" },
-			],
-			chartScope: scope,
-			sourceIds: ["TA1"],
-		});
-	}
-	if (snapshot.macdHistogramPoints.length >= 2) {
-		const extent = Math.max(0.001, ...snapshot.macdHistogramPoints.map((value) => Math.abs(value)));
-		blocks.push({
-			id: "ta-macd",
-			kind: "chart",
-			title: `MACD Histogram · 12/26/9 · ${scopeLabel}`,
-			symbol: snapshot.symbol,
-			points: snapshot.macdHistogramPoints,
-			...(snapshot.macdHistogramTimes.length === snapshot.macdHistogramPoints.length ? { pointTimes: snapshot.macdHistogramTimes } : {}),
-			...(snapshot.macdHistogramSessions.length === snapshot.macdHistogramPoints.length ? { pointSessions: snapshot.macdHistogramSessions } : {}),
-			reference: 0,
-			interval: snapshot.interval,
-			timezone: snapshot.timezone,
-			asOf: snapshot.asOf,
-			format: "number",
-			minValue: -extent,
-			maxValue: extent,
-			height: 7,
-			chartStyle: "histogram",
-			chartScope: scope,
-			sourceIds: ["TA1"],
-		});
-	}
-
-	const readBullets: CanvasBulletItem[] = [];
-	const signalSentence = isDay
-		? `${snapshot.symbol} intraday heuristic is ${snapshot.signal} (${snapshot.score} score from ${snapshot.signalCount} available checks: price/SMA20, Wilder RSI14, and MACD histogram).`
-		: `${snapshot.symbol} ${scopeLabel.toLowerCase()} heuristic is ${snapshot.signal} (${snapshot.score} score from ${snapshot.signalCount} available checks: price/SMA20, Wilder RSI14, and MACD histogram).`;
-	readBullets.push({ text: signalSentence, role: "interpretation", sourceIds: ["TA1"] });
-	const barNote = isDay
-		? `Indicators use ${snapshot.sessionPolicy}; the last calculation bar is ${quoteTimestampLabel(snapshot.asOf, snapshot.timezone)}.`
-		: `Indicators use ${scopeLabel.toLowerCase()} chart closes (${snapshot.interval} bars); the last calculation bar is ${quoteTimestampLabel(snapshot.asOf, snapshot.timezone)}.`;
-	readBullets.push({ text: barNote, role: "fact", sourceIds: ["TA1"] });
-	if (snapshot.closeLow !== null && snapshot.closeHigh !== null) {
-		readBullets.push({ text: `The observed ${snapshot.rangeBars}-bar close range is ${dollars(snapshot.closeLow, snapshot.currency)}–${dollars(snapshot.closeHigh, snapshot.currency)}; these are range extrema, not validated support/resistance.`, role: "fact" as const, sourceIds: ["TA1"] });
-	}
-	if (isDay && snapshot.momentum1h === null) {
-		readBullets.push({ text: "Same-session 1h momentum is unavailable because no bar was within 15 minutes of the one-hour anchor.", role: "fact" as const, sourceIds: ["TA1"] });
-	}
-	if (!isDay && snapshot.lastBarReturn === null) {
-		readBullets.push({ text: `${snapshot.lastBarReturnLabel} is unavailable (requires at least 2 aligned closes).`, role: "fact" as const, sourceIds: ["TA1"] });
-	}
-	readBullets.push({ text: `SMA/EMA/RSI/MACD are ${snapshot.interval}-bar based; scope is ${taTitlePrefix} (${CHART_SCOPE_CONFIGS[scope].label}).`, role: "fact", sourceIds: ["TA1"] });
-	readBullets.push({ text: "Trend distance is close minus SMA20 in percent (zero = at SMA20); MACD histogram bars show positive/negative momentum around zero; RSI guides mark 70/50/30.", role: "fact", sourceIds: ["TA1"] });
-
-	blocks.push(
-		{
-			id: "ta-read",
-			kind: "bullets",
-			title: `Technical Read · ${scopeLabel}`,
-			items: readBullets,
-		},
-		{
-			id: "ta-sources",
-			kind: "sources",
-			title: "TA Source",
-			items: [{
-				id: "TA1",
-				label: isDay
-					? "Yahoo Finance intraday chart API · deterministic, extended-hours-inclusive indicators"
-					: `Yahoo Finance ${scopeLabel.toLowerCase()} chart API · deterministic ${snapshot.interval} bar indicators`,
-				url: `https://finance.yahoo.com/quote/${encodeURIComponent(snapshot.symbol)}`,
-				status: "fetched",
-			}],
-		},
-	);
-	return blocks;
-}
-
-function sanitizeUrl(raw: string): string {
-	return sanitizePublicUrl(raw);
-}
-
-function sourceIdForUrl(url: string): string {
-	return `S-${createHash("sha256").update(url).digest("hex").slice(0, 12)}`;
-}
-
 function normalizeSourceIds(raw: unknown): string[] {
 	if (!Array.isArray(raw)) return [];
 	const ids: string[] = [];
@@ -3284,7 +2392,7 @@ function normalizeNewsItems(raw: unknown): CanvasNewsItem[] {
 		const headline = typeof r.headline === "string" ? cleanText(r.headline).slice(0, 4000).trim() : "";
 		if (!headline) continue;
 		const source = typeof r.source === "string" ? cleanText(r.source).slice(0, 160).trim() : undefined;
-		const url = typeof r.url === "string" ? sanitizeUrl(r.url) : undefined;
+		const url = typeof r.url === "string" ? sanitizePublicUrl(r.url) : undefined;
 		const note = typeof r.note === "string" ? cleanText(r.note).slice(0, 500).trim() : undefined;
 		const sourceIds = normalizeSourceIds(r.sourceIds);
 		items.push({
@@ -3328,7 +2436,7 @@ function normalizeSourceItems(raw: unknown): CanvasSourceItem[] {
 		const r = item as Record<string, unknown>;
 		const id = typeof r.id === "string" ? cleanText(r.id).slice(0, 160).trim() : "";
 		const label = typeof r.label === "string" ? cleanText(r.label).slice(0, 160).trim() : "";
-		const url = typeof r.url === "string" ? sanitizeUrl(r.url) : "";
+		const url = typeof r.url === "string" ? sanitizePublicUrl(r.url) : "";
 		if (!id || !label || !url) continue;
 		const statusRaw = typeof r.status === "string" ? cleanText(r.status).trim() : undefined;
 		const status = statusRaw && VALID_STATUSES.has(statusRaw) ? (statusRaw as CanvasSourceItem["status"]) : undefined;
@@ -3363,7 +2471,7 @@ function classifyDossierHint(block: CanvasBlock): DossierHint | undefined {
 	const id = (block.id ?? "").toLowerCase();
 	if (id.startsWith("ta-")) return "technical";
 	if (block.dossierHint) return block.dossierHint;
-	// Fallback classification for historical canvases via kind/title/id
+	// Fallback classification for historical state.canvases via kind/title/id
 	const title = (block.title ?? "").toLowerCase();
 	if (block.kind === "sources") return "sources";
 	if (block.kind === "chart") return "technical";
@@ -3400,7 +2508,7 @@ function normalizeEvidencePacket(raw: unknown): EvidencePacket | undefined {
 	const sourceId = typeof r.sourceId === "string" ? cleanText(r.sourceId).slice(0, 160).trim() : "";
 	const sourceTitle = typeof r.sourceTitle === "string" ? cleanText(r.sourceTitle).slice(0, 160).trim() : "";
 	const sourceDomain = typeof r.sourceDomain === "string" ? cleanText(r.sourceDomain).slice(0, 160).trim() : "";
-	const sourceUrl = typeof r.sourceUrl === "string" ? sanitizeUrl(r.sourceUrl) : "";
+	const sourceUrl = typeof r.sourceUrl === "string" ? sanitizePublicUrl(r.sourceUrl) : "";
 	const excerpt = typeof r.excerpt === "string" ? cleanText(r.excerpt).slice(0, 500).trim() : "";
 	const retrievalStatus = typeof r.retrievalStatus === "string" && ["fetched", "challenged", "limited", "failed"].includes(r.retrievalStatus)
 		? (r.retrievalStatus as EvidencePacket["retrievalStatus"]) : undefined;
@@ -3520,18 +2628,6 @@ export type CanvasQuality = { usable: boolean; reasons: string[]; codes: CanvasQ
 
 /** Stable, machine-readable failure codes for quality telemetry (ledger seed). */
 export const CANVAS_QUALITY_VERSION = 1;
-export type CanvasQualityCode =
-	| "NOT_COMPLETE"
-	| "EVIDENCE_BLOCKED"
-	| "EVIDENCE_NONE"
-	| "EVIDENCE_PENDING"
-	| "NO_FETCHED_PACKETS"
-	| "READ_COUNT"
-	| "READ_NO_SOURCEIDS"
-	| "READ_UNFETCHED_SOURCES"
-	| "READ_UNSUPPORTED_ITEMS"
-	| "EVIDENCE_UNSUPPORTED"
-	| "SCENARIO_IN_BRIEF";
 
 function blockSourceIds(block: CanvasBlock): string[] {
 	const ids = [...(block.sourceIds ?? [])];
@@ -3554,7 +2650,7 @@ function blockItemSourceIdSets(block: CanvasBlock): string[][] {
  * usable cache entry only when it is complete, carries fetched evidence, and
  * its read block — plus any evidence blocks — is actually supported by fetched
  * source packets at the item level. Blocked, pending, and evidence-less
- * canvases — including honest "retrieval failed" reports — are NOT usable
+ * state.canvases — including honest "retrieval failed" reports — are NOT usable
  * cache hits, so a degraded prefetch can never satisfy the warm-cache
  * freshness gate or impersonate a source-verified brief.
  */
@@ -3609,14 +2705,6 @@ export function assessCanvasQuality(canvas: Canvas | undefined): CanvasQuality {
 	return { usable: true, reasons: [], codes: [] };
 }
 
-export type CanvasQualityTelemetry = {
-	usable: boolean;
-	codes: CanvasQualityCode[];
-	evidenceStatus: EvidenceStatus;
-	fetchedCount: number;
-	qualityVersion: number;
-};
-
 /** Versioned, typed quality snapshot persisted with archived records (the ledger seed). */
 export function canvasQualityTelemetry(canvas: Canvas | undefined): CanvasQualityTelemetry {
 	const quality = assessCanvasQuality(canvas);
@@ -3655,8 +2743,6 @@ function normalizeQualityTelemetry(raw: unknown): CanvasQualityTelemetry | undef
 	return { usable: r.usable, codes, evidenceStatus: status, fetchedCount, qualityVersion: CANVAS_QUALITY_VERSION };
 }
 
-type ResearchGeneration = { promptVariant?: string; origin?: "precache"; qualityGate?: boolean };
-
 function normalizeResearchGeneration(raw: unknown): ResearchGeneration | undefined {
 	if (!raw || typeof raw !== "object") return undefined;
 	const r = raw as Record<string, unknown>;
@@ -3664,13 +2750,16 @@ function normalizeResearchGeneration(raw: unknown): ResearchGeneration | undefin
 		&& ["legacy", "compact", "compact-strict", "paired-v1"].includes(r.promptVariant)
 		? r.promptVariant
 		: undefined;
-	const origin = r.origin === "precache" ? "precache" as const : undefined;
+	const origin = r.origin === "precache" || r.origin === "scout" ? r.origin : undefined;
 	const qualityGate = typeof r.qualityGate === "boolean" ? r.qualityGate : undefined;
-	if (!promptVariant && !origin && qualityGate === undefined) return undefined;
+	const scoutCandidateId = typeof r.scoutCandidateId === "string" && /^trg-[a-f0-9]{32}$/.test(r.scoutCandidateId)
+		? r.scoutCandidateId : undefined;
+	if (!promptVariant && !origin && qualityGate === undefined && !scoutCandidateId) return undefined;
 	return {
 		...(promptVariant ? { promptVariant } : {}),
 		...(origin ? { origin } : {}),
 		...(qualityGate !== undefined ? { qualityGate } : {}),
+		...(scoutCandidateId ? { scoutCandidateId } : {}),
 	};
 }
 
@@ -4057,11 +3146,11 @@ function researchIdentityKey(value: Pick<ResearchRequest | ResearchJob, "symbol"
 }
 
 function runningResearchJob(): ResearchJob | undefined {
-	return runningResearchId ? researchJobs.get(runningResearchId) : undefined;
+	return state.runningResearchId ? state.researchJobs.get(state.runningResearchId) : undefined;
 }
 
 function activeResearchJobs(): ResearchJob[] {
-	return [...researchJobs.values()].filter(researchSlotHeld).sort((a, b) => a.startedAt - b.startedAt);
+	return [...state.researchJobs.values()].filter(researchSlotHeld).sort((a, b) => a.startedAt - b.startedAt);
 }
 
 function activeResearchJobForIdentity(value: Pick<ResearchRequest | ResearchJob, "symbol" | "chartScope" | "researchKey">): ResearchJob | undefined {
@@ -4072,13 +3161,13 @@ function activeResearchJobForIdentity(value: Pick<ResearchRequest | ResearchJob,
 function researchJobFor(symbol: string, scope?: ChartScope, researchKey?: string): ResearchJob | undefined {
 	if (scope && researchKey) {
 		const identity = canvasKey(symbol, scope, researchKey);
-		const matches = [...researchJobs.values()]
+		const matches = [...state.researchJobs.values()]
 			.filter((job) => researchIdentityKey(job) === identity)
 			.sort((a, b) => b.startedAt - a.startedAt || b.updatedAt - a.updatedAt);
 		return matches.find(researchSlotHeld) ?? matches[0];
 	}
-	const id = latestResearchBySymbol.get(symbol);
-	return id ? researchJobs.get(id) : undefined;
+	const id = state.latestResearchBySymbol.get(symbol);
+	return id ? state.researchJobs.get(id) : undefined;
 }
 
 function researchSlotHeld(job: ResearchJob | undefined): boolean {
@@ -4100,9 +3189,14 @@ function usableExactCanvasSince(job: ResearchJob, identity: PairedCacheIdentity)
 }
 
 const RECENT_SETTLED_RESEARCH_WINDOW_MS = 30_000;
+export const MAX_RESEARCH_QUESTION_CHARS = 4_000;
+
+export function boundResearchQuestion(question: string): string {
+	return cleanText(question).slice(0, MAX_RESEARCH_QUESTION_CHARS);
+}
 
 function latestSettledResearchJobs(limit = 6, now = Date.now()): ResearchJob[] {
-	return [...researchJobs.values()]
+	return [...state.researchJobs.values()]
 		.filter((job) => job.phase === "settled" && job.settledAt !== undefined && now >= job.settledAt && now - job.settledAt <= RECENT_SETTLED_RESEARCH_WINDOW_MS)
 		.sort((a, b) => (b.settledAt ?? 0) - (a.settledAt ?? 0) || b.updatedAt - a.updatedAt)
 		.slice(0, limit);
@@ -4129,11 +3223,13 @@ function researchDebugState(job: ResearchJob) {
 function createResearchJob(request: ResearchRequest): ResearchJob | undefined {
 	if (activeResearchJobForIdentity(request)) return undefined;
 	const now = Date.now();
-	const id = `market-${now.toString(36)}-${(++researchSequence).toString(36)}`;
+	const id = request.origin === "scout" && request.scoutCandidateId
+		? `scout-${request.scoutCandidateId}`
+		: `market-${now.toString(36)}-${(++state.researchSequence).toString(36)}`;
 	const job: ResearchJob = {
 		id,
 		symbol: request.symbol,
-		question: cleanText(request.question).slice(0, 300),
+		question: boundResearchQuestion(request.question),
 		returnTo: request.returnTo,
 		outcome: "queued",
 		activity: "seeding",
@@ -4147,33 +3243,37 @@ function createResearchJob(request: ResearchRequest): ResearchJob | undefined {
 		intent: request.intent,
 		contextLabel: cleanText(request.contextLabel).slice(0, 120).trim(),
 		...(request.origin === "precache" ? { origin: "precache" as const } : {}),
+		...(request.origin === "scout" ? { origin: "scout" as const } : {}),
 		promptVariant: request.pairedTarget ? "paired-v1" : readResearchPromptVariant(),
 		...(request.pairedTarget ? { pairedTarget: request.pairedTarget } : {}),
 		...(request.tokenLimit !== undefined ? { tokenLimit: request.tokenLimit } : {}),
 		...(request.precacheReservation ? { precacheReservation: request.precacheReservation } : {}),
+		...(request.modelProvider ? { modelProvider: request.modelProvider } : {}),
+		...(request.modelId ? { modelId: request.modelId } : {}),
+		...(request.scoutCandidateId ? { scoutCandidateId: request.scoutCandidateId } : {}),
 	};
-	researchJobs.set(id, job);
-	latestResearchBySymbol.set(job.symbol, id);
-	researchQueue.push(id);
+	state.researchJobs.set(id, job);
+	state.latestResearchBySymbol.set(job.symbol, id);
+	state.researchQueue.push(id);
 	activeTerminal?.setResearchJob(job);
 	return job;
 }
 
 function updateResearchJob(id: string, patch: Partial<Omit<ResearchJob, "id" | "startedAt">>): ResearchJob | undefined {
-	const previous = researchJobs.get(id);
+	const previous = state.researchJobs.get(id);
 	if (!previous) return undefined;
 	const next: ResearchJob = { ...previous, ...patch, updatedAt: Date.now() };
-	researchJobs.set(id, next);
-	const latest = latestResearchBySymbol.get(next.symbol);
-	if (!latest || (researchJobs.get(latest)?.startedAt ?? 0) <= next.startedAt) latestResearchBySymbol.set(next.symbol, id);
+	state.researchJobs.set(id, next);
+	const latest = state.latestResearchBySymbol.get(next.symbol);
+	if (!latest || (state.researchJobs.get(latest)?.startedAt ?? 0) <= next.startedAt) state.latestResearchBySymbol.set(next.symbol, id);
 	activeTerminal?.setResearchJob(next);
 	emitWorkerJob(next);
 	return next;
 }
 
 function removeQueuedResearch(id: string): void {
-	for (let index = researchQueue.length - 1; index >= 0; index--) {
-		if (researchQueue[index] === id) researchQueue.splice(index, 1);
+	for (let index = state.researchQueue.length - 1; index >= 0; index--) {
+		if (state.researchQueue[index] === id) state.researchQueue.splice(index, 1);
 	}
 }
 
@@ -4190,17 +3290,28 @@ function pruneSettledResearchJobs(store: Map<string, ResearchJob>, keep = MAX_SE
 }
 
 function settleResearchJob(id: string, patch: Partial<Omit<ResearchJob, "id" | "startedAt">> = {}): ResearchJob | undefined {
-	const job = researchJobs.get(id);
+	const job = state.researchJobs.get(id);
 	if (!job || job.phase === "settled") return job;
 	removeQueuedResearch(id);
-	researchCandidates.clear(id);
-	researchExtracts.delete(id);
+	state.researchCandidates.clear(id);
+	state.researchExtracts.delete(id);
 	const settledAt = Date.now();
 	const next = updateResearchJob(id, { ...patch, phase: "settled", slotHeld: false, settledAt });
 	if (!next) return job;
-	if (runningResearchId === id) runningResearchId = undefined;
-	workerSubmittedResearch.delete(id);
-	workerFinalizations.delete(id);
+	if (job.origin === "scout" && job.scoutCandidateId) {
+		const scout = state.marketScout;
+		if (scout) {
+			void settleScoutDispatchWithRetry(
+				scout,
+				job.scoutCandidateId,
+				next.outcome === "complete" ? "complete" : next.outcome === "cancelled" ? "cancelled" : "failed",
+				next.error,
+			);
+		}
+	}
+	if (state.runningResearchId === id) state.runningResearchId = undefined;
+	state.workerSubmittedResearch.delete(id);
+	state.workerFinalizations.delete(id);
 	emitWorkerSettled(next);
 	if (job.origin === "precache") {
 		requestPrecachePump?.();
@@ -4240,40 +3351,44 @@ function settleResearchJob(id: string, patch: Partial<Omit<ResearchJob, "id" | "
 			failed: packets.filter((packet) => packet.retrievalStatus === "failed").length,
 		});
 	}
-	const removed = new Set(pruneSettledResearchJobs(researchJobs));
+	const removed = new Set(pruneSettledResearchJobs(state.researchJobs));
 	if (removed.size > 0) {
-		for (const [symbol, latestId] of latestResearchBySymbol) {
+		for (const [symbol, latestId] of state.latestResearchBySymbol) {
 			if (!removed.has(latestId)) continue;
-			const latest = [...researchJobs.values()].filter((job) => job.symbol === symbol).sort((a, b) => b.startedAt - a.startedAt || b.updatedAt - a.updatedAt)[0];
-			if (latest) latestResearchBySymbol.set(symbol, latest.id);
-			else latestResearchBySymbol.delete(symbol);
+			const latest = [...state.researchJobs.values()].filter((job) => job.symbol === symbol).sort((a, b) => b.startedAt - a.startedAt || b.updatedAt - a.updatedAt)[0];
+			if (latest) state.latestResearchBySymbol.set(symbol, latest.id);
+			else state.latestResearchBySymbol.delete(symbol);
 		}
 	}
 	return next;
 }
 
+async function settleScoutDispatchWithRetry(
+	scout: MarketEventScout,
+	candidateId: string,
+	outcome: "complete" | "failed" | "cancelled",
+	error?: string,
+): Promise<void> {
+	for (let attempt = 0; attempt < 3; attempt += 1) {
+		try {
+			await scout.settleDispatch(candidateId, outcome, error);
+			return;
+		} catch {
+			if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 100 * (attempt + 1)));
+		}
+	}
+	state.marketScoutLastError = "Could not persist scout dispatch settlement";
+}
+
 function resetResearchJobs(): void {
+	// Module-scope (process-scoped) resets wrap the instance reset: the worker
+	// coordinator, the IPC bridge, and the pre-warm hooks live at module scope.
 	researchWorkerCoordinator?.dispose();
 	researchWorkerCoordinator = undefined;
-	researchJobs.clear();
-	researchCandidates.reset();
-	researchExtracts.clear();
-	latestResearchBySymbol.clear();
-	researchQueue.splice(0, researchQueue.length);
-	workerSubmittedResearch.clear();
-	workerFinalizations.clear();
-	pendingPairedCanvases.clear();
-	toolResearchJobs.clear();
-	runningResearchId = undefined;
+	state.resetResearchJobs();
 	workerBridge = undefined;
-	publicSessionResearchRuns = 0;
-	precacheWarmState = false;
-	precachePending = [];
 	requestPrecachePump = undefined;
 	reportPrecacheQuality = undefined;
-	precacheCanaryState = "none";
-	precacheCanaryJobId = undefined;
-	warmGeneration += 1;
 }
 
 function researchQueueLabel(): string {
@@ -4301,7 +3416,7 @@ function researchStatusLine(job: ResearchJob | undefined): string | undefined {
 		if (job.phase === "cancelling" || job.outcome === "cancelled") return `RESEARCH ${label}${scope} · CANCELLING…`;
 		if (job.outcome === "complete") return `RESEARCH ${label}${scope} · CANVAS COMPLETE${blocks} · WRAPPING UP`;
 		if (job.phase === "queued") {
-			const position = researchQueue.indexOf(job.id);
+			const position = state.researchQueue.indexOf(job.id);
 			return `RESEARCH ${label}${scope} · QUEUED${position >= 0 ? ` #${position + 1}` : ""} · [C] CANCEL`;
 		}
 		if (job.phase === "dispatched") return `RESEARCH ${label}${scope} · STARTING · [C] CANCEL`;
@@ -4310,7 +3425,7 @@ function researchStatusLine(job: ResearchJob | undefined): string | undefined {
 	}
 	if (job.outcome === "complete") {
 		const identityKey = canvasKey(job.symbol, job.chartScope, job.researchKey);
-		const canvas = canvases.get(identityKey);
+		const canvas = state.canvases.get(identityKey);
 		const evidenceStatus = canvas ? deriveEvidenceStatus(canvas) : "none";
 		if (evidenceStatus === "blocked") return `${label} EVIDENCE BLOCKED${scope}${blocks}`;
 		return `${label} COMPLETE${scope}${blocks}`;
@@ -4325,7 +3440,7 @@ function storeCanvas(canvas: Canvas, merge: boolean, allowTechnicalOverwrite = f
 	const scope = canvasScope(canvas);
 	const researchKey = canvasResearchKey(canvas);
 	const key = canvasKey(canvas.symbol, scope, researchKey);
-	const previous = canvases.get(key);
+	const previous = state.canvases.get(key);
 	const sameResearch = Boolean(canvas.researchId && previous?.researchId === canvas.researchId);
 	const incomingBlocks = normalizeCanvasBlocks(canvas.blocks);
 	const mergedBlocks = merge && sameResearch
@@ -4380,19 +3495,19 @@ function storeCanvas(canvas: Canvas, merge: boolean, allowTechnicalOverwrite = f
 		...(evidenceBlocker ? { evidenceBlocker } : {}),
 		...(evidenceCitations.length > 0 ? { evidenceCitations } : {}),
 	};
-	canvases.set(key, stored);
+	state.canvases.set(key, stored);
 	activeTerminal?.setCanvas(stored);
 	emitWorkerCanvas(stored);
 	return stored;
 }
 
 function canvasForResearch(symbol: string, scope: ChartScope, researchKey: string): Canvas | undefined {
-	return canvases.get(canvasKey(symbol, scope, researchKey));
+	return state.canvases.get(canvasKey(symbol, scope, researchKey));
 }
 
 function latestCanvasForDisplay(symbol: string, scope: ChartScope, predicate?: (canvas: Canvas) => boolean): Canvas | undefined {
 	let latest: Canvas | undefined;
-	for (const canvas of canvases.values()) {
+	for (const canvas of state.canvases.values()) {
 		if (canvas.symbol !== symbol || canvasScope(canvas) !== scope || (predicate && !predicate(canvas))) continue;
 		if (!latest || canvas.updatedAt > latest.updatedAt) latest = canvas;
 	}
@@ -4480,23 +3595,23 @@ function addArchivedResearchTo(store: Map<string, ArchivedResearch[]>, record: A
 }
 
 function addArchivedResearch(record: ArchivedResearch, updateLatest: boolean): void {
-	addArchivedResearchTo(researchArchive, record);
+	addArchivedResearchTo(state.researchArchive, record);
 	activeTerminal?.refreshArchivePosition();
 	if (updateLatest && isArchivedResearchCacheEligible(record)) {
 		const key = canvasKey(record.symbol, canvasScope(record.canvas), canvasResearchKey(record.canvas));
-		const current = canvases.get(key);
-		if (!current || current.updatedAt <= record.canvas.updatedAt) canvases.set(key, record.canvas);
+		const current = state.canvases.get(key);
+		if (!current || current.updatedAt <= record.canvas.updatedAt) state.canvases.set(key, record.canvas);
 	}
 }
 
 function archivedResearchFor(symbol: string, scope?: ChartScope, researchKey?: string): ArchivedResearch[] {
-	const history = researchArchive.get(symbol) ?? [];
+	const history = state.researchArchive.get(symbol) ?? [];
 	return history.filter((record) => (!scope || canvasScope(record.canvas) === scope)
 		&& (!researchKey || canvasResearchKey(record.canvas) === normalizeResearchKey(researchKey)));
 }
 
 export function isArchivedResearchCacheEligible(record: {
-	generation?: { origin?: "precache"; qualityGate?: boolean };
+	generation?: { origin?: "precache" | "scout"; qualityGate?: boolean };
 	quality?: { usable: boolean };
 }): boolean {
 	if (record.generation?.origin !== "precache") return true;
@@ -4526,7 +3641,7 @@ function cacheChoiceStatus(request: ResearchRequest, canvas: Canvas): string {
 	return `CACHE ${request.contextLabel} · ${request.intent.toUpperCase()} · ${CHART_SCOPE_CONFIGS[canvasScope(canvas)].label} · ${relativeAge(canvas.updatedAt)}${cacheEvidenceSuffix(canvas)} · [U] USE [F] REFRESH [ESC] CANCEL`;
 }
 
-function archivePayload(store: Map<string, ArchivedResearch[]> = researchArchive): ResearchArchiveFile {
+function archivePayload(store: Map<string, ArchivedResearch[]> = state.researchArchive): ResearchArchiveFile {
 	return {
 		version: 1,
 		updatedAt: Date.now(),
@@ -4534,26 +3649,14 @@ function archivePayload(store: Map<string, ArchivedResearch[]> = researchArchive
 	};
 }
 
-async function writeResearchArchive(target: string, payload: ResearchArchiveFile): Promise<void> {
-	await mkdir(dirname(target), { recursive: true });
-	const temporary = `${target}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
-	try {
-		await writeFile(temporary, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
-		await rename(temporary, target);
-	} catch (error) {
-		await rm(temporary, { force: true }).catch(() => {});
-		throw error;
-	}
-}
-
 async function persistResearchArchive(): Promise<void> {
 	if (isResearchWorkerProcess) throw new Error("Research workers must not persist the shared archive");
-	const target = archivePath;
+	const target = state.archivePath;
 	if (!target) return;
-	archiveWriteQueue = archiveWriteQueue.catch(() => {}).then(async () => {
-		await writeResearchArchive(target, archivePayload());
+	state.archiveWriteQueue = state.archiveWriteQueue.catch(() => {}).then(async () => {
+		await state.ports.storage.writeJsonFileAtomic(target, archivePayload());
 	});
-	return archiveWriteQueue;
+	return state.archiveWriteQueue;
 }
 
 type CompletedCanvasArchiveInput = { canvas: Canvas; question?: string; generation?: ResearchGeneration };
@@ -4561,7 +3664,7 @@ type CompletedCanvasArchiveInput = { canvas: Canvas; question?: string; generati
 async function archiveCompletedCanvases(inputs: readonly CompletedCanvasArchiveInput[]): Promise<void> {
 	if (inputs.length === 0) return;
 	if (isResearchWorkerProcess) throw new Error("Research workers must not persist the shared archive");
-	const target = archivePath;
+	const target = state.archivePath;
 	if (!target) throw new Error("Research archive path is unavailable");
 	const archivedAt = Date.now();
 	const records = inputs.map(({ canvas, question, generation }) => normalizeArchivedResearch({
@@ -4574,17 +3677,17 @@ async function archiveCompletedCanvases(inputs: readonly CompletedCanvasArchiveI
 	}));
 	if (records.some((record) => !record)) throw new Error("Completed research canvas is empty or invalid");
 
-	const write = archiveWriteQueue.catch(() => {}).then(async () => {
+	const write = state.archiveWriteQueue.catch(() => {}).then(async () => {
 		const next = new Map<string, ArchivedResearch[]>(
-			[...researchArchive].map(([symbol, history]) => [symbol, [...history]]),
+			[...state.researchArchive].map(([symbol, history]) => [symbol, [...history]]),
 		);
 		for (const record of records) addArchivedResearchTo(next, record!);
-		await writeResearchArchive(target, archivePayload(next));
-		researchArchive.clear();
-		for (const [symbol, history] of next) researchArchive.set(symbol, history);
+		await state.ports.storage.writeJsonFileAtomic(target, archivePayload(next));
+		state.researchArchive.clear();
+		for (const [symbol, history] of next) state.researchArchive.set(symbol, history);
 		activeTerminal?.refreshArchivePosition();
 	});
-	archiveWriteQueue = write;
+	state.archiveWriteQueue = write;
 	await write;
 }
 
@@ -4594,22 +3697,10 @@ async function archiveCompletedCanvas(canvas: Canvas, question?: string, generat
 
 async function readProjectArchive(cwd: string): Promise<ArchivedResearch[]> {
 	if (isResearchWorkerProcess) throw new Error("Research workers must not read the shared archive");
-	const configuredDataDir = process.env.MARKET_DATA_DIR?.trim();
-	if (configuredDataDir && !isAbsolute(configuredDataDir)) {
-		throw new Error("MARKET_DATA_DIR must be an absolute path");
-	}
-	const target = configuredDataDir
-		? join(configuredDataDir, "market-research-archive.json")
-		: join(cwd, ".pi", "market-research-archive.json");
-	archivePath = target;
-	let text: string;
-	try {
-		text = await readFile(target, "utf8");
-	} catch (error) {
-		if ((error as { code?: string }).code === "ENOENT") return [];
-		throw error;
-	}
-	const parsed = JSON.parse(text) as Partial<ResearchArchiveFile>;
+	const target = state.ports.storage.resolveDataPath("market-research-archive.json", cwd);
+	state.archivePath = target;
+	const parsed = await state.ports.storage.readJsonFile(target) as Partial<ResearchArchiveFile> | undefined;
+	if (parsed === undefined) return [];
 	if (parsed.version !== 1 || !Array.isArray(parsed.entries)) throw new Error("Unsupported or malformed market research archive");
 	return parsed.entries.flatMap((entry) => {
 		const normalized = normalizeArchivedResearch(entry);
@@ -4649,7 +3740,7 @@ class MarketTerminal {
 		private readonly done: (result: TerminalResult) => void,
 		initialTab = 0,
 		initialCanvas: Canvas | undefined,
-		private readonly viewWatchlist: string[] = watchlist,
+		private readonly viewWatchlist: string[] = state.watchlist,
 		private readonly researchActions?: ResearchActions,
 		initialResearch?: ResearchJob,
 		initialScope: ChartScope = DEFAULT_CHART_SCOPE,
@@ -5963,7 +5054,7 @@ class MarketHub {
 
 	private knownResearchJobs(): ResearchJob[] {
 		const jobs = new Map<string, ResearchJob>(this.researchJobCache);
-		for (const job of researchJobs.values()) jobs.set(job.id, job);
+		for (const job of state.researchJobs.values()) jobs.set(job.id, job);
 		return [...jobs.values()].sort((a, b) => b.startedAt - a.startedAt);
 	}
 
@@ -6209,10 +5300,10 @@ class MarketHub {
 	 * requests cannot race the UI.
 	 */
 	private async loadCryptoPulse(force = false): Promise<void> {
-		const requestedAt = ++cryptoPulseRequestSequence;
+		const requestedAt = ++state.cryptoPulseRequestSequence;
 		this.cryptoPulseRequestedAt = requestedAt;
 		if (!force) {
-			const cached = CRYPTO_PULSE_CACHE.getFresh<CryptoPulseSnapshot>("crypto-pulse");
+			const cached = state.CRYPTO_PULSE_CACHE.getFresh<CryptoPulseSnapshot>("crypto-pulse");
 			if (cached) {
 				this.cryptoPulse = cached;
 				this.cryptoPulseState = "ready";
@@ -6220,7 +5311,7 @@ class MarketHub {
 				return;
 			}
 		}
-		const stale = CRYPTO_PULSE_CACHE.getStale<CryptoPulseSnapshot>("crypto-pulse");
+		const stale = state.CRYPTO_PULSE_CACHE.getStale<CryptoPulseSnapshot>("crypto-pulse");
 		if (stale) {
 			this.cryptoPulse = stale;
 			this.cryptoPulseState = "ready";
@@ -6239,7 +5330,7 @@ class MarketHub {
 			const usable = isCryptoPulseUsable(snapshot);
 			if (usable) {
 				this.cryptoPulse = snapshot;
-				CRYPTO_PULSE_CACHE.set("crypto-pulse", snapshot);
+				state.CRYPTO_PULSE_CACHE.set("crypto-pulse", snapshot);
 			} else if (!this.cryptoPulse) {
 				this.cryptoPulse = snapshot;
 			}
@@ -8071,7 +7162,7 @@ function runDossierRegression(scenario: DossierRegressionScenario): DossierRegre
 		contextLabel: `DOSSIER ${scenario.toUpperCase()}`,
 	};
 	const key = canvasKey(symbol, "day", identity.researchKey);
-	canvases.delete(key);
+	state.canvases.delete(key);
 	try {
 		if (scenario === "overflow") {
 			const updatedAt = Date.now();
@@ -8171,10 +7262,10 @@ function runDossierRegression(scenario: DossierRegressionScenario): DossierRegre
 			};
 		}
 
-		const canonical = sanitizeUrl("https://source.example/report?utm_source=seed");
+		const canonical = sanitizePublicUrl("https://source.example/report?utm_source=seed");
 		const sameSourceId = sourceIdForUrl(canonical);
-		const duplicateSourceId = sourceIdForUrl(sanitizeUrl("https://source.example/report"));
-		const differentSourceId = sourceIdForUrl(sanitizeUrl("https://other.example/report"));
+		const duplicateSourceId = sourceIdForUrl(sanitizePublicUrl("https://source.example/report"));
+		const differentSourceId = sourceIdForUrl(sanitizePublicUrl("https://other.example/report"));
 		const packets = mergeEvidencePackets([{
 			sourceId: sameSourceId,
 			sourceTitle: "Older source",
@@ -8204,7 +7295,7 @@ function runDossierRegression(scenario: DossierRegressionScenario): DossierRegre
 			latestPacketUrl: packets[0]?.sourceUrl,
 		};
 	} finally {
-		canvases.delete(key);
+		state.canvases.delete(key);
 	}
 }
 
@@ -8278,8 +7369,8 @@ function restoreSessionCanvases(ctx: ExtensionContext): boolean {
 		const canvas = normalizeStoredCanvas(details?.canvas);
 		if (!canvas) continue;
 		const key = canvasKey(canvas.symbol, canvasScope(canvas), canvasResearchKey(canvas));
-		const current = canvases.get(key);
-		if (!current || current.updatedAt <= canvas.updatedAt) canvases.set(key, canvas);
+		const current = state.canvases.get(key);
+		if (!current || current.updatedAt <= canvas.updatedAt) state.canvases.set(key, canvas);
 		if (canvas.stage !== "partial") {
 			const archived = normalizeArchivedResearch({ asOf: canvas.updatedAt, archivedAt: canvas.updatedAt, canvas: { ...canvas, stage: "complete" } });
 			if (archived) {
@@ -8411,8 +7502,8 @@ function restoreCheckpointCanvases(ctx: ExtensionContext): boolean {
 			const canvas = checkpointCanvasToStored(canvasRaw, symbol, scope, createdAt);
 			if (!canvas) continue;
 			const key = canvasKey(canvas.symbol, canvasScope(canvas), canvasResearchKey(canvas));
-			const current = canvases.get(key);
-			if (!current || current.updatedAt <= canvas.updatedAt) canvases.set(key, canvas);
+			const current = state.canvases.get(key);
+			if (!current || current.updatedAt <= canvas.updatedAt) state.canvases.set(key, canvas);
 			restored = true;
 		}
 	}
@@ -8420,20 +7511,20 @@ function restoreCheckpointCanvases(ctx: ExtensionContext): boolean {
 }
 
 async function rebuildCanvasState(ctx: ExtensionContext): Promise<void> {
-	await archiveWriteQueue.catch(() => {});
-	researchArchive.clear();
-	canvases.clear();
-	archiveCwd = ctx.cwd;
+	await state.archiveWriteQueue.catch(() => {});
+	state.researchArchive.clear();
+	state.canvases.clear();
+	state.archiveCwd = ctx.cwd;
 	try {
 		for (const record of await readProjectArchive(ctx.cwd)) addArchivedResearch(record, true);
 	} catch (error) {
-		archivePath = undefined;
+		state.archivePath = undefined;
 		if (ctx.mode === "tui") ctx.ui.notify(`Research archive unavailable: ${error instanceof Error ? error.message : String(error)}`, "warning");
 	}
 	const archiveChanged = restoreSessionCanvases(ctx);
 	restoreSessionWatchlist(ctx);
 	const checkpointRestored = restoreCheckpointCanvases(ctx);
-	if ((archiveChanged || checkpointRestored) && archivePath) {
+	if ((archiveChanged || checkpointRestored) && state.archivePath) {
 		try {
 			await persistResearchArchive();
 		} catch (error) {
@@ -8444,10 +7535,10 @@ async function rebuildCanvasState(ctx: ExtensionContext): Promise<void> {
 
 async function ensureArchiveLoaded(ctx: ExtensionContext, force = false): Promise<void> {
 	if (isResearchWorkerProcess) throw new Error("Research workers must not load the shared archive");
-	if (!force && archiveCwd === ctx.cwd && archiveReady) return archiveReady;
-	archiveCwd = ctx.cwd;
-	archiveReady = rebuildCanvasState(ctx);
-	return archiveReady;
+	if (!force && state.archiveCwd === ctx.cwd && state.archiveReady) return state.archiveReady;
+	state.archiveCwd = ctx.cwd;
+	state.archiveReady = rebuildCanvasState(ctx);
+	return state.archiveReady;
 }
 
 async function openMarketPanel(
@@ -8466,7 +7557,7 @@ async function openMarketPanel(
 	let quote: Quote | undefined;
 	let initialError: string | undefined;
 	const scope = initialArchivedCanvas?.chartScope ?? initialScope;
-	const initialResearch = [...researchJobs.values()].filter((job) => job.symbol === symbol && job.chartScope === scope).sort((a, b) => b.startedAt - a.startedAt)[0];
+	const initialResearch = [...state.researchJobs.values()].filter((job) => job.symbol === symbol && job.chartScope === scope).sort((a, b) => b.startedAt - a.startedAt)[0];
 	const initialLiveCanvas = researchSlotHeld(initialResearch)
 		? canvasForResearch(symbol, scope, initialResearch!.researchKey)
 		: latestCanvasForDisplay(symbol, scope, (canvas) => isTickerResearchKey(canvasResearchKey(canvas)));
@@ -8483,7 +7574,7 @@ async function openMarketPanel(
 	let terminal: MarketTerminal | undefined;
 	const result = await ctx.ui.custom<TerminalResult>((tui, theme, _keybindings, done) => {
 		terminal = new MarketTerminal(
-			tui, theme, symbol, quote, (s, signal) => fetchQuote(symbol, s, signal), done, initialTab, initialLiveCanvas, watchlist, researchActions, initialResearch, scope, tickerNavigation, returnState, initialTickerLayout, onWatchlistChange,
+			tui, theme, symbol, quote, (s, signal) => fetchQuote(symbol, s, signal), done, initialTab, initialLiveCanvas, state.watchlist, researchActions, initialResearch, scope, tickerNavigation, returnState, initialTickerLayout, onWatchlistChange,
 		);
 		if (initialError) terminal.setStatus(`Initial quote unavailable: ${initialError}`);
 		else if (returnStatus) terminal.setStatus(returnStatus);
@@ -8513,7 +7604,7 @@ async function openMarketMap(
 	initialNavigation?: MarketHubNavigationState,
 ): Promise<TerminalResult | undefined> {
 	const scope = initialArchivedCanvas?.chartScope ?? initialNavigation?.chartScope ?? DEFAULT_CHART_SCOPE;
-	const initialResearch = [...researchJobs.values()].filter((job) => job.symbol === "MARKET" && job.chartScope === scope).sort((a, b) => b.startedAt - a.startedAt)[0];
+	const initialResearch = [...state.researchJobs.values()].filter((job) => job.symbol === "MARKET" && job.chartScope === scope).sort((a, b) => b.startedAt - a.startedAt)[0];
 	const initialLiveCanvas = researchSlotHeld(initialResearch) && isSignalsResearchKey(initialResearch!.researchKey)
 		? canvasForResearch("MARKET", scope, initialResearch!.researchKey)
 		: latestCanvasForDisplay("MARKET", scope, (canvas) => isSignalsResearchKey(canvasResearchKey(canvas)));
@@ -8523,7 +7614,7 @@ async function openMarketMap(
 	let terminal: MarketHub | undefined;
 	const result = await ctx.ui.custom<TerminalResult>((tui, theme, _keybindings, done) => {
 		terminal = new MarketHub(
-			tui, theme, snapshot, (s, signal) => fetchMarketSnapshot(pi, s, signal), done, initialScreen, initialLiveCanvas, watchlist, researchActions, initialResearch, initialNavigation, onWatchlistChange,
+			tui, theme, snapshot, (s, signal) => fetchMarketSnapshot(pi, s, signal), done, initialScreen, initialLiveCanvas, state.watchlist, researchActions, initialResearch, initialNavigation, onWatchlistChange,
 		);
 		if (returnStatus) terminal.setStatus(returnStatus);
 		else terminal.setStatus("LOADING MARKET MAP…");
@@ -8929,7 +8020,7 @@ function strictResultLine(payload: {
 
 export default function (pi: ExtensionAPI) {
 	const persistWatchlist = () => {
-		pi.appendEntry(WATCHLIST_SESSION_CUSTOM_TYPE, { symbols: [...watchlist] });
+		pi.appendEntry(WATCHLIST_SESSION_CUSTOM_TYPE, { symbols: [...state.watchlist] });
 	};
 
 	const researchPrompt = (job: ResearchJob): string => {
@@ -8956,10 +8047,13 @@ export default function (pi: ExtensionAPI) {
 		...(job.origin === "precache" && job.tokenLimit !== undefined
 			? { origin: "precache" as const, tokenLimit: job.tokenLimit }
 			: {}),
+		...(job.origin === "scout" && job.modelProvider === "openrouter" && job.modelId && job.scoutCandidateId
+			? { origin: "scout" as const, modelProvider: "openrouter" as const, modelId: job.modelId, scoutCandidateId: job.scoutCandidateId }
+			: {}),
 	});
 
 	const settleWorkerFailure = (jobId: string, error: unknown): void => {
-		const job = researchJobs.get(jobId);
+		const job = state.researchJobs.get(jobId);
 		if (!job || !researchSlotHeld(job) || job.outcome === "cancelled") return;
 		const message = cleanText(error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 180);
 		settleResearchJob(jobId, { outcome: "failed", error: message || "Research worker failed" });
@@ -8970,37 +8064,49 @@ export default function (pi: ExtensionAPI) {
 		canvas: Canvas,
 		event?: Pick<Extract<WorkerEvent, { type: "settled" }>, "outcome" | "error" | "usage" | "tokenGuard">,
 	): Promise<void> => {
-		if (workerFinalizations.has(jobId)) return;
-		workerFinalizations.add(jobId);
-		const job = researchJobs.get(jobId);
+		if (state.workerFinalizations.has(jobId)) return;
+		state.workerFinalizations.add(jobId);
+		const job = state.researchJobs.get(jobId);
 		if (!job || !researchSlotHeld(job) || job.outcome !== "complete") {
-			workerFinalizations.delete(jobId);
+			state.workerFinalizations.delete(jobId);
 			return;
 		}
 		try {
 			const qualityGate = job.origin === "precache" ? readPrecacheQualityGate() : undefined;
-			await archiveCompletedCanvas(canvas, job.question, { promptVariant: job.promptVariant, origin: job.origin, ...(qualityGate !== undefined ? { qualityGate } : {}) });
+			if (job.origin === "scout" && !assessCanvasQuality(canvas).usable) {
+				settleResearchJob(jobId, {
+					outcome: "failed",
+					error: "Scout research output failed the evidence quality gate",
+				});
+				return;
+			}
+			await archiveCompletedCanvas(canvas, job.question, {
+				promptVariant: job.promptVariant,
+				origin: job.origin,
+				...(job.scoutCandidateId ? { scoutCandidateId: job.scoutCandidateId } : {}),
+				...(qualityGate !== undefined ? { qualityGate } : {}),
+			});
 			if (job.origin === "precache" && job.precacheReservation && !job.pairedTarget) {
 				// Mirror the paired path: the exact identity may not linger in the
 				// live canvas map as a warm result unless it is quality-usable.
 				if (qualityGate && !assessCanvasQuality(canvas).usable) {
-					canvases.delete(canvasKey(job.symbol, job.chartScope, job.researchKey));
+					state.canvases.delete(canvasKey(job.symbol, job.chartScope, job.researchKey));
 				}
 				await persistPrecacheSettlement(job, "complete", event?.usage);
 			}
-			const current = researchJobs.get(jobId);
+			const current = state.researchJobs.get(jobId);
 			if (!current || !researchSlotHeld(current) || current.outcome !== "complete") return;
 			settleResearchJob(jobId, { outcome: "complete", error: undefined });
 		} catch (error) {
 			if (job.origin === "precache" && job.precacheReservation && !job.pairedTarget) {
 				const message = `Could not persist completed research: ${cleanText(error instanceof Error ? error.message : String(error)).slice(0, 140)}`;
-				workerFinalizations.delete(jobId);
+				state.workerFinalizations.delete(jobId);
 				void finalizeSinglePrecacheSettlement(jobId, { outcome: "failed", error: message, usage: event?.usage, tokenGuard: event?.tokenGuard });
 				return;
 			}
 			settleWorkerFailure(jobId, `Could not persist completed research: ${cleanText(error instanceof Error ? error.message : String(error)).slice(0, 140)}`);
 		} finally {
-			workerFinalizations.delete(jobId);
+			state.workerFinalizations.delete(jobId);
 		}
 	};
 
@@ -9025,7 +8131,7 @@ export default function (pi: ExtensionAPI) {
 		if (!reservation) throw new Error("Pre-cache reservation correlation is unavailable");
 		const pairKey = precacheSettlementKey(job);
 		if (reservation.pairKey !== pairKey) throw new Error("Pre-cache reservation identity mismatch");
-		const write = precacheLedgerWriteQueue.then(async () => {
+		const write = state.precacheLedgerWriteQueue.then(async () => {
 			const file = await readPrecacheLedger(reservation.ledgerPath);
 			const day = file.days.find((record) => record.date === reservation.ledgerDate);
 			if (!day) throw new Error(`Pre-cache ledger day is missing: ${reservation.ledgerDate}`);
@@ -9044,7 +8150,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			await writePrecacheLedger(reservation.ledgerPath, file);
 		});
-		precacheLedgerWriteQueue = write.catch(() => {});
+		state.precacheLedgerWriteQueue = write.catch(() => {});
 		await write;
 	};
 
@@ -9077,11 +8183,11 @@ export default function (pi: ExtensionAPI) {
 		jobId: string,
 		event: Pick<Extract<WorkerEvent, { type: "settled" }>, "outcome" | "error" | "usage" | "tokenGuard">,
 	): Promise<void> => {
-		if (workerFinalizations.has(jobId)) return;
-		workerFinalizations.add(jobId);
-		const job = researchJobs.get(jobId);
+		if (state.workerFinalizations.has(jobId)) return;
+		state.workerFinalizations.add(jobId);
+		const job = state.researchJobs.get(jobId);
 		if (!job || !researchSlotHeld(job) || !job.pairedTarget) {
-			workerFinalizations.delete(jobId);
+			state.workerFinalizations.delete(jobId);
 			return;
 		}
 		let outcome: "complete" | "failed" | "cancelled" = event.outcome;
@@ -9092,7 +8198,7 @@ export default function (pi: ExtensionAPI) {
 				if (!synthetic || synthetic.researchId !== job.id || synthetic.stage !== "complete") {
 					throw new Error("Worker settled without a complete paired canvas");
 				}
-				const split = pendingPairedCanvases.get(job.id);
+				const split = state.pendingPairedCanvases.get(job.id);
 				if (!split) throw new Error("Worker settled without a valid paired canvas split");
 				const targets: Array<{ needed: boolean; identity: PairedCacheIdentity }> = [
 					{ needed: job.pairedTarget.neededBrief, identity: job.pairedTarget.brief },
@@ -9137,17 +8243,17 @@ export default function (pi: ExtensionAPI) {
 				await persistPrecacheSettlement(job, "failed", event.usage, precacheFailureTelemetry(job, failure, event.tokenGuard === true));
 			} catch (ledgerError) {
 				failure = `Could not persist pre-cache usage: ${cleanText(ledgerError instanceof Error ? ledgerError.message : String(ledgerError)).slice(0, 130)}`;
-				precachePending = [];
+				state.precachePending = [];
 				stopPrecacheTimer();
 			}
 		} finally {
-			pendingPairedCanvases.delete(jobId);
-			const current = researchJobs.get(jobId);
+			state.pendingPairedCanvases.delete(jobId);
+			const current = state.researchJobs.get(jobId);
 			if (current && researchSlotHeld(current)) {
 				settleResearchJob(jobId, { outcome, ...(failure ? { error: failure } : { error: undefined }) });
 			}
-			canvases.delete(canvasKey(job.symbol, job.chartScope, job.researchKey));
-			workerFinalizations.delete(jobId);
+			state.canvases.delete(canvasKey(job.symbol, job.chartScope, job.researchKey));
+			state.workerFinalizations.delete(jobId);
 		}
 	};
 
@@ -9160,11 +8266,11 @@ export default function (pi: ExtensionAPI) {
 		jobId: string,
 		event: Pick<Extract<WorkerEvent, { type: "settled" }>, "outcome" | "error" | "usage" | "tokenGuard">,
 	): Promise<void> => {
-		if (workerFinalizations.has(jobId)) return;
-		workerFinalizations.add(jobId);
-		const job = researchJobs.get(jobId);
+		if (state.workerFinalizations.has(jobId)) return;
+		state.workerFinalizations.add(jobId);
+		const job = state.researchJobs.get(jobId);
 		if (!job || !researchSlotHeld(job) || job.origin !== "precache" || job.pairedTarget) {
-			workerFinalizations.delete(jobId);
+			state.workerFinalizations.delete(jobId);
 			return;
 		}
 		const outcome: "complete" | "failed" | "cancelled" = event.outcome;
@@ -9173,24 +8279,24 @@ export default function (pi: ExtensionAPI) {
 			await persistPrecacheSettlement(job, outcome, event.usage, precacheFailureTelemetry(job, failure, event.tokenGuard === true));
 		} catch (error) {
 			const ledgerFailure = `Could not persist pre-cache usage: ${cleanText(error instanceof Error ? error.message : String(error)).slice(0, 130)}`;
-			precachePending = [];
+			state.precachePending = [];
 			stopPrecacheTimer();
-			const current = researchJobs.get(jobId);
+			const current = state.researchJobs.get(jobId);
 			if (current && researchSlotHeld(current)) {
 				settleResearchJob(jobId, { outcome: "failed", error: ledgerFailure });
 			}
-			workerFinalizations.delete(jobId);
+			state.workerFinalizations.delete(jobId);
 			return;
 		}
-		const current = researchJobs.get(jobId);
+		const current = state.researchJobs.get(jobId);
 		if (current && researchSlotHeld(current)) {
 			settleResearchJob(jobId, { outcome, ...(failure ? { error: failure } : { error: undefined }) });
 		}
-		workerFinalizations.delete(jobId);
+		state.workerFinalizations.delete(jobId);
 	};
 
 	const failWorkerResearch = (jobId: string, error: unknown): void => {
-		const job = researchJobs.get(jobId);
+		const job = state.researchJobs.get(jobId);
 		const message = cleanText(error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 180) || "Research worker failed";
 		if (job?.origin === "precache" && !isResearchWorkerProcess) {
 			void (job.pairedTarget
@@ -9202,7 +8308,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const applyWorkerEvent = (event: WorkerEvent): void => {
-		const job = researchJobs.get(event.jobId);
+		const job = state.researchJobs.get(event.jobId);
 		if (!job || !researchSlotHeld(job) || job.outcome === "cancelled") return;
 
 		switch (event.type) {
@@ -9242,7 +8348,7 @@ export default function (pi: ExtensionAPI) {
 							failWorkerResearch(job.id, split.error);
 							return;
 						}
-						pendingPairedCanvases.set(job.id, split);
+						state.pendingPairedCanvases.set(job.id, split);
 						if (job.pairedTarget.neededBrief) publishedBlocks = Math.max(publishedBlocks, normalizeCanvasBlocks(split.brief.blocks).length);
 						if (job.pairedTarget.neededWhy) publishedBlocks = Math.max(publishedBlocks, normalizeCanvasBlocks(split.why.blocks).length);
 					}
@@ -9308,7 +8414,7 @@ export default function (pi: ExtensionAPI) {
 			const permitGate = createResearchPermitGateForRuntime();
 			researchWorkerCoordinator = new ResearchWorkerCoordinator({
 				concurrency: readResearchWorkerConcurrency(),
-				workerFactory: createDefaultWorkerFactory(),
+				workerFactory: state.ports.workerFactory ?? createDefaultWorkerFactory(),
 				onEvent: applyWorkerEvent,
 				onError: failWorkerResearch,
 				...(permitGate ? { ...permitGate } : {}),
@@ -9319,15 +8425,15 @@ export default function (pi: ExtensionAPI) {
 
 	const pumpResearchQueue = (ctx: ExtensionContext, workerBootstrap = false): void => {
 		if (isResearchWorkerProcess) {
-			if (runningResearchId || (!workerBootstrap && (!ctx.isIdle() || ctx.hasPendingMessages()))) return;
-			while (researchQueue.length > 0) {
-				const id = researchQueue.shift()!;
-				const queued = researchJobs.get(id);
+			if (state.runningResearchId || (!workerBootstrap && (!ctx.isIdle() || ctx.hasPendingMessages()))) return;
+			while (state.researchQueue.length > 0) {
+				const id = state.researchQueue.shift()!;
+				const queued = state.researchJobs.get(id);
 				if (!queued || !researchSlotHeld(queued) || queued.phase !== "queued") continue;
-				runningResearchId = id;
+				state.runningResearchId = id;
 				const dispatched = updateResearchJob(id, { phase: "dispatched", outcome: "queued", activity: "seeding" });
 				if (!dispatched) {
-					runningResearchId = undefined;
+					state.runningResearchId = undefined;
 					continue;
 				}
 				try {
@@ -9345,18 +8451,18 @@ export default function (pi: ExtensionAPI) {
 		try {
 			coordinator = getResearchWorkerCoordinator();
 		} catch (error) {
-			for (const id of [...researchQueue]) failWorkerResearch(id, error);
+			for (const id of [...state.researchQueue]) failWorkerResearch(id, error);
 			return;
 		}
-		for (const id of [...researchQueue]) {
-			const queued = researchJobs.get(id);
-			if (!queued || !researchSlotHeld(queued) || queued.phase !== "queued" || workerSubmittedResearch.has(id)) continue;
+		for (const id of [...state.researchQueue]) {
+			const queued = state.researchJobs.get(id);
+			if (!queued || !researchSlotHeld(queued) || queued.phase !== "queued" || state.workerSubmittedResearch.has(id)) continue;
 			const submitted = coordinator.enqueue(id, workerRequestForJob(queued));
 			if (!submitted.accepted) {
 				failWorkerResearch(id, submitted.reason || "Research worker queue rejected the job");
 				continue;
 			}
-			workerSubmittedResearch.add(id);
+			state.workerSubmittedResearch.add(id);
 			if (submitted.status === "dispatched") {
 				removeQueuedResearch(id);
 				updateResearchJob(id, { phase: "dispatched", outcome: "queued", activity: "seeding", error: undefined });
@@ -9393,7 +8499,7 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 			if (activeResearchJobs().length >= 24) return { accepted: false, status: "RESEARCH QUEUE FULL · CANCEL OR WAIT FOR A JOB" };
-			if (publicSessionResearchLimit !== undefined && publicSessionResearchRuns >= publicSessionResearchLimit) {
+			if (publicSessionResearchLimit !== undefined && state.publicSessionResearchRuns >= publicSessionResearchLimit) {
 				return {
 					accepted: false,
 					status: `PUBLIC SESSION RESEARCH LIMIT REACHED (${publicSessionResearchLimit})`,
@@ -9401,13 +8507,13 @@ export default function (pi: ExtensionAPI) {
 			}
 			const job = createResearchJob(request);
 			if (!job) return { accepted: false, status: "THIS RESEARCH JOB IS ALREADY ACTIVE", job: activeResearchJobForIdentity(request) };
-			if (publicSessionResearchLimit !== undefined) publicSessionResearchRuns += 1;
+			if (publicSessionResearchLimit !== undefined) state.publicSessionResearchRuns += 1;
 			if (!isResearchWorkerProcess) pumpResearchQueue(ctx);
-			const current = researchJobs.get(job.id) ?? job;
+			const current = state.researchJobs.get(job.id) ?? job;
 			return { accepted: true, status: `${researchStatusLine(current)} · ${researchQueueLabel()}`, job: current };
 		},
 		cancel(jobId) {
-			const job = jobId ? researchJobs.get(jobId) : undefined;
+			const job = jobId ? state.researchJobs.get(jobId) : undefined;
 			if (!job || !researchSlotHeld(job)) return { accepted: false, status: "NO ACTIVE RESEARCH FOR CURRENT SELECTION", job };
 			if (job.outcome === "complete") return { accepted: false, status: `RESEARCH ${job.contextLabel} IS FINALIZING`, job };
 			if (job.phase === "cancelling") return { accepted: false, status: `RESEARCH ${job.contextLabel} IS CANCELLING`, job };
@@ -9471,22 +8577,22 @@ export default function (pi: ExtensionAPI) {
 			// Invalid configuration (validated at warm entry) or a broken
 			// coordinator must not crash the process from a timer callback;
 			// drop the remaining plan and fail the warm silently.
-			precachePending = [];
+			state.precachePending = [];
 			stopPrecacheTimer();
 		}
 	};
 
 	const pumpPrecacheUnchecked = (ctx: ExtensionContext): void => {
-		if (precachePending.length === 0) {
+		if (state.precachePending.length === 0) {
 			stopPrecacheTimer();
 			return;
 		}
-		if (!readPrecacheEnabled() || Date.now() < precacheCircuitOpenUntil) {
-			precachePending = [];
+		if (!readPrecacheEnabled() || Date.now() < state.precacheCircuitOpenUntil) {
+			state.precachePending = [];
 			stopPrecacheTimer();
 			return;
 		}
-		if (precacheCanaryState === "active") return;
+		if (state.precacheCanaryState === "active") return;
 		const active = activeResearchJobs();
 		if (active.some((job) => job.origin !== "precache")) return;
 		const warmActive = active.filter((job) => job.origin === "precache").length;
@@ -9495,29 +8601,29 @@ export default function (pi: ExtensionAPI) {
 		if (remaining <= 0) return;
 
 		const actions = researchActions(ctx);
-		if (precacheCanaryState === "required") {
+		if (state.precacheCanaryState === "required") {
 			// Dispatch exactly one canary through normal scheduler guards and
 			// retain it at the plan head if the start is temporarily rejected.
-			const item = precachePending[0]!;
+			const item = state.precachePending[0]!;
 			const response = actions.start({ action: "research", returnTo: "market", origin: "precache", ...item });
 			if (response.accepted && response.job) {
-				precacheCanaryState = "active";
-				precacheCanaryJobId = response.job.id;
-				precachePending.shift();
+				state.precacheCanaryState = "active";
+				state.precacheCanaryJobId = response.job.id;
+				state.precachePending.shift();
 			}
 			return;
 		}
-		for (let index = 0; index < Math.min(remaining, precachePending.length); index++) {
-			const item = precachePending[0]!;
+		for (let index = 0; index < Math.min(remaining, state.precachePending.length); index++) {
+			const item = state.precachePending[0]!;
 			const response = actions.start({ action: "research", returnTo: "market", origin: "precache", ...item });
 			if (response.accepted) {
-				precachePending.shift();
+				state.precachePending.shift();
 			} else {
 				// Duplicate/already-active or queue-full; retry on the next pump.
 				break;
 			}
 		}
-		if (precachePending.length === 0) stopPrecacheTimer();
+		if (state.precachePending.length === 0) stopPrecacheTimer();
 	};
 
 	/**
@@ -9529,11 +8635,11 @@ export default function (pi: ExtensionAPI) {
 	 * atomically before any dispatch.
 	 */
 	const warmResearchCache = async (ctx: ExtensionContext): Promise<void> => {
-		if (isResearchWorkerProcess || precacheWarmState || !readPrecacheEnabled() || Date.now() < precacheCircuitOpenUntil) return;
+		if (isResearchWorkerProcess || isBrowserSession || state.precacheWarmState || !readPrecacheEnabled() || Date.now() < state.precacheCircuitOpenUntil) return;
 		const maxJobs = readPrecacheMaxJobs();
 		const qualityGate = readPrecacheQualityGate();
-		const generation = warmGeneration;
-		precacheWarmState = true;
+		const generation = state.warmGeneration;
+		state.precacheWarmState = true;
 		if (precacheWarmCapacity(readResearchWorkerConcurrency(), maxJobs) === 0) return;
 		if (qualityGate && !configuredUnbrowserMcpUrl()) return;
 
@@ -9561,7 +8667,7 @@ export default function (pi: ExtensionAPI) {
 			const timeout = setTimeout(() => controller.abort(), PRECACHE_SNAPSHOT_TIMEOUT_MS);
 			try {
 				const snapshot = await fetchMarketSnapshot(pi, DEFAULT_CHART_SCOPE, controller.signal, "US stock market latest news earnings macro rates");
-				if (generation !== warmGeneration) return;
+				if (generation !== state.warmGeneration) return;
 				leadHeadline = snapshot.headlines[0];
 				moverSymbols = snapshot.movers.map((mover) => mover.quote.symbol);
 			} finally {
@@ -9575,17 +8681,17 @@ export default function (pi: ExtensionAPI) {
 		const plan = strategy === "single"
 			? buildSinglePrecachePlan({ isFresh, maxJobs, leadHeadline, moverSymbols })
 			: buildPairedPrecachePlan({ isFresh, maxJobs, leadHeadline, moverSymbols });
-		if (generation !== warmGeneration || plan.length === 0) return;
+		if (generation !== state.warmGeneration || plan.length === 0) return;
 
 		// Reserve the highest-priority prefix and persist it before any dispatch.
 		let admitted: PrecacheResearchRequest[];
 		try {
-			if (!archiveCwd) throw new Error("Research archive path is unavailable");
-			const path = precacheLedgerFilePath(archiveCwd);
+			if (!state.archiveCwd) throw new Error("Research archive path is unavailable");
+			const path = precacheLedgerFilePath(state.archiveCwd);
 			const keyFor = (item: PrecacheResearchRequest): string => item.pairedTarget
 				? pairedPairKey(item.symbol, item.chartScope, item.pairedTarget.brief.researchKey, item.pairedTarget.why.researchKey)
 				: singlePrecacheKey(item.symbol, item.chartScope, item.researchKey);
-			const reserveAndWrite = precacheLedgerWriteQueue.then(async () => {
+			const reserveAndWrite = state.precacheLedgerWriteQueue.then(async () => {
 				const file = await readPrecacheLedger(path);
 				const reservationNow = Date.now();
 				const ledgerDate = utcDayKey(reservationNow);
@@ -9606,41 +8712,41 @@ export default function (pi: ExtensionAPI) {
 				await writePrecacheLedger(path, file);
 				return next;
 			});
-			precacheLedgerWriteQueue = reserveAndWrite.then(() => {}, () => {});
+			state.precacheLedgerWriteQueue = reserveAndWrite.then(() => {}, () => {});
 			admitted = await reserveAndWrite;
 		} catch (error) {
 			throw new Error(`Pre-cache budget ledger failed: ${error instanceof Error ? error.message : String(error)}`);
 		}
-		if (generation !== warmGeneration || admitted.length === 0) return;
+		if (generation !== state.warmGeneration || admitted.length === 0) return;
 
 		// Set up canary/degraded logic (uses split halves).
 		reportPrecacheQuality = (counts) => {
-			if (counts.usable) precacheDegradedStreak = 0;
-			else precacheDegradedStreak += 1;
-			if (precacheCanaryState === "active" && counts.jobId === precacheCanaryJobId) {
+			if (counts.usable) state.precacheDegradedStreak = 0;
+			else state.precacheDegradedStreak += 1;
+			if (state.precacheCanaryState === "active" && counts.jobId === state.precacheCanaryJobId) {
 				const verdict = decidePrecacheCanary(counts);
 				if (verdict.openCircuit) {
-					precacheCanaryState = "none";
-					precacheCircuitOpenUntil = Date.now() + PRECACHE_CIRCUIT_COOLDOWN_MS;
-					precachePending = [];
+					state.precacheCanaryState = "none";
+					state.precacheCircuitOpenUntil = Date.now() + PRECACHE_CIRCUIT_COOLDOWN_MS;
+					state.precachePending = [];
 					stopPrecacheTimer();
 					return;
 				}
-				precacheCanaryState = "passed";
+				state.precacheCanaryState = "passed";
 				startPrecachePump(ctx);
 				return;
 			}
-			if (precacheDegradedStreak >= PRECACHE_DEGRADED_THRESHOLD) {
-				precacheCircuitOpenUntil = Date.now() + PRECACHE_CIRCUIT_COOLDOWN_MS;
-				precachePending = [];
+			if (state.precacheDegradedStreak >= PRECACHE_DEGRADED_THRESHOLD) {
+				state.precacheCircuitOpenUntil = Date.now() + PRECACHE_CIRCUIT_COOLDOWN_MS;
+				state.precachePending = [];
 				stopPrecacheTimer();
 			}
 		};
 
-		precachePending = admitted;
+		state.precachePending = admitted;
 		requestPrecachePump = () => queueMicrotask(() => pumpPrecache(ctx));
-		precacheCanaryState = qualityGate ? "required" : "passed";
-		precacheCanaryJobId = undefined;
+		state.precacheCanaryState = qualityGate ? "required" : "passed";
+		state.precacheCanaryJobId = undefined;
 		startPrecachePump(ctx);
 	};
 
@@ -9651,8 +8757,8 @@ export default function (pi: ExtensionAPI) {
 			if (active) throw new Error(`Pass research_id=${active.id} to target the active background research job`);
 			return undefined;
 		}
-		const job = researchJobs.get(id);
-		if (!job || runningResearchId !== id || job.phase === "settled" || job.settledAt !== undefined) throw new Error(`Stale or unknown research_id (possibly queued): ${id}`);
+		const job = state.researchJobs.get(id);
+		if (!job || state.runningResearchId !== id || job.phase === "settled" || job.settledAt !== undefined) throw new Error(`Stale or unknown research_id (possibly queued): ${id}`);
 		if (job.outcome === "cancelled") throw new Error(`Research job ${id} was cancelled`);
 		if (job.outcome === "complete") throw new Error(`Research job ${id} already published a complete canvas`);
 		if (expectedSymbol && job.symbol !== expectedSymbol) throw new Error(`research_id ${id} belongs to ${job.symbol}, not ${expectedSymbol}`);
@@ -9660,8 +8766,8 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const writableResearchJob = (job: ResearchJob): ResearchJob | undefined => {
-		const current = researchJobs.get(job.id);
-		return current && runningResearchId === job.id && researchSlotHeld(current)
+		const current = state.researchJobs.get(job.id);
+		return current && state.runningResearchId === job.id && researchSlotHeld(current)
 			&& current.phase !== "cancelling" && current.outcome !== "cancelled" && current.outcome !== "complete"
 			? current : undefined;
 	};
@@ -9727,111 +8833,128 @@ export default function (pi: ExtensionAPI) {
 		return undefined;
 	};
 
-	let marketScout: MarketEventScout | undefined;
-	let marketScoutCwd: string | undefined;
-	let marketScoutTimer: ReturnType<typeof setTimeout> | undefined;
-	let marketScoutAbort: AbortController | undefined;
-	let marketScoutInFlight: Promise<MarketEventScoutRunResult> | undefined;
-	let marketScoutDrain: Promise<void> | undefined;
-	let marketScoutSchedulerActive = false;
-	let marketScoutGeneration = 0;
-	let marketScoutLastError: string | undefined;
-	let marketScoutLastNotifiedError: string | undefined;
-
 	const stopMarketScout = (): Promise<void> => {
-		if (marketScoutDrain) return marketScoutDrain;
+		if (state.marketScoutDrain) return state.marketScoutDrain;
 		let operation: Promise<void>;
 		operation = (async () => {
-			marketScoutSchedulerActive = false;
-			marketScoutGeneration += 1;
-			if (marketScoutTimer) clearTimeout(marketScoutTimer);
-			marketScoutTimer = undefined;
-			const controller = marketScoutAbort;
+			state.marketScoutSchedulerActive = false;
+			state.marketScoutGeneration += 1;
+			if (state.marketScoutTimer) clearTimeout(state.marketScoutTimer);
+			state.marketScoutTimer = undefined;
+			const controller = state.marketScoutAbort;
 			controller?.abort(new Error("Market event scout stopped"));
-			const pending = marketScoutInFlight;
+			const pending = state.marketScoutInFlight;
 			if (pending) await pending.catch(() => undefined);
-			if (marketScoutAbort === controller) marketScoutAbort = undefined;
-			if (marketScoutInFlight === pending) marketScoutInFlight = undefined;
-			marketScout = undefined;
-			marketScoutCwd = undefined;
+			if (state.marketScoutAbort === controller) state.marketScoutAbort = undefined;
+			if (state.marketScoutInFlight === pending) state.marketScoutInFlight = undefined;
+			state.marketScout = undefined;
+			state.marketScoutCwd = undefined;
 		})().finally(() => {
-			if (marketScoutDrain === operation) marketScoutDrain = undefined;
+			if (state.marketScoutDrain === operation) state.marketScoutDrain = undefined;
 		});
-		marketScoutDrain = operation;
+		state.marketScoutDrain = operation;
 		return operation;
 	};
 
-	const getMarketScout = (): MarketEventScout => {
-		if (isResearchWorkerProcess || process.env.PUBLIC_SESSION_WORKER === "1" || process.env.TERMINAL_RUNTIME_MODE === "public-gateway") {
-			throw new Error("Market event scouting is unavailable in disposable/public workers");
+	const getMarketScout = (ctx?: ExtensionContext): MarketEventScout => {
+		if (isResearchWorkerProcess || process.env.PUBLIC_SESSION_WORKER === "1"
+			|| process.env.TERMINAL_RUNTIME_MODE === "public-gateway" || process.env.TERMINAL_RUNTIME_MODE === "private-workspace"
+			|| process.env.FINANCIAL_WORKSPACE_CHECKPOINTS === "1") {
+			throw new Error("Market event scouting is unavailable in this runtime");
 		}
-		if (!archiveCwd) throw new Error("Market event scout data path is unavailable");
-		if (marketScout && marketScoutCwd === archiveCwd) return marketScout;
-		if (marketScoutCwd && marketScoutCwd !== archiveCwd) throw new Error("Market event scout lifecycle transition is still draining");
-		marketScout = new MarketEventScout({
+		if (!state.archiveCwd) throw new Error("Market event scout data path is unavailable");
+		if (state.marketScout && state.marketScoutCwd === state.archiveCwd) return state.marketScout;
+		if (state.marketScoutCwd && state.marketScoutCwd !== state.archiveCwd) throw new Error("Market event scout lifecycle transition is still draining");
+		const dispatchEnabled = readMarketScoutDispatchEnabled();
+		if (dispatchEnabled && !ctx) throw new Error("Market event scout dispatch context is unavailable");
+		const dispatchModelId = dispatchEnabled ? readMarketScoutModelId() : undefined;
+		const dispatch: MarketEventTriggerDispatcher | undefined = dispatchEnabled
+			? {
+				modelId: dispatchModelId!,
+				policy: readMarketScoutDispatchPolicy(),
+					dispatch(candidate) {
+						const request = marketScoutDispatchRequest(candidate, dispatchModelId!);
+						if (!request) return { accepted: false, error: "Trigger route could not be converted to a research request" };
+						const response = researchActions(ctx!).start(request);
+						const retryable = !response.accepted && (
+							Boolean(response.job)
+							|| response.status.includes("QUEUE FULL")
+							|| response.status.includes("LIMIT REACHED")
+						);
+						return {
+							accepted: response.accepted,
+							...(response.job?.id ? { jobId: response.job.id } : {}),
+							...(!response.accepted ? { error: response.status } : {}),
+							...(retryable ? { retryable: true } : {}),
+						};
+					},
+			}
+			: undefined;
+		state.marketScout = new MarketEventScout({
 			client: marketEventDocumentClient(pi),
-			statePath: marketEventScoutFilePath(archiveCwd),
-			getTrackedSymbols: () => [...MOVER_UNIVERSE, ...watchlist],
+			statePath: marketEventScoutFilePath(state.archiveCwd),
+			getTrackedSymbols: () => [...MOVER_UNIVERSE, ...state.watchlist],
+			...(dispatch ? { dispatch } : {}),
 		});
-		marketScoutCwd = archiveCwd;
-		return marketScout;
+		state.marketScoutCwd = state.archiveCwd;
+		return state.marketScout;
 	};
 
-	const prepareMarketScout = async (): Promise<{ scout: MarketEventScout; generation: number }> => {
-		if (marketScoutDrain) await marketScoutDrain;
-		if (marketScoutCwd && marketScoutCwd !== archiveCwd) await stopMarketScout();
-		return { scout: getMarketScout(), generation: marketScoutGeneration };
+	const prepareMarketScout = async (ctx?: ExtensionContext): Promise<{ scout: MarketEventScout; generation: number }> => {
+		if (state.marketScoutDrain) await state.marketScoutDrain;
+		if (state.marketScoutCwd && state.marketScoutCwd !== state.archiveCwd) await stopMarketScout();
+		return { scout: getMarketScout(ctx), generation: state.marketScoutGeneration };
 	};
 
-	const runMarketScout = async (expectedGeneration?: number): Promise<MarketEventScoutRunResult> => {
-		const prepared = await prepareMarketScout();
-		if (prepared.generation !== marketScoutGeneration) throw new Error("Market event scout lifecycle changed before polling");
+	const runMarketScout = async (expectedGeneration?: number, ctx?: ExtensionContext): Promise<MarketEventScoutRunResult> => {
+		const prepared = await prepareMarketScout(ctx);
+		if (prepared.generation !== state.marketScoutGeneration) throw new Error("Market event scout lifecycle changed before polling");
 		if (expectedGeneration !== undefined
-			&& (!marketScoutSchedulerActive || expectedGeneration !== marketScoutGeneration)) {
+			&& (!state.marketScoutSchedulerActive || expectedGeneration !== state.marketScoutGeneration)) {
 			throw new Error("Market event scout lifecycle changed before polling");
 		}
-		if (!marketScoutAbort || marketScoutAbort.signal.aborted) marketScoutAbort = new AbortController();
-		const controller = marketScoutAbort;
+		if (!state.marketScoutAbort || state.marketScoutAbort.signal.aborted) state.marketScoutAbort = new AbortController();
+		const controller = state.marketScoutAbort;
 		const operation = prepared.scout.run({ signal: controller.signal });
-		marketScoutInFlight = operation;
+		state.marketScoutInFlight = operation;
 		try {
 			const result = await operation;
-			marketScoutLastError = undefined;
-			marketScoutLastNotifiedError = undefined;
+			state.marketScoutLastError = undefined;
+			state.marketScoutLastNotifiedError = undefined;
 			return result;
 		} catch (error) {
 			if (!controller.signal.aborted) {
-				marketScoutLastError = cleanText(error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 240);
+				state.marketScoutLastError = cleanText(error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 240);
 			}
 			throw error;
 		} finally {
-			if (marketScoutInFlight === operation) marketScoutInFlight = undefined;
+			if (state.marketScoutInFlight === operation) state.marketScoutInFlight = undefined;
 		}
 	};
 
 	const armMarketScout = (ctx: ExtensionContext, generation: number, delayMs: number): void => {
-		if (!marketScoutSchedulerActive || generation !== marketScoutGeneration) return;
-		marketScoutTimer = setTimeout(() => {
-			marketScoutTimer = undefined;
-			if (!marketScoutSchedulerActive || generation !== marketScoutGeneration) return;
+		if (!state.marketScoutSchedulerActive || generation !== state.marketScoutGeneration) return;
+		state.marketScoutTimer = setTimeout(() => {
+			state.marketScoutTimer = undefined;
+			if (!state.marketScoutSchedulerActive || generation !== state.marketScoutGeneration) return;
 			void (async () => {
 				let completed = false;
 				try {
-					await runMarketScout(generation);
+					await runMarketScout(generation, ctx);
 					completed = true;
 				} catch (error) {
-					if (!marketScoutSchedulerActive || generation !== marketScoutGeneration) return;
+					if (!state.marketScoutSchedulerActive || generation !== state.marketScoutGeneration) return;
 					const message = cleanText(error instanceof Error ? error.message : String(error)).slice(0, 180);
-					if (ctx.mode === "tui" && message !== marketScoutLastNotifiedError) {
-						marketScoutLastNotifiedError = message;
+					if (ctx.mode === "tui" && message !== state.marketScoutLastNotifiedError) {
+						state.marketScoutLastNotifiedError = message;
 						ctx.ui.notify(`Market scout paused: ${message}`, "warning");
 					}
 				}
-				if (!marketScoutSchedulerActive || generation !== marketScoutGeneration) return;
+				if (!state.marketScoutSchedulerActive || generation !== state.marketScoutGeneration) return;
 				let delay = 60_000;
 				if (completed) {
 					try {
-						delay = marketScoutScheduleDelay(Date.now(), await getMarketScout().nextDueAt());
+					delay = marketScoutScheduleDelay(Date.now(), await getMarketScout(ctx).nextDueAt());
 					} catch {
 						// State/configuration errors retry slowly; the warning above is de-duplicated.
 					}
@@ -9839,7 +8962,7 @@ export default function (pi: ExtensionAPI) {
 				armMarketScout(ctx, generation, delay);
 			})();
 		}, delayMs);
-		marketScoutTimer.unref?.();
+		state.marketScoutTimer.unref?.();
 	};
 
 	const startMarketScout = async (ctx: ExtensionContext): Promise<void> => {
@@ -9848,37 +8971,63 @@ export default function (pi: ExtensionAPI) {
 			enabled = readMarketScoutEnabled();
 		} catch (error) {
 			await stopMarketScout();
-			marketScoutLastError = cleanText(error instanceof Error ? error.message : String(error)).slice(0, 240);
-			if (ctx.mode === "tui") ctx.ui.notify(`Market scout disabled: ${marketScoutLastError}`, "warning");
+			state.marketScoutLastError = cleanText(error instanceof Error ? error.message : String(error)).slice(0, 240);
+			if (ctx.mode === "tui") ctx.ui.notify(`Market scout disabled: ${state.marketScoutLastError}`, "warning");
 			return;
 		}
-		if (marketScoutCwd && marketScoutCwd !== archiveCwd) await stopMarketScout();
+		if (state.marketScoutCwd && state.marketScoutCwd !== state.archiveCwd) await stopMarketScout();
 		if (!enabled || isResearchWorkerProcess) {
-			if (marketScoutSchedulerActive) await stopMarketScout();
+			if (state.marketScoutSchedulerActive) await stopMarketScout();
 			return;
 		}
-		if (marketScoutSchedulerActive && marketScoutCwd === archiveCwd) return;
+		if (state.marketScoutSchedulerActive && state.marketScoutCwd === state.archiveCwd) return;
 		try {
-			const prepared = await prepareMarketScout();
-			if (prepared.generation !== marketScoutGeneration) return;
+			const prepared = await prepareMarketScout(ctx);
+			if (prepared.generation !== state.marketScoutGeneration) return;
 		} catch (error) {
 			await stopMarketScout();
-			marketScoutLastError = cleanText(error instanceof Error ? error.message : String(error)).slice(0, 240);
-			if (ctx.mode === "tui") ctx.ui.notify(`Market scout disabled: ${marketScoutLastError}`, "warning");
+			state.marketScoutLastError = cleanText(error instanceof Error ? error.message : String(error)).slice(0, 240);
+			if (ctx.mode === "tui") ctx.ui.notify(`Market scout disabled: ${state.marketScoutLastError}`, "warning");
 			return;
 		}
-		if (marketScoutSchedulerActive && marketScoutCwd === archiveCwd) return;
-		marketScoutAbort = new AbortController();
-		marketScoutSchedulerActive = true;
-		const generation = ++marketScoutGeneration;
+		if (state.marketScoutSchedulerActive && state.marketScoutCwd === state.archiveCwd) return;
+		state.marketScoutAbort = new AbortController();
+		state.marketScoutSchedulerActive = true;
+		const generation = ++state.marketScoutGeneration;
 		armMarketScout(ctx, generation, 0);
+	};
+
+	const settleScoutDispatchesBeforeReset = async (
+		scout: MarketEventScout | undefined,
+		candidateIds: string[],
+	): Promise<void> => {
+		if (!scout) return;
+		for (const candidateId of candidateIds) {
+			try {
+				await scout.settleDispatch(candidateId, "cancelled", "Research session reset");
+			} catch {
+				state.marketScoutLastError = "Could not settle scout dispatch during session reset";
+			}
+		}
 	};
 
 	const restoreSessionState = async (ctx: ExtensionContext, reason?: SessionStartEvent["reason"]): Promise<void> => {
 		// Every start/tree transition begins from defaults, then restores only the
 		// active branch's session snapshot or workspace checkpoint below.
 		resetWatchlist();
+		const scout = state.marketScout;
+		const scoutCandidateIds = [...state.researchJobs.values()]
+			.filter((job) => job.origin === "scout" && job.scoutCandidateId)
+			.map((job) => job.scoutCandidateId!)
+			.filter((candidateId, index, all) => all.indexOf(candidateId) === index);
 		resetResearchJobs();
+		// Keep resetResearchJobs synchronous for browser-worker boot: the host fires
+		// lifecycle events without awaiting their async handlers. Stop the old scout
+		// and reconcile its durable outbox immediately after the in-memory reset.
+		void (async () => {
+			await stopMarketScout();
+			await settleScoutDispatchesBeforeReset(scout, scoutCandidateIds);
+		})();
 		if (isResearchWorkerProcess) return;
 		await ensureArchiveLoaded(ctx, true);
 		await startMarketScout(ctx);
@@ -9923,14 +9072,14 @@ export default function (pi: ExtensionAPI) {
 	pi.on("tool_execution_start", (event) => {
 		const job = runningResearchJob();
 		if (!job || job.outcome === "cancelled") return;
-		toolResearchJobs.set(event.toolCallId, job.id);
+		state.toolResearchJobs.set(event.toolCallId, job.id);
 		const activity = activityForTool(event.toolName, event.args);
 		updateResearchJob(job.id, { ...(activity ? { activity } : {}), toolName: event.toolName });
 	});
 	pi.on("tool_execution_end", (event) => {
-		const jobId = toolResearchJobs.get(event.toolCallId);
-		toolResearchJobs.delete(event.toolCallId);
-		const job = jobId ? researchJobs.get(jobId) : undefined;
+		const jobId = state.toolResearchJobs.get(event.toolCallId);
+		state.toolResearchJobs.delete(event.toolCallId);
+		const job = jobId ? state.researchJobs.get(jobId) : undefined;
 		if (!job || !researchSlotHeld(job) || job.outcome === "cancelled" || !event.isError) return;
 		let rawResult = "Tool failed";
 		try {
@@ -9959,7 +9108,7 @@ export default function (pi: ExtensionAPI) {
 		if (!ctx.hasPendingMessages()) scheduleResearchPump(ctx);
 	});
 	pi.on("session_shutdown", async () => {
-		researchExtracts.clear();
+		state.researchExtracts.clear();
 		if (!isResearchWorkerProcess) {
 			await stopMarketScout();
 			researchWorkerCoordinator?.dispose();
@@ -10324,7 +9473,7 @@ export default function (pi: ExtensionAPI) {
 				const readSourceIds = new Set(readBlocks.flatMap((block) => block.kind === "bullets" || block.kind === "news"
 					? [...(block.sourceIds ?? []), ...block.items.flatMap((item) => item.sourceIds ?? [])]
 					: block.sourceIds ?? []));
-				const extracts = researchExtracts.get(job.id);
+				const extracts = state.researchExtracts.get(job.id);
 				for (const citation of validatedCitations) {
 					const sourceText = extracts?.get(citation.sourceId)?.replace(/\s+/g, " ");
 					if (!sourceText || !sourceText.includes(citation.quote) || !readSourceIds.has(citation.sourceId)) {
@@ -10401,12 +9550,12 @@ export default function (pi: ExtensionAPI) {
 		details,
 	});
 	const grantExtractionCandidates = (job: ResearchJob | undefined, candidates: DiscoveryCandidate[]): DiscoveryCandidate[] => {
-		return grantAllowedExtractionCandidates(researchCandidates, job?.id, candidates);
+		return grantAllowedExtractionCandidates(state.researchCandidates, job?.id, candidates);
 	};
 	const recordEvidencePacket = (job: ResearchJob, packet: EvidencePacket): void => {
 		const current = requireWritableResearchJob(job);
 		const evidencePackets = mergeEvidencePackets(current.evidencePackets, [packet]) ?? [];
-		const existingCanvas = canvases.get(canvasKey(current.symbol, current.chartScope, current.researchKey));
+		const existingCanvas = state.canvases.get(canvasKey(current.symbol, current.chartScope, current.researchKey));
 		let publishedBlocks = current.publishedBlocks;
 		if (existingCanvas && existingCanvas.researchId === current.id) {
 			const canvas = storeCanvas({
@@ -10447,8 +9596,8 @@ export default function (pi: ExtensionAPI) {
 			const job = correlatedResearchJob(params.research_id);
 			if (!job) throw new Error("market_extract requires an active research_id");
 			requireWritableResearchJob(job);
-			const candidate = researchCandidates.consume(job.id, String(params.candidate_id));
-			const safeUrl = sanitizeUrl(candidate.url);
+			const candidate = state.researchCandidates.consume(job.id, String(params.candidate_id));
+			const safeUrl = sanitizePublicUrl(candidate.url);
 			if (!safeUrl || safeUrl !== candidate.url) throw new Error("Registered extraction candidate is no longer valid");
 			const mode = params.mode as UnbrowserExtractionMode;
 			let extraction: UnbrowserExtraction;
@@ -10502,7 +9651,7 @@ export default function (pi: ExtensionAPI) {
 					: retrievalStatus === "challenged"
 						? "Source presented an access challenge"
 						: undefined;
-			const sourceUrl = sanitizeUrl(extraction.finalUrl) || safeUrl;
+			const sourceUrl = sanitizePublicUrl(extraction.finalUrl) || safeUrl;
 			const status = retrievalStatus.toUpperCase();
 			const resultLine = strictResultLine({
 				status: retrievalStatus,
@@ -10527,9 +9676,9 @@ export default function (pi: ExtensionAPI) {
 				evidenceBody ? "\nEXTRACTED CONTENT:\n" + evidenceBody : "No evidentiary content was extracted.",
 			].filter(Boolean).join("\n");
 			if (retrievalStatus === "fetched") {
-				const extracts = researchExtracts.get(job.id) ?? new Map<string, string>();
+				const extracts = state.researchExtracts.get(job.id) ?? new Map<string, string>();
 				extracts.set(candidate.sourceId, evidenceBody);
-				researchExtracts.set(job.id, extracts);
+				state.researchExtracts.set(job.id, extracts);
 			}
 
 			const evidencePacket: EvidencePacket = {
@@ -10594,7 +9743,7 @@ export default function (pi: ExtensionAPI) {
 				const seenDomains = new Set<string>();
 				const out: DiscoveryCandidate[] = [];
 				for (const c of candidates) {
-					const safeUrl = sanitizeUrl(c.url);
+					const safeUrl = sanitizePublicUrl(c.url);
 					if (!safeUrl || seen.has(safeUrl)) continue;
 					seen.add(safeUrl);
 					let domain = "unknown";
@@ -10743,7 +9892,7 @@ export default function (pi: ExtensionAPI) {
 			if (next.action === "quote") {
 				const scope = next.chartScope ?? (next.returnState?.chartScope ?? returnState.chartScope);
 				returnState = next.returnState ?? returnState;
-				const watchHint = watchlist.includes(next.symbol)
+				const watchHint = state.watchlist.includes(next.symbol)
 					? `${next.symbol} IS ON WATCH · E REMOVES · B BACK`
 					: `${next.symbol} OPEN · E ADDS TO WATCH · B BACK`;
 				const listHint = tickerNavigationLabel(next.tickerNavigation);
@@ -10823,7 +9972,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("market-scout", {
-		description: "Inspect or poll the event scout and trigger dry run: /market-scout [status|sync]",
+		description: "Inspect or poll the event scout and optionally dispatch guarded trigger jobs: /market-scout [status|sync]",
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
 			const action = args.trim().toLowerCase() || "status";
 			if (action !== "status" && action !== "sync") {
@@ -10837,12 +9986,13 @@ export default function (pi: ExtensionAPI) {
 			try {
 				await ensureArchiveLoaded(ctx);
 				if (action === "sync") {
-					const result = await runMarketScout();
+					const result = await runMarketScout(undefined, ctx);
 					ctx.ui.notify([
-						"MARKET EVENT SCOUT · TRIGGER DRY RUN · MODEL DISPATCH OFF",
+						`MARKET EVENT SCOUT · TRIGGER DRY RUN · MODEL DISPATCH ${readMarketScoutDispatchEnabled() ? "ON" : "OFF"}`,
 						`Polled ${result.polledSources} source(s): ${result.successfulSources} ok · ${result.failedSources} failed`,
 						`Baseline ${result.baselineItems} · new ${result.newItems} · admit-shadow ${result.admitted} · watch ${result.watched} · suppress ${result.suppressed}`,
 						`Dry-run candidates ${result.candidateEvaluated} · would trigger ${result.wouldTrigger} · gated ${result.gated}`,
+						`Dispatch enqueued ${result.dispatchEnqueued} · failed ${result.dispatchFailed} · pending ${result.dispatchPending}`,
 						result.triggerCandidates.length > 0
 							? result.triggerCandidates.slice(0, 4).map(marketEventTriggerCandidateLabel).join("\n")
 							: "No new trigger candidates.",
@@ -10850,33 +10000,45 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 
-				if (!archiveCwd) throw new Error("Market event scout data path is unavailable");
-				const state = await readMarketEventScoutState(marketEventScoutFilePath(archiveCwd));
+				if (!state.archiveCwd) throw new Error("Market event scout data path is unavailable");
+				const scoutState = await readMarketEventScoutState(marketEventScoutFilePath(state.archiveCwd));
 				let enabledLabel = "off";
 				try { enabledLabel = readMarketScoutEnabled() ? "on" : "off"; } catch { enabledLabel = "invalid"; }
+				let dispatchLabel = "off";
+				try { dispatchLabel = readMarketScoutDispatchEnabled() ? "on" : "off"; } catch { dispatchLabel = "invalid"; }
 				let transportLabel = configuredUnbrowserMcpUrl() ? "MCP" : "unconfigured";
 				try {
 					if (!configuredUnbrowserMcpUrl() && readMarketScoutLocalCliEnabled()) transportLabel = "local CLI (explicit dev opt-in)";
 				} catch { transportLabel = "invalid"; }
 				const sourceLines = DEFAULT_MARKET_EVENT_SOURCES.map((source) => {
-					const sourceState = state.sources.find((candidate) => candidate.sourceId === source.id);
+					const sourceState = scoutState.sources.find((candidate) => candidate.sourceId === source.id);
 					if (!sourceState) return `${source.label}: not initialized`;
 					const last = sourceState.lastSuccessAt ? new Date(sourceState.lastSuccessAt).toLocaleString() : "never";
 					return `${source.label}: ${sourceState.lastStatus} · last ${last} · new ${sourceState.newItems} · A/W/S ${sourceState.admitted}/${sourceState.watched}/${sourceState.suppressed}`;
 				});
-				const recent = state.decisions.slice(0, 5).map((decision) =>
+				const recent = scoutState.decisions.slice(0, 5).map((decision) =>
 					`${decision.disposition.toUpperCase()} P${decision.priority} · ${decision.symbols.join(",") || decision.target?.lane || "UNRESOLVED"} · ${decision.title}`,
 				);
-				const policy = state.triggerDryRun.policy;
+				const policy = scoutState.triggerDryRun.policy;
 				const todayKey = new Date().toISOString().slice(0, 10);
-				const today = state.triggerDryRun.days.find((entry) => entry.day === todayKey)?.aggregate;
+				const today = scoutState.triggerDryRun.days.find((entry) => entry.day === todayKey)?.aggregate;
 				const routes = today?.routes;
 				const associations = today?.associations;
 				const gates = today?.gates;
-				const recentCandidates = state.triggerDryRun.candidates.slice(0, 5).map(marketEventTriggerCandidateLabel);
+				const recentCandidates = scoutState.triggerDryRun.candidates.slice(0, 5).map(marketEventTriggerCandidateLabel);
+				const dispatches = scoutState.triggerDispatches;
+				const dispatchCounts = {
+					pending: dispatches.filter((record) => record.status === "pending").length,
+					enqueued: dispatches.filter((record) => record.status === "enqueued" || record.status === "reserved").length,
+					settled: dispatches.filter((record) => record.status === "settled").length,
+					failed: dispatches.filter((record) => record.status === "failed").length,
+				};
 				ctx.ui.notify([
-					`MARKET EVENT SCOUT · TRIGGER DRY RUN · scheduler ${enabledLabel} · transport ${transportLabel}`,
-					marketScoutLastError ? `Last runtime error: ${marketScoutLastError}` : "Model dispatch: off; token reservation: off; canvas mutation: off.",
+					`MARKET EVENT SCOUT · scheduler ${enabledLabel} · dispatch ${dispatchLabel} · transport ${transportLabel}`,
+					state.marketScoutLastError ? `Last runtime error: ${state.marketScoutLastError}` : dispatchLabel === "on"
+						? `Model dispatch: guarded · model ${readMarketScoutModelId()} · fail closed · no paid fallback.`
+						: "Model dispatch: off; token reservation: off; canvas mutation: off.",
+					`Dispatch outbox pending/enqueued/settled/failed ${dispatchCounts.pending}/${dispatchCounts.enqueued}/${dispatchCounts.settled}/${dispatchCounts.failed}`,
 					`Simulation policy v${policy.version}: min P${policy.minPriority} · TTL ${Math.round(policy.ttlMs / 60_000)}m · target cooldown ${Math.round(policy.targetCooldownMs / 60_000)}m · daily cap ${policy.dailyCap}`,
 					`UTC ${todayKey}: candidates ${today?.evaluated ?? 0} · mapped ${today?.mapped ?? 0} · would trigger ${today?.wouldTrigger ?? 0} · gated ${today?.gated ?? 0}`,
 					`Routes TICKER/EVENT/STORY/UNMAPPED ${routes?.tickerBrief ?? 0}/${routes?.macroEventBrief ?? 0}/${routes?.marketStoryBrief ?? 0}/${routes?.unsupported ?? 0}`,
@@ -10885,7 +10047,7 @@ export default function (pi: ExtensionAPI) {
 					...sourceLines,
 					recent.length > 0 ? `Recent observations:\n${recent.join("\n")}` : "Recent observations: none (the first successful poll establishes a baseline).",
 					recentCandidates.length > 0 ? `Recent dry-run candidates:\n${recentCandidates.join("\n")}` : "Recent dry-run candidates: none.",
-				].join("\n"), marketScoutLastError ? "warning" : "info");
+				].join("\n"), state.marketScoutLastError ? "warning" : "info");
 			} catch (error) {
 				ctx.ui.notify(`Market scout unavailable: ${cleanText(error instanceof Error ? error.message : String(error)).slice(0, 220)}`, "error");
 			}
@@ -10911,7 +10073,7 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("Use /market for the Market Map or /market AAPL for a ticker", "error");
 				return;
 			}
-			const watchHint = watchlist.includes(symbol) ? `${symbol} IS ON WATCH · E REMOVES` : `${symbol} OPEN · PRESS E TO ADD TO WATCH`;
+			const watchHint = state.watchlist.includes(symbol) ? `${symbol} IS ON WATCH · E REMOVES` : `${symbol} OPEN · PRESS E TO ADD TO WATCH`;
 			await handleTerminalResult(await openMarketPanel(ctx, symbol, watchHint, 0, actions, persistWatchlist), ctx, actions);
 		},
 	});

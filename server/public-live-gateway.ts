@@ -236,6 +236,22 @@ const MARKET_SCREENS = new Set(["MARKET", "SIGNALS", "EVENTS", "MOVERS", "WATCH"
 const CHART_SCOPES = new Set(["day", "week", "month", "year", "max"]);
 const TERMINAL_PANES = new Set(["headlines", "story", "lanes", "briefing"]);
 
+function hasOnlyKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
+  const allowedSet = new Set(allowed);
+  return Object.keys(value).every((key) => allowedSet.has(key));
+}
+
+/** Public worker frames must never carry credentials or model configuration. */
+function containsSensitiveKey(value: unknown, depth = 0): boolean {
+  if (depth > 8 || !value || typeof value !== "object") return false;
+  if (Array.isArray(value)) return value.some((entry) => containsSensitiveKey(entry, depth + 1));
+  for (const [key, child] of Object.entries(value)) {
+    if (/(?:api[-_ ]?key|authorization|bearer|secret|password|token|credential|model)/i.test(key)) return true;
+    if (containsSensitiveKey(child, depth + 1)) return true;
+  }
+  return false;
+}
+
 function isActionContext(value: unknown): boolean {
   if (!isRecord(value) || !isBoundedString(value.screen, 32)) return false;
   if (value.mode === "ticker") {
@@ -288,20 +304,24 @@ export function isAllowedPublicClientMessage(text: string): boolean {
   const data = message as Record<string, unknown>;
   switch (data.type) {
     case "input":
-      return typeof data.data === "string" && data.data.length > 0 && data.data.length <= 64;
+      return hasOnlyKeys(data, ["type", "data"])
+        && typeof data.data === "string" && data.data.length > 0 && data.data.length <= 64;
     case "resize":
-      return Number.isInteger(data.cols) && Number.isInteger(data.rows)
+      return hasOnlyKeys(data, ["type", "cols", "rows"])
+        && Number.isInteger(data.cols) && Number.isInteger(data.rows)
         && (data.cols as number) >= 20 && (data.cols as number) <= 320
         && (data.rows as number) >= 10 && (data.rows as number) <= 200;
     case "command":
-      return data.name === "market" && typeof data.args === "string"
+      return hasOnlyKeys(data, ["type", "name", "args"])
+        && data.name === "market" && typeof data.args === "string"
         && /^[A-Za-z0-9.^=_-]{0,32}$/.test(data.args);
     case "select_response":
-      return typeof data.id === "string" && data.id.length > 0 && data.id.length <= 160
+      return hasOnlyKeys(data, ["type", "id", "value", "cancelled"])
+        && typeof data.id === "string" && data.id.length > 0 && data.id.length <= 160
         && (data.value === undefined || isBoundedString(data.value, 512, true))
         && (data.cancelled === undefined || typeof data.cancelled === "boolean");
     case "web_action":
-      return isAllowedPublicWebAction(data.data);
+      return hasOnlyKeys(data, ["type", "data"]) && isAllowedPublicWebAction(data.data);
     default:
       return false;
   }
@@ -318,23 +338,26 @@ export function isAllowedPublicWorkerMessage(text: string): boolean {
   if (!isRecord(message) || typeof message.type !== "string") return false;
   switch (message.type) {
     case "frame":
-      return Array.isArray(message.rows)
+      return hasOnlyKeys(message, ["type", "rows", "width", "rows_count", "state"])
+        && Array.isArray(message.rows)
         && message.rows.length <= 240
         && message.rows.every((row) => isBoundedString(row, 16_384, true))
         && Number.isInteger(message.width) && (message.width as number) >= 20 && (message.width as number) <= 320
         && Number.isInteger(message.rows_count) && message.rows_count === message.rows.length
-        && (message.state === undefined || isRecord(message.state));
+        && (message.state === undefined || (isRecord(message.state) && !containsSensitiveKey(message.state)));
     case "notify":
-      return (message.level === "info" || message.level === "warning" || message.level === "error")
+      return hasOnlyKeys(message, ["type", "level", "message"])
+        && (message.level === "info" || message.level === "warning" || message.level === "error")
         && isBoundedString(message.message, 2_048);
     case "select_request":
-      return isBoundedString(message.id, 160)
+      return hasOnlyKeys(message, ["type", "id", "title", "options"])
+        && isBoundedString(message.id, 160)
         && isBoundedString(message.title, 512)
         && Array.isArray(message.options)
         && message.options.length <= 256
         && message.options.every((option) => isBoundedString(option, 512));
     case "closed":
-      return true;
+      return hasOnlyKeys(message, ["type"]);
     default:
       return false;
   }
