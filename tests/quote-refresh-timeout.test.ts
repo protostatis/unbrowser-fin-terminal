@@ -16,7 +16,14 @@ test("a stalled quote universe shares one refresh deadline", async () => {
       reject(signal.reason);
       return;
     }
-    signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    // A stalled request has no socket to keep the Node event loop alive, and
+    // AbortSignal.timeout uses an unref'd timer. Hold the loop open so the
+    // shared refresh deadline actually fires and rejects the mock.
+    const keepAlive = setInterval(() => {}, 60_000);
+    signal.addEventListener("abort", () => {
+      clearInterval(keepAlive);
+      reject(signal.reason);
+    }, { once: true });
   })) as typeof fetch;
 
   try {
