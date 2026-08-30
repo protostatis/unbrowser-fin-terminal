@@ -5545,6 +5545,7 @@ class MarketHub {
 			const snapshot = await this.loadSnapshot(scope, controller.signal);
 			if (generation !== this.snapshotGeneration || scope !== this.chartScope) return;
 			if (snapshot.chartScope !== scope) throw new Error(`scope mismatch: requested ${scope}, received ${snapshot.chartScope}`);
+			if (snapshot.quotes.length === 0) throw new Error("quote universe returned no usable quotes");
 			this.snapshot = snapshot;
 			this.status = "MARKET MAP SYNCED";
 			this.clampSelection();
