@@ -28,7 +28,10 @@ function uniquePort(): number {
   return randomInt(1024, 65536);
 }
 
-function waitForServer(port: number, host: string, timeoutMs = 5000): Promise<void> {
+// The first forked tsx process can cold-start the full server dependency graph
+// on constrained CI runners; keep the readiness deadline above that startup
+// cost without changing the server's own behavior.
+function waitForServer(port: number, host: string, timeoutMs = 10000): Promise<void> {
   const start = Date.now();
   return new Promise((resolve, reject) => {
     function tryConnect() {

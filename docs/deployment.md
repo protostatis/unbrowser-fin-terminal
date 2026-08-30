@@ -91,6 +91,25 @@ deployment fallback for a normal terminal release.
 - Authenticated/worker containers listen on `8787`; the public gateway uses its
   separately configured port (the pilot overlay uses `8788`). `/api/ready` is
   the readiness check for each mode.
+- The authenticated browser-owned variant is a separate service built with
+  `Dockerfile.browser-terminal` and `VITE_TERMINAL_BUILD_MODE=browser`. It runs
+  `npm run start:browser-terminal`, requires
+  `TERMINAL_RUNTIME_MODE=browser`, and must not be pointed at the Pi-backed
+  `server/index.ts` image. Its `/data/browser-sessions` directory is the only
+  durable state. The service requires server-side OpenRouter and private MCP
+  configuration; those values must never be included in Vite build arguments or
+  browser responses.
+- The browser-owned service is commissioned first on the isolated
+  `/fin-terminal-browser/` canary route from the infra repository's
+  `docker-compose.browser-terminal.yml` overlay. The overlay requires an
+  immutable `FIN_TERMINAL_BROWSER_IMAGE` and a separate
+  `FIN_TERMINAL_BROWSER_PROXY_TOKEN`; it must not reuse the Pi singleton or the
+  workspace control-plane service. Keep `FIN_TERMINAL_BROWSER_ENABLED=false`
+  until both profiled services are healthy and direct commissioning succeeds.
+- Release the browser image from a merged application revision using the
+  `Publish authenticated browser-terminal image` workflow. Record both the
+  application commit and the resulting GHCR manifest digest in the infra
+  release; never point infra at a mutable tag or a locally built image.
 - Caddy owns authenticated-terminal route authorization and injects its terminal
   proxy token. For public live, Caddy must strip and overwrite `X-Real-IP`; the
   gateway trusts that value only when Caddy also strips and overwrites

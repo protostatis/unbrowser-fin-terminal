@@ -25,9 +25,8 @@ import {
 } from "../../shared/research-source-policy.js";
 import {
 	CryptoPulseCache,
-	fetchCryptoPulse,
 	isCryptoPulseUsable,
-	resolveYahooPair,
+	fetchCryptoPulse,
 	type CryptoPulseSnapshot,
 	type CryptoScoreboardRow,
 	type FetchLike,
@@ -5322,10 +5321,15 @@ class MarketHub {
 			this.tui.requestRender();
 		}
 		try {
-			const { snapshot, errors } = await fetchCryptoPulse(
-				{ fetchImpl: cryptoPulseFetchImpl ?? fetch, panicRadarEnabled: readPanicRadarEnabled() },
-				undefined,
-			);
+			const { snapshot, errors } = cryptoPulseFetchImpl
+				? await fetchCryptoPulse(
+					{ fetchImpl: cryptoPulseFetchImpl, panicRadarEnabled: readPanicRadarEnabled() },
+					undefined,
+				)
+				: await state.ports.transport.fetchCryptoPulse(
+					{ panicRadarEnabled: readPanicRadarEnabled() },
+					undefined,
+				);
 			if (this.cryptoPulseRequestedAt !== requestedAt) return; // superseded
 			const usable = isCryptoPulseUsable(snapshot);
 			if (usable) {
@@ -5448,7 +5452,7 @@ class MarketHub {
 		if (cached !== undefined) return cached;
 		if (this.cryptoPairResolved.has(cmcSymbol)) return this.cryptoResolvedPair.get(cmcSymbol) ?? null;
 		this.cryptoPairResolved.add(cmcSymbol);
-		const resolved = await resolveYahooPair(cmcSymbol);
+		const resolved = await state.ports.transport.resolveCryptoPair(cmcSymbol);
 		if (resolved) this.cryptoResolvedPair.set(cmcSymbol, resolved);
 		return resolved;
 	}

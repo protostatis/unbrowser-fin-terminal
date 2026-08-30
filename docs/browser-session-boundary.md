@@ -1,7 +1,7 @@
 # Browser session boundary
 
-The browser session is a private alpha, not a replacement for the public
-gateway.
+The browser session has two distinct deployments: a personal BYOK alpha and an
+authenticated production mode. Neither is the anonymous public gateway.
 
 ## Browser alpha
 
@@ -21,6 +21,26 @@ The browser requires a CORS-capable Unbrowser MCP endpoint configured with
 silently fall back to the local `unbrowser` executable. Yahoo quote requests
 are likewise subject to browser CORS policy unless the deployment supplies an
 explicit, authenticated quote transport.
+
+## Authenticated browser terminal
+
+Build with `VITE_TERMINAL_BUILD_MODE=browser` and run
+`npm run start:browser-terminal` (the production image is
+`Dockerfile.browser-terminal`). This entrypoint intentionally has no Pi imports
+and never calls `createAgentSession`. The browser still owns the canonical
+terminal UI and isolated research workers, while the same-origin Node broker
+owns:
+
+- authenticated principal binding from Caddy's `X-Fin-Terminal-User`;
+- the fixed OpenRouter chat-completions upstream and server-selected model;
+- a session-bound, allowlisted Unbrowser MCP proxy;
+- Yahoo quotes, crypto-pair resolution, and cached CMC/PanicRadar crypto pulse;
+- ETag-guarded, principal-scoped archive and watchlist persistence.
+
+The browser sends no provider key. Broker routes reject cross-origin requests,
+unknown MCP methods/tools, arbitrary upstream URLs, oversized payloads, and
+requests without the reverse-proxy token/principal contract. The browser
+client's IndexedDB adapter remains available only for the personal alpha.
 
 ## Node/Pi runtime
 
