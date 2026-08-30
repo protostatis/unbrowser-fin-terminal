@@ -7,6 +7,7 @@
  * structured cloning.
  */
 import type { StoragePort } from "../../../shared/kernel/ports.js";
+import { browserApiUrl } from "./browser-api.js";
 
 export const BROWSER_STORAGE_DB = "unbrowser-fin-terminal";
 export const BROWSER_STORAGE_VERSION = 1;
@@ -128,6 +129,64 @@ export function createMemoryStoragePort(): StoragePort {
 		},
 		async writeJsonFileAtomic(path, value) {
 			files.set(keyForPath(path), `${JSON.stringify(value, null, 2)}\n`);
+		},
+	};
+}
+
+/**
+ * Principal-scoped storage for the authenticated browser terminal. The server
+ * owns the durable record; this adapter keeps the kernel's virtual-file
+ * contract and its latest ETag without ever placing credentials in storage.
+ */
+export function createBrowserHttpStoragePort(options: { fetchImpl?: typeof fetch } = {}): StoragePort {
+	const request = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
+	const etags = new Map<string, string | null>();
+	const pathName = (path: string): "market-research-archive.json" | "market-watchlist.json" => {
+		const name = path.startsWith("browser-http://storage/") ? path.slice("browser-http://storage/".length) : path;
+		if (name !== "market-research-archive.json" && name !== "market-watchlist.json") {
+			throw new Error("Authenticated browser storage path is not supported");
+		}
+		return name;
+	};
+	const storageUrl = (path: string): string => browserApiUrl(`/api/browser/v1/storage/${encodeURIComponent(pathName(path))}`);
+
+	return {
+		resolveDataPath(relative: string): string {
+			if (relative !== "market-research-archive.json" && relative !== "market-watchlist.json") {
+				throw new Error("Authenticated browser storage path is not supported");
+			}
+			return `browser-http://storage/${relative}`;
+		},
+		async readJsonFile(path: string): Promise<unknown | undefined> {
+			const name = pathName(path);
+			const response = await request(storageUrl(path), { headers: { accept: "application/json" } });
+			if (response.status === 404) {
+				etags.set(name, null);
+				return undefined;
+			}
+			if (!response.ok) throw new Error(`browser storage read returned HTTP ${response.status}`);
+			const etag = response.headers.get("etag");
+			if (!etag) throw new Error("Authenticated browser storage read did not return an ETag");
+			etags.set(name, etag);
+			return await response.json();
+		},
+		async writeJsonFileAtomic(path: string, value: unknown): Promise<void> {
+			const name = pathName(path);
+			const headers: Record<string, string> = { "content-type": "application/json", accept: "application/json" };
+			if (!etags.has(name)) throw new Error("Authenticated browser storage must be read before it can be written");
+			const etag = etags.get(name);
+			if (etag) headers["if-match"] = etag;
+			else headers["if-none-match"] = "*";
+			const response = await request(storageUrl(path), {
+				method: "PUT",
+				headers,
+				body: JSON.stringify(value),
+			});
+			if (response.status === 409 || response.status === 412) throw new Error("Authenticated browser storage changed in another tab; reload to reconcile it");
+			if (!response.ok) throw new Error(`browser storage write returned HTTP ${response.status}`);
+			const nextEtag = response.headers.get("etag");
+			if (!nextEtag) throw new Error("Authenticated browser storage write did not return an ETag");
+			etags.set(name, nextEtag);
 		},
 	};
 }

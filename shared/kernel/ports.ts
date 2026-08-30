@@ -33,6 +33,12 @@ import {
 	type ChartScope,
 	type Quote,
 } from "./quotes.js";
+import {
+	fetchCryptoPulse,
+	resolveYahooPair,
+	type CryptoPulseSnapshot,
+	type CryptoPulseFetchOptions,
+} from "../crypto-pulse.js";
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
@@ -73,6 +79,13 @@ export interface TransportPort {
 	 * gate for day scope); `timeoutMs` defaults to QUOTE_REQUEST_TIMEOUT_MS.
 	 */
 	fetchQuote(symbol: string, scope: ChartScope, signal?: AbortSignal, timeoutMs?: number): Promise<Quote>;
+	/** Fetch the normalized crypto pulse through the host's trusted transport. */
+	fetchCryptoPulse(options?: Pick<CryptoPulseFetchOptions, "panicRadarEnabled">, signal?: AbortSignal): Promise<{
+		snapshot: CryptoPulseSnapshot;
+		errors: string[];
+	}>;
+	/** Resolve a CMC symbol to the chart provider's actual pair. */
+	resolveCryptoPair(symbol: string, signal?: AbortSignal): Promise<string | null>;
 	/** Trimmed UNBROWSER_MCP_URL, or undefined when unset. */
 	unbrowserEndpoint(): string | undefined;
 }
@@ -194,6 +207,12 @@ export function createNodeTransportPort(options: { fetchImpl?: typeof fetch } = 
 
 			const payload = await response.json();
 			return parseChartPayloadToQuote(symbol, payload, { ...cfg, chartScope: scope });
+		},
+		async fetchCryptoPulse(options = {}, signal): Promise<{ snapshot: CryptoPulseSnapshot; errors: string[] }> {
+			return fetchCryptoPulse(options, signal);
+		},
+		async resolveCryptoPair(symbol, signal): Promise<string | null> {
+			return resolveYahooPair(symbol, fetchImpl ?? globalThis.fetch, undefined, undefined, signal);
 		},
 		unbrowserEndpoint(): string | undefined {
 			const value = process.env.UNBROWSER_MCP_URL?.trim();

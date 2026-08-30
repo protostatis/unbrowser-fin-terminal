@@ -12,7 +12,7 @@
  *                     Pi's follow-up dispatch; the session's own events drive
  *                     the extension state machine
  *   exec            → throws "not available in browser worker"
- *   appendEntry     → no-op (the worker never persists)
+ *   appendEntry     → optional host callback (workers never persist)
  *   getFlag         → env lookup (MARKET_* flags read process.env)
  *   setActiveTools  → no-op (alpha sends every registered tool)
  *   ui              → shim: custom throws in the worker; onTerminalInput stores;
@@ -120,6 +120,10 @@ export interface BrowserRuntimeHostOptions {
 	ui?: BrowserRuntimeUi;
 	cwd?: string;
 	hasUI?: boolean;
+	/** Durable session entries restored before the extension receives session_start. */
+	sessionBranch?: Array<{ type: string; customType?: string; data?: unknown }>;
+	/** Optional persistence hook for session-local custom entries. */
+	appendEntry?: (type: string, data: Record<string, unknown>) => void;
 }
 
 function noOpUi(): BrowserRuntimeUi {
@@ -210,7 +214,7 @@ export function createBrowserRuntimeHost(options: BrowserRuntimeHostOptions = {}
 				navigateTree: async () => ({ cancelled: true }),
 				switchSession: async () => ({ cancelled: true }),
 				reload: async () => {},
-				sessionManager: { getBranch: () => [] },
+				sessionManager: { getBranch: () => options.sessionBranch ?? [] },
 				modelRegistry: {},
 				model: undefined,
 				scopedModels: [],
@@ -256,7 +260,9 @@ export function createBrowserRuntimeHost(options: BrowserRuntimeHostOptions = {}
 	(host as unknown as Record<string, unknown>).exec = async () => {
 		throw new Error("exec: the unbrowser CLI is not available in the browser research worker");
 	};
-	(host as unknown as Record<string, unknown>).appendEntry = () => {};
+	(host as unknown as Record<string, unknown>).appendEntry = (type: string, data: Record<string, unknown>) => {
+		options.appendEntry?.(type, data);
+	};
 	(host as unknown as Record<string, unknown>).getFlag = (name: string) => {
 		try {
 			const raw = (process.env as Record<string, string | undefined>)[name];

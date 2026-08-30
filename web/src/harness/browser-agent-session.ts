@@ -7,7 +7,8 @@
  * openrouter_agent_cli/cli.py and `run_concurrent` in concurrent.py.
  *
  * No browser APIs beyond fetch/AbortSignal; runs under Node (tsx tests) and in
- * the browser bundle alike. API key is BYOK (memory only, never persisted).
+ * the browser bundle alike. Authentication may be supplied by a server-side
+ * same-origin broker, in which case no provider API key is sent by this class.
  *
  * Deliberate deviations from cli.py (all cited inline):
  * - Permission policy is NOT ported: browser alpha auto-allows every
@@ -96,8 +97,8 @@ export interface BrowserToolExecutor {
 }
 
 export interface BrowserSessionOptions {
-	/** BYOK, memory only — never persisted. */
-	apiKey: string;
+	/** Optional BYOK key for the legacy alpha; omitted for authenticated broker sessions. */
+	apiKey?: string;
 	/** Any OpenRouter model id, e.g. "deepseek/deepseek-v4-flash-0731". */
 	model: string;
 	systemPrompt: string;
@@ -280,11 +281,11 @@ export class BrowserAgentSession {
 
 	private readonly options: Required<Pick<
 		BrowserSessionOptions,
-		| "apiKey" | "model" | "systemPrompt" | "tools" | "toolExecutor" | "maxTurns" | "maxConcurrency"
+		| "model" | "systemPrompt" | "tools" | "toolExecutor" | "maxTurns" | "maxConcurrency"
 		| "maxHistoryMessages" | "commandTimeoutMs" | "requestTimeoutMs" | "compactThresholdTokens"
 		| "compactKeepTail" | "maxToolResultChars" | "endpoint" | "parallelToolCalls"
 		| "maxDiscoverPerBatch" | "maxDiscoverRounds"
-	>> & Pick<BrowserSessionOptions, "fetchImpl" | "onLog" | "onEvent">;
+	>> & Pick<BrowserSessionOptions, "apiKey" | "fetchImpl" | "onLog" | "onEvent">;
 
 	constructor(options: BrowserSessionOptions) {
 		this.options = {
@@ -597,7 +598,7 @@ export class BrowserAgentSession {
 		const response = await fetchImpl(this.options.endpoint, {
 			method: "POST",
 			headers: {
-				Authorization: `Bearer ${this.options.apiKey}`,
+				...(this.options.apiKey ? { Authorization: `Bearer ${this.options.apiKey}` } : {}),
 				"Content-Type": "application/json",
 			},
 			body: JSON.stringify(body),

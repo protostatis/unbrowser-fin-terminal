@@ -146,6 +146,25 @@ For the production release workflow, including the immutable source-SHA handoff
 to `unchained-infra` and GitHub Actions production approval, see
 [`docs/deployment.md`](docs/deployment.md).
 
+### Authenticated browser terminal (no Pi)
+
+The production browser-owned variant uses a separate backend entrypoint with no
+Pi session or WebSocket. Build it with the browser image and provide the broker
+credentials only to the server:
+
+```bash
+docker build -f Dockerfile.browser-terminal \
+  --build-arg PUBLIC_BASE_PATH=/fin-terminal-browser/ \
+  -t unbrowser-fin-terminal-browser .
+```
+
+Set `TERMINAL_RUNTIME_MODE=browser`, `MARKET_PROXY_TOKEN`,
+`OPENROUTER_API_KEY` (or `OPENROUTER_API_KEY_FILE`), and the private
+Docker-internal `UNBROWSER_MCP_URL`. Caddy must strip client identity/auth
+headers, run `forward_auth`, copy `X-Fin-Terminal-User`, and inject the proxy
+token before forwarding to this container. Mount `/data` for the principal-
+scoped archive and watchlist records. The browser sends no provider key.
+
 ### Public live-session pilot
 
 The public-live build preserves the stable demo URL while replacing the replay

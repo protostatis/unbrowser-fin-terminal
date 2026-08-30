@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createBrowserStoragePort } from "../web/src/harness/browser-storage.js";
+import { createBrowserHttpStoragePort, createBrowserStoragePort } from "../web/src/harness/browser-storage.js";
 
 type Callback = (() => void) | null;
 
@@ -89,4 +89,20 @@ test("browser storage serializes before writing and rejects malformed JSON", asy
 	assert.deepEqual(await storage.readJsonFile(path), { old: true });
 	indexedDB.records.set(path.replace("idb://market-terminal/", ""), { path: path.replace("idb://market-terminal/", ""), text: "{" });
 	await assert.rejects(storage.readJsonFile(path), SyntaxError);
+});
+
+test("authenticated browser storage uses an explicit create precondition after a missing read", async () => {
+	const requests: Array<{ method: string; headers: Headers }> = [];
+	const fakeFetch: typeof fetch = async (_input, init) => {
+		const requestHeaders = new Headers(init?.headers);
+		requests.push({ method: init?.method ?? "GET", headers: requestHeaders });
+		if ((init?.method ?? "GET") === "GET") return new Response(null, { status: 404 });
+		return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { etag: '"created"' } });
+	};
+	const storage = createBrowserHttpStoragePort({ fetchImpl: fakeFetch });
+	const path = storage.resolveDataPath("market-watchlist.json", "/browser");
+	await assert.rejects(storage.writeJsonFileAtomic(path, { version: 1, symbols: [] }), /must be read/);
+	assert.equal(await storage.readJsonFile(path), undefined);
+	await storage.writeJsonFileAtomic(path, { version: 1, symbols: ["AAPL"] });
+	assert.equal(requests[1]?.headers.get("if-none-match"), "*");
 });

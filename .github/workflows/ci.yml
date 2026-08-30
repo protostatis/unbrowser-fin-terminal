@@ -60,8 +60,41 @@ jobs:
             --tag fin-terminal-ci:${GITHUB_SHA} \
             .
 
+      - name: Build authenticated browser-terminal runtime image
+        run: |
+          docker build \
+            --file Dockerfile.browser-terminal \
+            --build-arg PUBLIC_BASE_PATH=/fin-terminal-browser/ \
+            --build-arg VCS_REF="${GITHUB_SHA}" \
+            --tag fin-terminal-browser-ci:${GITHUB_SHA} \
+            .
+
       - name: Smoke test final research worker artifact
         run: |
           image_id="$(docker image inspect --format '{{.Id}}' fin-terminal-ci:${GITHUB_SHA})"
           docker run --rm --network none --entrypoint node \
             "${image_id}" /app/server/research-worker-artifact-smoke.js
+
+      - name: Smoke test authenticated browser backend without Pi imports
+        run: |
+          image_id="$(docker image inspect --format '{{.Id}}' fin-terminal-browser-ci:${GITHUB_SHA})"
+          docker run --rm --network none \
+            --env NODE_ENV=production \
+            --env HOST=127.0.0.1 \
+            --env PORT=0 \
+            --env PUBLIC_BASE_PATH=/fin-terminal-browser/ \
+            --env TERMINAL_RUNTIME_MODE=browser \
+            --env MARKET_PROXY_TOKEN=ci-proxy-token \
+            --env OPENROUTER_API_KEY=ci-openrouter-key \
+            --env UNBROWSER_MCP_URL=http://fin-terminal-browser-mcp:8767/mcp \
+            --entrypoint sh "${image_id}" -c '
+              set -eu
+              node dist-server/server/browser-terminal-main.js >/tmp/browser-terminal.log 2>&1 &
+              pid=$!
+              trap "kill $pid 2>/dev/null || true" EXIT
+              sleep 2
+              if ! kill -0 "$pid" 2>/dev/null; then
+                cat /tmp/browser-terminal.log
+                exit 1
+              fi
+            '

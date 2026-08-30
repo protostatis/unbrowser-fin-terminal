@@ -18,13 +18,14 @@ if (!/^\/(?:[A-Za-z0-9._~-]+\/)*$/.test(publicBasePath)) {
 // undefined so the path-based default applies (the Dockerfile passes an empty
 // VITE_TERMINAL_BUILD_MODE, which ?? alone would treat as a valid value).
 const requestedBuildMode = process.env.VITE_TERMINAL_BUILD_MODE?.trim() || undefined;
-if (requestedBuildMode && !["replay", "live", "public-live"].includes(requestedBuildMode)) {
-  throw new Error("VITE_TERMINAL_BUILD_MODE must be replay, live, or public-live");
+if (requestedBuildMode && !["replay", "live", "public-live", "browser"].includes(requestedBuildMode)) {
+  throw new Error("VITE_TERMINAL_BUILD_MODE must be replay, live, public-live, or browser");
 }
-const buildMode: "replay" | "live" | "public-live" = requestedBuildMode as
+const buildMode: "replay" | "live" | "public-live" | "browser" = requestedBuildMode as
   | "replay"
   | "live"
   | "public-live"
+  | "browser"
   | undefined
   ?? (publicBasePath.split("/").filter(Boolean).includes("fin-terminal-demo") ? "replay" : "live");
 const baseProxyPath = publicBasePath === "/" ? "" : publicBasePath.replace(/\/$/, "");
@@ -66,7 +67,7 @@ export default defineConfig({
       transformIndexHtml(html) {
         return html.replace(
           "</head>",
-          `  <meta name="x-build-mode" content="${buildMode}">\n  </head>`,
+          `  <meta name="x-build-mode" content="${buildMode}">\n  <meta name="x-build-base-path" content="${publicBasePath}">\n  </head>`,
         );
       },
     },

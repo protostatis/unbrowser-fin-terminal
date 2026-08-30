@@ -37,6 +37,7 @@ export interface BrowserWorkerFactoryOptions {
 	apiKey?: string;
 	model?: string;
 	unbrowserEndpoint?: string;
+	apiEndpoint?: string;
 }
 
 const INIT_ACK = "init_ack";
@@ -45,12 +46,13 @@ const EXIT = "__exit";
 export function createBrowserWorkerFactory(options: BrowserWorkerFactoryOptions = {}): BrowserWorkerFactory {
 	return (env: Record<string, string>): BrowserWorkerHandle => {
 		const worker = new Worker(new URL("./research-worker.browser.ts", import.meta.url), { type: "module" });
-		const browserAlphaConfigured = Boolean(options.apiKey || options.model || options.unbrowserEndpoint);
+		const browserAlphaConfigured = Boolean(options.apiKey || options.model || options.unbrowserEndpoint || options.apiEndpoint);
 		const workerEnv = {
 			...env,
 			...(options.apiKey ? { BROWSER_API_KEY: options.apiKey } : {}),
 			...(options.model ? { BROWSER_MODEL: options.model } : {}),
 			...(options.unbrowserEndpoint ? { UNBROWSER_MCP_URL: options.unbrowserEndpoint } : {}),
+			...(options.apiEndpoint ? { BROWSER_API_ENDPOINT: options.apiEndpoint } : {}),
 			...(browserAlphaConfigured ? {
 				MARKET_PRECACHE_ENABLED: "0",
 				MARKET_SCOUT_ENABLED: "0",

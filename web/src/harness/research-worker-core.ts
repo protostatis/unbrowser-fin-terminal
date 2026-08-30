@@ -91,6 +91,8 @@ export interface RunResearchAttemptOptions {
 	model?: string;
 	/** Overrides env.BROWSER_API_KEY. */
 	apiKey?: string;
+	/** Overrides env.BROWSER_API_ENDPOINT; used by authenticated sessions. */
+	endpoint?: string;
 	/** System prompt for the agent session (defaults to the worker constant). */
 	systemPrompt?: string;
 	/** How long to wait for the extension's terminal event before emitting a core fatal. */
@@ -165,13 +167,15 @@ export async function runResearchAttempt(run: WorkerRunMessageLike, options: Run
       options?: { workerProcess?: boolean; browserSession?: boolean },
     ) => void;
   }).configureMarketTerminalRuntime;
-  if (process.pid === 0) {
-    configure?.(createBrowserKernelPorts({
-      apiKey: options.apiKey ?? process.env.BROWSER_API_KEY,
-      model: options.model ?? process.env.BROWSER_MODEL,
-      unbrowserEndpoint: process.env.UNBROWSER_MCP_URL,
-      workerProcess: true,
-      fetchImpl: options.fetchImpl,
+	if (process.pid === 0) {
+		configure?.(createBrowserKernelPorts({
+			apiKey: options.apiKey ?? process.env.BROWSER_API_KEY,
+			apiEndpoint: options.endpoint ?? process.env.BROWSER_API_ENDPOINT,
+			model: options.model ?? process.env.BROWSER_MODEL,
+			unbrowserEndpoint: process.env.UNBROWSER_MCP_URL,
+			serverBroker: Boolean(options.endpoint ?? process.env.BROWSER_API_ENDPOINT),
+			workerProcess: true,
+			fetchImpl: options.fetchImpl,
     }), { workerProcess: true });
   }
   extension(host as unknown as Parameters<typeof extension>[0]);
@@ -192,7 +196,8 @@ export async function runResearchAttempt(run: WorkerRunMessageLike, options: Run
 	const model = options.model ?? process.env.BROWSER_MODEL;
 	if (!model) throw new Error("BROWSER_MODEL is required to boot the research worker");
 	const apiKey = options.apiKey ?? process.env.BROWSER_API_KEY;
-	if (!apiKey) throw new Error("BROWSER_API_KEY is required to boot the research worker");
+	const endpoint = options.endpoint ?? process.env.BROWSER_API_ENDPOINT;
+	if (!apiKey && !endpoint) throw new Error("Either BROWSER_API_KEY or BROWSER_API_ENDPOINT is required to boot the research worker");
 
 	const registeredResearchTools = [...host.tools.values()].filter((tool) => isMarketResearchToolName(tool.name));
 	const registeredNames = new Set(registeredResearchTools.map((tool) => tool.name));
@@ -207,6 +212,7 @@ export async function runResearchAttempt(run: WorkerRunMessageLike, options: Run
 
 	const session = new BrowserAgentSession({
 		apiKey,
+		endpoint,
 		model,
 		systemPrompt: options.systemPrompt ?? DEFAULT_WORKER_SYSTEM_PROMPT,
 		tools,
@@ -340,6 +346,8 @@ export interface BrowserResearchWorkerRuntimeOptions {
 	fetchImpl?: typeof fetch;
 	model?: string;
 	apiKey?: string;
+	/** OpenRouter-compatible endpoint; defaults to the public OpenRouter URL. */
+	endpoint?: string;
 	settleTimeoutMs?: number;
 }
 
@@ -369,7 +377,8 @@ export function createBrowserResearchWorkerRuntime(options: BrowserResearchWorke
 				signal,
 				fetchImpl: options.fetchImpl,
 				model: options.model,
-				apiKey: options.apiKey,
+			apiKey: options.apiKey,
+			endpoint: options.endpoint,
 				settleTimeoutMs: options.settleTimeoutMs,
 			});
 		},
