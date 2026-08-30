@@ -4945,6 +4945,8 @@ class MarketHub {
 	/** Per-symbol quote cache for the crypto pulse right-pane chart, keyed `${scope}:${symbol}`. */
 	private cryptoQuotes = new Map<string, Quote>();
 	private cryptoQuoteAttempted = new Set<string>();
+	/** Failed chart requests stay retryable, but must not render forever as syncing. */
+	private cryptoQuoteUnavailable = new Set<string>();
 	private cryptoQuoteLoading = false;
 	/** Latest chart request skipped while a fetch was in flight. */
 	private cryptoQuotePending: { scope: ChartScope; symbol: string } | undefined;
@@ -5402,10 +5404,21 @@ class MarketHub {
 	 */
 	private async ensureCryptoChart(cmcSymbol: string | null | undefined, scope: ChartScope = this.chartScope): Promise<void> {
 		if (!cmcSymbol) return;
-		const resolved = await this.resolveCryptoPair(cmcSymbol);
+		const symbolKey = `${scope}:${cmcSymbol}`;
+		let resolved: string | null;
+		try {
+			resolved = await this.resolveCryptoPair(cmcSymbol);
+		} catch {
+			// Pair discovery is upstream I/O. A transient 429/timeout must leave
+			// the row retryable instead of turning it into a permanent no-chart row.
+			this.cryptoQuoteUnavailable.add(symbolKey);
+			this.tui.requestRender();
+			return;
+		}
 		if (!resolved) {
 			this.cryptoNoChart.add(cmcSymbol);
-			this.cryptoQuoteAttempted.add(`${scope}:${cmcSymbol}`);
+			this.cryptoQuoteUnavailable.delete(symbolKey);
+			this.cryptoQuoteAttempted.add(symbolKey);
 			this.tui.requestRender();
 			return;
 		}
@@ -5421,6 +5434,8 @@ class MarketHub {
 			this.cryptoQuotePending = { scope, symbol: cmcSymbol };
 			return;
 		}
+		this.cryptoQuoteUnavailable.delete(symbolKey);
+		this.cryptoQuoteUnavailable.delete(cacheKey);
 		this.cryptoQuoteLoading = true;
 		this.cryptoQuoteAttempted.add(cacheKey);
 		try {
@@ -5429,8 +5444,10 @@ class MarketHub {
 			if (quote.points.length < 2) this.cryptoNoChart.add(cmcSymbol);
 			else this.cryptoNoChart.delete(cmcSymbol);
 		} catch {
-			// Chart stays unavailable for this symbol; the right pane shows a
-			// quiet "no bars" note instead of an error wall.
+			// Keep the request retryable. The right pane reports an unavailable
+			// chart rather than leaving the symbol on a permanent "syncing" label.
+			this.cryptoQuoteAttempted.delete(cacheKey);
+			this.cryptoQuoteUnavailable.add(cacheKey);
 		} finally {
 			this.cryptoQuoteLoading = false;
 			const pending = this.cryptoQuotePending;
@@ -5451,13 +5468,19 @@ class MarketHub {
 		const cached = this.cryptoResolvedPair.get(cmcSymbol);
 		if (cached !== undefined) return cached;
 		if (this.cryptoPairResolved.has(cmcSymbol)) return this.cryptoResolvedPair.get(cmcSymbol) ?? null;
-		this.cryptoPairResolved.add(cmcSymbol);
 		const resolved = await state.ports.transport.resolveCryptoPair(cmcSymbol);
+		// Cache only settled responses. Transient broker/provider failures must be
+		// retried on the next selection/scope refresh rather than poisoning the
+		// session with a false "no pair" verdict.
+		this.cryptoPairResolved.add(cmcSymbol);
 		if (resolved) this.cryptoResolvedPair.set(cmcSymbol, resolved);
 		return resolved;
 	}
 
 	private snapshotStatus(): string {
+		if (this.screen === MARKET_SCREEN.market && this.marketView === "crypto") {
+			return this.cryptoSnapshotStatus();
+		}
 		const shown = CHART_SCOPE_CONFIGS[this.snapshot.chartScope].label;
 		const requested = CHART_SCOPE_CONFIGS[this.chartScope].label;
 		const quoteCount = this.snapshot.quotes.length;
@@ -5469,6 +5492,34 @@ class MarketHub {
 		}
 		if (this.snapshot.chartScope !== this.chartScope) return `SHOWING ${shown} · ${requested} UNAVAILABLE · ${quoteCount} QUOTES · ${age}`;
 		return `${shown} SNAPSHOT · ${quoteCount} QUOTES · ${age}`;
+	}
+
+	/**
+	 * The crypto subview has its own pulse and selected-row chart state. Do not
+	 * report the unrelated global market snapshot here (it can legitimately be
+	 * empty after a failed global refresh, which used to make a healthy crypto
+	 * board look like it had no data).
+	 */
+	private cryptoSnapshotStatus(): string {
+		const pulse = this.cryptoPulse;
+		if (!pulse) {
+			return this.cryptoPulseState === "loading"
+				? "CRYPTO PULSE · SYNCING"
+				: `CRYPTO PULSE · ${this.cryptoPulseState === "error" ? "UNAVAILABLE" : "NOT SYNCED"}`;
+		}
+		const age = pulse.fetchedAt > 0 ? recencyLabel(pulse.fetchedAt) : "AGE —";
+		const row = this.cryptoRows()[this.cryptoSelected]?.row;
+		if (!row) return `CRYPTO PULSE · ${age}`;
+		const pair = this.cryptoResolvedPair.get(row.symbol) ?? row.yahooSymbol;
+		if (!pair || this.cryptoNoChart.has(row.symbol)) {
+			return `CRYPTO PULSE · ${age} · ${row.symbol} DISPLAY-ONLY`;
+		}
+		if (this.cryptoQuoteUnavailable.has(`${this.chartScope}:${row.symbol}`) || this.cryptoQuoteUnavailable.has(`${this.chartScope}:${pair}`)) {
+			return `CRYPTO PULSE · ${age} · ${CHART_SCOPE_CONFIGS[this.chartScope].label} CHART UNAVAILABLE · R RETRY`;
+		}
+		const quote = this.cryptoQuotes.get(`${this.chartScope}:${pair}`);
+		if (!quote) return `CRYPTO PULSE · ${age} · ${CHART_SCOPE_CONFIGS[this.chartScope].label} CHART SYNCING`;
+		return `CRYPTO PULSE · ${age} · ${CHART_SCOPE_CONFIGS[this.chartScope].label} CHART · ${quote.points.length} BARS`;
 	}
 
 	startRefresh(): void {
@@ -5506,6 +5557,7 @@ class MarketHub {
 			const snapshot = await this.loadSnapshot(scope, controller.signal);
 			if (generation !== this.snapshotGeneration || scope !== this.chartScope) return;
 			if (snapshot.chartScope !== scope) throw new Error(`scope mismatch: requested ${scope}, received ${snapshot.chartScope}`);
+			if (snapshot.quotes.length === 0) throw new Error("quote universe returned no usable quotes");
 			this.snapshot = snapshot;
 			this.status = "MARKET MAP SYNCED";
 			this.clampSelection();
@@ -6126,10 +6178,18 @@ class MarketHub {
 		// prefer the resolved pair, fall back to the scoreboard's derivation.
 		const resolvedPair = selectedCmcSymbol ? (this.cryptoResolvedPair.get(selectedCmcSymbol) ?? selectedRow?.yahooSymbol ?? null) : null;
 		const chartQuote = resolvedPair ? this.cryptoQuotes.get(`${this.chartScope}:${resolvedPair}`) : undefined;
+		const chartUnavailable = Boolean(selectedCmcSymbol && (
+			this.cryptoQuoteUnavailable.has(`${this.chartScope}:${selectedCmcSymbol}`)
+			|| (resolvedPair && this.cryptoQuoteUnavailable.has(`${this.chartScope}:${resolvedPair}`))
+		));
 		if (selectedCmcSymbol && !resolvedPair) {
 			chartBlock.push(fit(th.bold(th.fg("accent", "PRICE CHART"))));
 			chartBlock.push(fit(th.fg("dim", `  ${selectedCmcSymbol} · no chartable Yahoo pair`)));
 			chartBlock.push(fit(th.fg("dim", "  J open · K why · E watch")));
+		} else if (selectedCmcSymbol && chartUnavailable) {
+			chartBlock.push(fit(th.bold(th.fg("accent", "PRICE CHART"))));
+			chartBlock.push(fit(th.fg("warning", `  ${resolvedPair} · unavailable · R retry`)));
+			chartBlock.push(fit(th.fg("dim", "  J opens the full ticker · K why · E watch")));
 		} else if (selectedCmcSymbol && !chartQuote && !this.cryptoNoChart.has(selectedCmcSymbol)) {
 			chartBlock.push(fit(th.bold(th.fg("accent", "PRICE CHART"))));
 			chartBlock.push(fit(th.fg("dim", `  ${resolvedPair} · syncing chart…`)));

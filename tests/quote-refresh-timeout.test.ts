@@ -37,7 +37,7 @@ test("a stalled quote universe shares one refresh deadline", async () => {
     const elapsedMs = performance.now() - startedAt;
 
     assert.deepEqual(quotes, []);
-    assert.equal(requestSignals.length, 8, "only the concurrent first wave should begin");
+    assert.equal(requestSignals.length, 4, "only the broker-safe concurrent first wave should begin");
     assert.ok(elapsedMs < 350, `refresh exceeded its shared deadline: ${elapsedMs.toFixed(1)}ms`);
   } finally {
     globalThis.fetch = originalFetch;

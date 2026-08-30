@@ -8,6 +8,7 @@ import {
   isCryptoPulseUsable,
   isStablecoinListing,
   isStablecoinSymbol,
+  resolveYahooPair,
   yahooPairForSymbol,
   type CryptoListing,
 } from "../shared/crypto-pulse.js";
@@ -280,6 +281,44 @@ test("dynamic Yahoo pair derivation: -USD convention with overrides and exclusio
   assert.equal(yahooPairForSymbol("SUI"), null);
   assert.equal(yahooPairForSymbol("UNI"), null);
   assert.equal(yahooPairForSymbol("APT"), null);
+});
+
+test("Yahoo pair search rejects fuzzy matches for unrelated tickers", async () => {
+  const fetchImpl = async (input: string | URL): Promise<Response> => {
+    const url = String(input);
+    if (url.includes("/chart/LIT-USD")) return new Response("not found", { status: 404 });
+    if (url.includes("/v1/finance/search?q=LIT")) {
+      return jsonResponse({ quotes: [{ symbol: "LTC-USD", quoteType: "CRYPTOCURRENCY" }] });
+    }
+    return new Response("not found", { status: 404 });
+  };
+
+  assert.equal(await resolveYahooPair("LIT", fetchImpl), null);
+});
+
+test("Yahoo pair search accepts numeric-suffix crypto pairs", async () => {
+  const fetchImpl = async (input: string | URL): Promise<Response> => {
+    const url = String(input);
+    if (url.includes("/chart/TRUMP-USD")) return new Response("not found", { status: 404 });
+    if (url.includes("/v1/finance/search?q=TRUMP")) {
+      return jsonResponse({ quotes: [{ symbol: "TRUMP35336-USD", quoteType: "CRYPTOCURRENCY" }] });
+    }
+    return new Response("not found", { status: 404 });
+  };
+
+  assert.equal(await resolveYahooPair("TRUMP", fetchImpl), "TRUMP35336-USD");
+});
+
+test("Yahoo pair resolution propagates transient provider failures", async () => {
+  let calls = 0;
+  const fetchImpl = async (input: string | URL): Promise<Response> => {
+    calls += 1;
+    assert.match(String(input), /chart\/BTC-USD/);
+    return new Response("busy", { status: 429 });
+  };
+
+  await assert.rejects(() => resolveYahooPair("BTC", fetchImpl), /HTTP 429/);
+  assert.equal(calls, 1, "a rate-limited direct probe must not fan out into a fuzzy search");
 });
 
 test("a one-directional (all-positive) market still fills both columns", () => {
