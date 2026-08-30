@@ -125,7 +125,7 @@ export async function resolveYahooPair(
     const bars = (chart as { chart?: { result?: Array<{ timestamp?: unknown[] }> } })?.chart?.result?.[0]?.timestamp?.length ?? 0;
     if (bars > 0) return direct;
   } catch (error) {
-    if (signal?.aborted) throw error;
+    if (signal?.aborted || isRetryablePairResolutionError(error)) throw error;
     // Fall through to search if the direct pair fails to parse.
   }
   // Search for the real crypto pair (numeric suffix or renamed ticker).
@@ -138,14 +138,25 @@ export async function resolveYahooPair(
       signal,
     );
     const quotes = (search as { quotes?: Array<{ symbol?: unknown; quoteType?: unknown }> })?.quotes ?? [];
-    const cryptoPair = quotes.find(
-      (quote) => quote.quoteType === "CRYPTOCURRENCY" && typeof quote.symbol === "string" && /-USD$/.test(quote.symbol),
-    )?.symbol;
+    const cryptoPair = quotes.find((quote) => {
+      if (quote.quoteType !== "CRYPTOCURRENCY" || typeof quote.symbol !== "string" || !/-USD$/.test(quote.symbol)) return false;
+      // Yahoo search is fuzzy: a query for LIT can return the unrelated
+      // Litecoin pair LTC-USD. Accept only the exact ticker or the numeric
+      // suffix form used by Yahoo for renamed/duplicate crypto listings.
+      const pairBase = quote.symbol.slice(0, -4).toUpperCase();
+      const suffix = pairBase.startsWith(canonical) ? pairBase.slice(canonical.length) : "";
+      return pairBase === canonical || (suffix.length > 0 && /^\d+$/.test(suffix));
+    })?.symbol;
     return typeof cryptoPair === "string" ? cryptoPair : null;
   } catch (error) {
-    if (signal?.aborted) throw error;
+    if (signal?.aborted || isRetryablePairResolutionError(error)) throw error;
     return null;
   }
+}
+
+function isRetryablePairResolutionError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /HTTP (?:429|5\d\d)\b/.test(message) || /timed out|timeout/i.test(message);
 }
 
 // ── Typed datasets ──────────────────────────────────────────────────────────

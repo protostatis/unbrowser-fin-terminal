@@ -5402,7 +5402,15 @@ class MarketHub {
 	 */
 	private async ensureCryptoChart(cmcSymbol: string | null | undefined, scope: ChartScope = this.chartScope): Promise<void> {
 		if (!cmcSymbol) return;
-		const resolved = await this.resolveCryptoPair(cmcSymbol);
+		let resolved: string | null;
+		try {
+			resolved = await this.resolveCryptoPair(cmcSymbol);
+		} catch {
+			// Pair discovery is upstream I/O. A transient 429/timeout must leave
+			// the row retryable instead of turning it into a permanent no-chart row.
+			this.tui.requestRender();
+			return;
+		}
 		if (!resolved) {
 			this.cryptoNoChart.add(cmcSymbol);
 			this.cryptoQuoteAttempted.add(`${scope}:${cmcSymbol}`);
@@ -5451,13 +5459,19 @@ class MarketHub {
 		const cached = this.cryptoResolvedPair.get(cmcSymbol);
 		if (cached !== undefined) return cached;
 		if (this.cryptoPairResolved.has(cmcSymbol)) return this.cryptoResolvedPair.get(cmcSymbol) ?? null;
-		this.cryptoPairResolved.add(cmcSymbol);
 		const resolved = await state.ports.transport.resolveCryptoPair(cmcSymbol);
+		// Cache only settled responses. Transient broker/provider failures must be
+		// retried on the next selection/scope refresh rather than poisoning the
+		// session with a false "no pair" verdict.
+		this.cryptoPairResolved.add(cmcSymbol);
 		if (resolved) this.cryptoResolvedPair.set(cmcSymbol, resolved);
 		return resolved;
 	}
 
 	private snapshotStatus(): string {
+		if (this.screen === MARKET_SCREEN.market && this.marketView === "crypto") {
+			return this.cryptoSnapshotStatus();
+		}
 		const shown = CHART_SCOPE_CONFIGS[this.snapshot.chartScope].label;
 		const requested = CHART_SCOPE_CONFIGS[this.chartScope].label;
 		const quoteCount = this.snapshot.quotes.length;
@@ -5469,6 +5483,31 @@ class MarketHub {
 		}
 		if (this.snapshot.chartScope !== this.chartScope) return `SHOWING ${shown} · ${requested} UNAVAILABLE · ${quoteCount} QUOTES · ${age}`;
 		return `${shown} SNAPSHOT · ${quoteCount} QUOTES · ${age}`;
+	}
+
+	/**
+	 * The crypto subview has its own pulse and selected-row chart state. Do not
+	 * report the unrelated global market snapshot here (it can legitimately be
+	 * empty after a failed global refresh, which used to make a healthy crypto
+	 * board look like it had no data).
+	 */
+	private cryptoSnapshotStatus(): string {
+		const pulse = this.cryptoPulse;
+		if (!pulse) {
+			return this.cryptoPulseState === "loading"
+				? "CRYPTO PULSE · SYNCING"
+				: `CRYPTO PULSE · ${this.cryptoPulseState === "error" ? "UNAVAILABLE" : "NOT SYNCED"}`;
+		}
+		const age = pulse.fetchedAt > 0 ? recencyLabel(pulse.fetchedAt) : "AGE —";
+		const row = this.cryptoRows()[this.cryptoSelected]?.row;
+		if (!row) return `CRYPTO PULSE · ${age}`;
+		const pair = this.cryptoResolvedPair.get(row.symbol) ?? row.yahooSymbol;
+		if (!pair || this.cryptoNoChart.has(row.symbol)) {
+			return `CRYPTO PULSE · ${age} · ${row.symbol} DISPLAY-ONLY`;
+		}
+		const quote = this.cryptoQuotes.get(`${this.chartScope}:${pair}`);
+		if (!quote) return `CRYPTO PULSE · ${age} · ${CHART_SCOPE_CONFIGS[this.chartScope].label} CHART SYNCING`;
+		return `CRYPTO PULSE · ${age} · ${CHART_SCOPE_CONFIGS[this.chartScope].label} CHART · ${quote.points.length} BARS`;
 	}
 
 	startRefresh(): void {

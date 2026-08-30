@@ -162,6 +162,7 @@ test("Crypto Pulse renders the mood strip and HOT/COLD scoreboard in char cells"
   assert.ok(lines.some((line: string) => line.includes("RELATIVE 24H")), "relative ranking should be labeled");
   assert.ok(lines.some((line: string) => /DOGE/.test(line) && /8\.5/.test(line)), "HOTTEST row should show DOGE +8.50%");
   assert.ok(lines.some((line: string) => /XRP/.test(line) && /-3\.1/.test(line)), "COLDEST row should show XRP -3.10%");
+  assert.equal(lines.some((line: string) => line.includes("SNAPSHOT · 0 QUOTES")), false, "crypto footer must not report the unrelated global snapshot");
   // Display-only broad-market strip renders and is labeled.
   const stripIdx = lines.findIndex((line: string) => line.includes("TOP-20 MOVERS"));
   assert.ok(stripIdx >= 0, "movers strip should render");

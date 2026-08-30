@@ -44,8 +44,12 @@ import {
 
 /** Per-request quote fetch timeout (moved from the extension, exported for reuse). */
 export const QUOTE_REQUEST_TIMEOUT_MS = 12_000;
-/** Max concurrent quote requests within one universe refresh (moved from the extension). */
-export const QUOTE_FETCH_CONCURRENCY = 8;
+/**
+ * Max concurrent quote requests within one universe refresh. The browser
+ * broker allows four concurrent requests per principal; matching that limit
+ * avoids dropping every fifth request as a 429 before it reaches Yahoo.
+ */
+export const QUOTE_FETCH_CONCURRENCY = 4;
 
 // ── Port interfaces ─────────────────────────────────────────────────────────
 
