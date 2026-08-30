@@ -39,8 +39,6 @@ const MAX_QUOTE_RESPONSE_BYTES = 512 * 1024;
 const MAX_STORAGE_BODY_BYTES = 2 * 1024 * 1024;
 const CRYPTO_CACHE_TTL_MS = 60_000;
 const BROKER_RATE_WINDOW_MS = 60_000;
-const BROKER_RATE_LIMIT = 60;
-const GLOBAL_BROKER_RATE_LIMIT = 60;
 const MAX_GLOBAL_CONCURRENCY = 16;
 const MAX_PRINCIPAL_CONCURRENCY = 4;
 const MAX_CHAT_CONCURRENCY = 2;
@@ -52,12 +50,33 @@ const UPSTREAM_CHAT_TIMEOUT_MS = 75_000;
 const UPSTREAM_MCP_TIMEOUT_MS = 35_000;
 const UPSTREAM_QUOTE_TIMEOUT_MS = 15_000;
 const UPSTREAM_MCP_CLOSE_TIMEOUT_MS = 5_000;
+const MCP_READINESS_TIMEOUT_MS = 10_000;
+const MCP_READINESS_CACHE_MS = 10_000;
+const MCP_PROTOCOL_VERSION = "2025-03-26";
 const MCP_METHODS = new Set(["initialize", "notifications/initialized", "tools/call"]);
 const STORAGE_NAMES = new Set(["market-research-archive.json", "market-watchlist.json"]);
 const MAX_MCP_SESSIONS = 8;
 const MAX_MCP_SESSIONS_PER_PRINCIPAL = 4;
 const MCP_INITIALIZE_RATE_WINDOW_MS = 60_000;
 const MCP_INITIALIZE_RATE_LIMIT = 12;
+
+// Quote refreshes are intentionally high-volume. They must not consume the
+// same per-minute budget as crypto, interactive research, or control traffic;
+// otherwise a 58-symbol refresh can make J/K source discovery unavailable for
+// the rest of the minute and can starve the crypto pulse endpoint.
+const QUOTE_RATE_LIMIT = 60;
+const CRYPTO_RATE_LIMIT = 30;
+const RESEARCH_RATE_LIMIT = 24;
+const CONTROL_RATE_LIMIT = 60;
+
+type BrokerLane = "quote" | "crypto" | "research" | "control";
+
+const BROKER_LANE_LIMITS: Record<BrokerLane, { rateLimit: number; globalRateLimit: number; concurrency: number }> = {
+  quote: { rateLimit: QUOTE_RATE_LIMIT, globalRateLimit: QUOTE_RATE_LIMIT, concurrency: MAX_PRINCIPAL_CONCURRENCY },
+  crypto: { rateLimit: CRYPTO_RATE_LIMIT, globalRateLimit: CRYPTO_RATE_LIMIT, concurrency: 2 },
+  research: { rateLimit: RESEARCH_RATE_LIMIT, globalRateLimit: RESEARCH_RATE_LIMIT, concurrency: MAX_PRINCIPAL_CONCURRENCY },
+  control: { rateLimit: CONTROL_RATE_LIMIT, globalRateLimit: CONTROL_RATE_LIMIT, concurrency: MAX_PRINCIPAL_CONCURRENCY },
+};
 
 type FetchImpl = typeof fetch;
 type JsonRecord = Record<string, unknown>;
@@ -92,6 +111,11 @@ type McpSession = {
 type CryptoCacheEntry = {
   result: { snapshot: CryptoPulseSnapshot; errors: string[] };
   cachedAt: number;
+};
+
+type McpReadiness = {
+  checkedAt: number;
+  ok: boolean;
 };
 
 function asRecord(value: unknown): JsonRecord | undefined {
@@ -291,40 +315,49 @@ export function createBrowserTerminalApp(options: BrowserTerminalAppOptions = {}
   const webDist = options.webDist ?? path.resolve(process.env.MARKET_ROOT?.trim() || process.cwd(), "dist-web");
   const now = options.now ?? Date.now;
   const brokerRequestState = new Map<string, PrincipalRequestState>();
+  const globalBrokerRequestState = new Map<BrokerLane, PrincipalRequestState>();
   let globalConcurrent = 0;
-  let globalWindowStartedAt = now();
-  let globalRequestCount = 0;
   const mcpSessions = new Map<string, McpSession>();
   const mcpInitializeState = new Map<string, PrincipalRequestState>();
   let mcpInitializationInFlight = 0;
   const storageLocks = new Map<string, Promise<void>>();
   const cryptoCache = new Map<boolean, CryptoCacheEntry>();
   const cryptoInFlight = new Map<boolean, Promise<CryptoCacheEntry["result"]>>();
+  let mcpReadiness: McpReadiness | undefined;
+  let mcpReadinessInFlight: Promise<boolean> | undefined;
 
-  function acquireBrokerRequest(principal: string, principalConcurrency = MAX_PRINCIPAL_CONCURRENCY): (() => void) | undefined {
+  function acquireBrokerRequest(
+    principal: string,
+    lane: BrokerLane,
+    principalConcurrency = BROKER_LANE_LIMITS[lane].concurrency,
+  ): (() => void) | undefined {
     const timestamp = now();
-    const state = brokerRequestState.get(principal) ?? { windowStartedAt: timestamp, requestCount: 0, concurrent: 0 };
+    const laneLimits = BROKER_LANE_LIMITS[lane];
+    const stateKey = `${lane}\0${principal}`;
+    const state = brokerRequestState.get(stateKey) ?? { windowStartedAt: timestamp, requestCount: 0, concurrent: 0 };
+    const globalState = globalBrokerRequestState.get(lane) ?? { windowStartedAt: timestamp, requestCount: 0, concurrent: 0 };
     if (timestamp - state.windowStartedAt >= BROKER_RATE_WINDOW_MS) {
       state.windowStartedAt = timestamp;
       state.requestCount = 0;
     }
-    if (timestamp - globalWindowStartedAt >= BROKER_RATE_WINDOW_MS) {
-      globalWindowStartedAt = timestamp;
-      globalRequestCount = 0;
+    if (timestamp - globalState.windowStartedAt >= BROKER_RATE_WINDOW_MS) {
+      globalState.windowStartedAt = timestamp;
+      globalState.requestCount = 0;
     }
     if (
-      state.requestCount >= BROKER_RATE_LIMIT
-      || globalRequestCount >= GLOBAL_BROKER_RATE_LIMIT
+      state.requestCount >= laneLimits.rateLimit
+      || globalState.requestCount >= laneLimits.globalRateLimit
       || state.concurrent >= principalConcurrency
       || globalConcurrent >= MAX_GLOBAL_CONCURRENCY
     ) {
       return undefined;
     }
     state.requestCount += 1;
-    globalRequestCount += 1;
+    globalState.requestCount += 1;
     state.concurrent += 1;
     globalConcurrent += 1;
-    brokerRequestState.set(principal, state);
+    brokerRequestState.set(stateKey, state);
+    globalBrokerRequestState.set(lane, globalState);
     let released = false;
     return () => {
       if (released) return;
@@ -332,6 +365,85 @@ export function createBrowserTerminalApp(options: BrowserTerminalAppOptions = {}
       state.concurrent = Math.max(0, state.concurrent - 1);
       globalConcurrent = Math.max(0, globalConcurrent - 1);
     };
+  }
+
+  async function checkMcpReadiness(): Promise<boolean> {
+    if (!mcpEndpoint) return true;
+    const timestamp = now();
+    if (mcpReadiness && timestamp - mcpReadiness.checkedAt < MCP_READINESS_CACHE_MS) {
+      return mcpReadiness.ok;
+    }
+    if (mcpReadinessInFlight) return mcpReadinessInFlight;
+
+    const probe = (async () => {
+      let sessionId: string | undefined;
+      try {
+        const initialize = await request(mcpEndpoint, {
+          method: "POST",
+          headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: "readiness",
+            method: "initialize",
+            params: {
+              protocolVersion: MCP_PROTOCOL_VERSION,
+              capabilities: {},
+              clientInfo: { name: "unbrowser-fin-terminal-readiness", version: "0.1.0" },
+            },
+          }),
+          signal: AbortSignal.timeout(MCP_READINESS_TIMEOUT_MS),
+        });
+        await responseBuffer(initialize, 64 * 1024);
+        sessionId = initialize.headers.get("mcp-session-id") || undefined;
+        return initialize.ok && Boolean(sessionId);
+      } catch {
+        return false;
+      } finally {
+        if (sessionId) {
+          try {
+            await request(mcpEndpoint, {
+              method: "DELETE",
+              headers: { "mcp-session-id": sessionId },
+              signal: AbortSignal.timeout(UPSTREAM_MCP_CLOSE_TIMEOUT_MS),
+            });
+          } catch {
+            // The sidecar has its own bounded worker lifetime.
+          }
+        }
+      }
+    })();
+    mcpReadinessInFlight = probe;
+    try {
+      const ok = await probe;
+      mcpReadiness = { checkedAt: now(), ok };
+      return ok;
+    } finally {
+      if (mcpReadinessInFlight === probe) mcpReadinessInFlight = undefined;
+    }
+  }
+
+  function logMcpFailure(method: string, tool: string | undefined, startedAt: number, error: unknown): void {
+    if (process.env.NODE_ENV === "test") return;
+    const detail = error instanceof Error ? error : new Error(String(error));
+    const cause = detail.cause && typeof detail.cause === "object"
+      ? detail.cause as { code?: unknown; name?: unknown }
+      : undefined;
+    let endpointHost = "unknown";
+    try {
+      endpointHost = new URL(mcpEndpoint || "").host || endpointHost;
+    } catch {
+      // Keep diagnostics safe when a bad endpoint is supplied.
+    }
+    console.warn("browser-terminal MCP upstream failure", {
+      method,
+      tool: tool || undefined,
+      endpointHost,
+      elapsedMs: Math.max(0, now() - startedAt),
+      errorName: detail.name,
+      errorMessage: detail.message.slice(0, 240),
+      causeName: typeof cause?.name === "string" ? cause.name : undefined,
+      causeCode: typeof cause?.code === "string" ? cause.code : undefined,
+    });
   }
 
   function respondBusy(res: ExpressResponse): void {
@@ -394,7 +506,17 @@ export function createBrowserTerminalApp(options: BrowserTerminalAppOptions = {}
   });
 
   app.get("/api/health", (_req, res) => res.json({ status: "ok", uptime: process.uptime() }));
-  app.get("/api/ready", (_req, res) => res.json({ status: "ready", browserTerminal: true }));
+  app.get("/api/ready", async (req, res) => {
+    if (req.query.dependencies === "1" && !(await checkMcpReadiness())) {
+      res.status(503).json({ status: "starting", browserTerminal: true, dependencies: { mcp: false } });
+      return;
+    }
+    res.json({
+      status: "ready",
+      browserTerminal: true,
+      ...(req.query.dependencies === "1" ? { dependencies: { mcp: true } } : {}),
+    });
+  });
 
   app.use((req, res, next) => {
     if (req.path === "/api/ready") {
@@ -436,7 +558,7 @@ export function createBrowserTerminalApp(options: BrowserTerminalAppOptions = {}
       res.status(400).json({ error: "Invalid quote symbol or scope" });
       return;
     }
-    const release = acquireBrokerRequest(getPrincipal(req));
+    const release = acquireBrokerRequest(getPrincipal(req), "quote");
     if (!release) {
       respondBusy(res);
       return;
@@ -468,7 +590,7 @@ export function createBrowserTerminalApp(options: BrowserTerminalAppOptions = {}
       res.status(400).json({ error: "Invalid crypto symbol" });
       return;
     }
-    const release = acquireBrokerRequest(getPrincipal(req));
+    const release = acquireBrokerRequest(getPrincipal(req), "crypto");
     if (!release) {
       respondBusy(res);
       return;
@@ -490,7 +612,7 @@ export function createBrowserTerminalApp(options: BrowserTerminalAppOptions = {}
       res.json({ version: 1, ...cached.result });
       return;
     }
-    const release = acquireBrokerRequest(getPrincipal(req));
+    const release = acquireBrokerRequest(getPrincipal(req), "crypto");
     if (!release) {
       respondBusy(res);
       return;
@@ -528,7 +650,7 @@ export function createBrowserTerminalApp(options: BrowserTerminalAppOptions = {}
       res.status(400).json({ error: "Invalid browser research request" });
       return;
     }
-    const release = acquireBrokerRequest(principal, MAX_CHAT_CONCURRENCY);
+    const release = acquireBrokerRequest(principal, "research", MAX_CHAT_CONCURRENCY);
     if (!release) {
       respondBusy(res);
       return;
@@ -567,6 +689,7 @@ export function createBrowserTerminalApp(options: BrowserTerminalAppOptions = {}
   app.post("/api/browser/v1/mcp", express.json({ limit: MAX_MCP_BODY_BYTES }), async (req, res) => {
     const principal = getPrincipal(req);
     const timestamp = now();
+    const mcpStartedAt = timestamp;
     const expiredAt = timestamp - MCP_SESSION_IDLE_TTL_MS;
     const expiredLifetime = timestamp - MCP_SESSION_MAX_LIFETIME_MS;
     const expiredSessions: McpSession[] = [];
@@ -603,7 +726,7 @@ export function createBrowserTerminalApp(options: BrowserTerminalAppOptions = {}
          return;
       }
     }
-    const release = acquireBrokerRequest(principal);
+    const release = acquireBrokerRequest(principal, "research");
     if (!release) {
       respondBusy(res);
       return;
@@ -686,11 +809,13 @@ export function createBrowserTerminalApp(options: BrowserTerminalAppOptions = {}
       };
       if (existing) await withMcpSessionLock(existing, forward);
       else await forward();
-    } catch {
+    } catch (error) {
       if (existing) {
         existing.closing = true;
         if (mcpSessions.get(browserSessionId!) === existing) mcpSessions.delete(browserSessionId!);
       }
+      const params = asRecord(body.params);
+      logMcpFailure(method, typeof params?.name === "string" ? params.name : undefined, mcpStartedAt, error);
       safeUpstreamFailure(res);
     } finally {
       if (countedInitialization) {
@@ -715,7 +840,7 @@ export function createBrowserTerminalApp(options: BrowserTerminalAppOptions = {}
       res.status(404).end();
       return;
     }
-    const release = acquireBrokerRequest(principal);
+    const release = acquireBrokerRequest(principal, "research");
     if (!release) {
       respondBusy(res);
       return;
@@ -741,7 +866,7 @@ export function createBrowserTerminalApp(options: BrowserTerminalAppOptions = {}
       res.status(404).end();
       return;
     }
-    const release = acquireBrokerRequest(getPrincipal(req));
+    const release = acquireBrokerRequest(getPrincipal(req), "control");
     if (!release) {
       respondBusy(res);
       return;
@@ -765,7 +890,7 @@ export function createBrowserTerminalApp(options: BrowserTerminalAppOptions = {}
       res.status(400).json({ error: "Invalid browser storage document" });
       return;
     }
-    const release = acquireBrokerRequest(getPrincipal(req));
+    const release = acquireBrokerRequest(getPrincipal(req), "control");
     if (!release) {
       respondBusy(res);
       return;

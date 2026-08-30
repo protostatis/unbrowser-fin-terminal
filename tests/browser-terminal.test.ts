@@ -111,6 +111,46 @@ test("authenticated broker requires the forwarded origin scheme to match", async
   });
 });
 
+test("dependency readiness performs an MCP handshake and cleans up the probe session", async () => {
+  const methods: string[] = [];
+  const fakeFetch: typeof fetch = async (_input, init) => {
+    methods.push(init?.method || "GET");
+    if (init?.method === "POST") {
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: "readiness", result: {} }), {
+        status: 200,
+        headers: { "content-type": "application/json", "mcp-session-id": "readiness-session" },
+      });
+    }
+    return new Response(null, { status: 204 });
+  };
+  await withServer(fakeFetch, async (base) => {
+    const response = await fetch(`${base}/api/ready?dependencies=1`);
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {
+      status: "ready",
+      browserTerminal: true,
+      dependencies: { mcp: true },
+    });
+  });
+  assert.deepEqual(methods, ["POST", "DELETE"]);
+});
+
+test("dependency readiness reports MCP outages without hiding ordinary health", async () => {
+  const fakeFetch: typeof fetch = async () => { throw new Error("sidecar unavailable"); };
+  await withServer(fakeFetch, async (base) => {
+    const health = await fetch(`${base}/api/health`);
+    assert.equal(health.status, 200);
+
+    const response = await fetch(`${base}/api/ready?dependencies=1`);
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), {
+      status: "starting",
+      browserTerminal: true,
+      dependencies: { mcp: false },
+    });
+  });
+});
+
 test("MCP proxy maps upstream sessions and binds them to the authenticated principal", async () => {
 	const mcpCalls: Array<{ headers?: HeadersInit; body?: string }> = [];
 	const fakeFetch: typeof fetch = async (input, init) => {
@@ -351,6 +391,45 @@ test("global broker rate limiting applies across principals", async () => {
     }
     assert.equal(responses.filter((response) => response.status === 404).length, 60);
     assert.equal(responses.filter((response) => response.status === 429).length, 1);
+  });
+});
+
+test("quote refresh budget does not consume crypto or interactive research budgets", async () => {
+  const fakeFetch: typeof fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("/v8/finance/chart/")) {
+      return new Response(JSON.stringify({ chart: { result: [] } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (url === "https://openrouter.ai/api/v1/chat/completions") {
+      return new Response(JSON.stringify({ choices: [{ message: { role: "assistant", content: "ok" } }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    throw new Error(`unexpected upstream ${url}`);
+  };
+  await withServer(fakeFetch, async (base) => {
+    const quotes = [];
+    for (let index = 0; index < 60; index += 1) {
+      quotes.push(await fetch(`${base}/api/browser/v1/quotes/AAPL?scope=day`, { headers: headers() }));
+    }
+    assert.equal(quotes.every((response) => response.status === 502), true);
+
+    const crypto = await fetch(`${base}/api/browser/v1/crypto/pulse`, { headers: headers() });
+    assert.equal(crypto.status, 200);
+
+    const research = await fetch(`${base}/api/browser/v1/chat/completions`, {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({ messages: [{ role: "user", content: "hello" }] }),
+    });
+    assert.equal(research.status, 200);
+
+    const rejectedQuote = await fetch(`${base}/api/browser/v1/quotes/AAPL?scope=day`, { headers: headers() });
+    assert.equal(rejectedQuote.status, 429);
   });
 });
 

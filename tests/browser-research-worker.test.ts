@@ -61,7 +61,9 @@ function planFromMessages(messages: WireMessage[]): TurnPlan {
 		typeof lastUser?.content === "string" ? lastUser.content : JSON.stringify(lastUser?.content ?? ""),
 	);
 	const researchId = /research_id=([A-Za-z0-9_-]{1,160})/.exec(prompt)?.[1] ?? "job-unknown";
-	const symbol = /(?:^|\n)Research ([A-Za-z0-9.^$-]{1,20}) /.exec(prompt)?.[1] ?? "AAPL";
+	const symbol = /(?:target|symbol)=([A-Za-z0-9.^$-]{1,20})/i.exec(prompt)?.[1]
+		?? /\bResearch ([A-Za-z0-9.^$-]{1,20})\s+/i.exec(prompt)?.[1]
+		?? "AAPL";
 
 	const executed = new Set<string>();
 	for (const message of messages) {
@@ -222,7 +224,10 @@ function workerEnv(mcpEndpoint: string): Record<string, string> {
 		UNBROWSER_MCP_URL: mcpEndpoint,
 		MARKET_MOCK_MONDAY: "1",
 		MARKET_PRECACHE_ENABLED: "0",
-		MARKET_RESEARCH_PROMPT: "legacy",
+		// Exercise the structured prompt fields used by the browser build. The
+		// conformance model must not fall back to AAPL when the prompt carries
+		// `target=` / `symbol=` instead of the legacy prose form.
+		MARKET_RESEARCH_PROMPT: "compact",
 	};
 }
 

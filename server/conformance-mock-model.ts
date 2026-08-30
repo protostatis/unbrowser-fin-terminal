@@ -85,10 +85,10 @@ function researchIdFromPrompt(prompt: string): string | undefined {
   return match?.[1];
 }
 
-/** Extract the target symbol from legacy ("Research AAPL ...") or compact ("target=AAPL"). */
+/** Extract the target symbol from legacy and structured research prompts. */
 function symbolFromPrompt(prompt: string): string | undefined {
-  const target = /target=([A-Za-z0-9.^$-]{1,20})/.exec(prompt)?.[1]
-    ?? /(?:^|\n)Research ([A-Za-z0-9.^$-]{1,20}) /.exec(prompt)?.[1];
+  const target = /(?:target|symbol)=([A-Za-z0-9.^$-]{1,20})/i.exec(prompt)?.[1]
+    ?? /\bResearch ([A-Za-z0-9.^$-]{1,20})\s+/i.exec(prompt)?.[1];
   return target && target !== "MARKET" ? target : "AAPL";
 }
 
