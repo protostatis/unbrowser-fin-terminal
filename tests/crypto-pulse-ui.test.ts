@@ -87,6 +87,17 @@ async function waitForState(uiTest: TestTool, predicate: (state: any) => boolean
   }
 }
 
+async function waitForScreen(uiTest: TestTool, predicate: (lines: string[]) => boolean, timeoutMs = 2_000): Promise<string[]> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const result = await uiTest.execute("state", { action: "state", width: 110, height: 30 });
+    const lines: string[] = result.details.screen;
+    if (predicate(lines)) return lines;
+    if (Date.now() > deadline) throw new Error("crypto pulse screen did not settle in time");
+    await new Promise((resolve) => setTimeout(resolve, 15));
+  }
+}
+
 type FixtureMode = "full" | "all-fail" | "board-only";
 
 /** Mutable fixture fetch so a test can flip providers between refreshes. */
@@ -277,6 +288,33 @@ test("display-only movers strip never participates in W/S selection or J-open", 
   assert.ok(cp.selectedIndex <= 5, "selection must stay within the 6-row ranked board");
   assert.ok(cp.selectedSymbol, "selected row must always resolve to an openable pair");
   assert.ok(cp.movers?.leaders.length === 3, "strip leaders exposed for the web skin");
+});
+
+test("failed crypto chart requests render as unavailable and remain retryable", async () => {
+  const previousFetch = globalThis.fetch;
+  let yahooCalls = 0;
+  globalThis.fetch = (async () => {
+    yahooCalls++;
+    return new Response("upstream unavailable", { status: 429 });
+  }) as typeof fetch;
+  try {
+    setCryptoPulseFetchImplForTest(cryptoPulseFixtureFetch);
+    const uiTest = registeredTools().get("market_ui_test");
+    assert.ok(uiTest);
+
+    await uiTest.execute("reset", { action: "reset" });
+    await uiTest.execute("open_market", { action: "open_market" });
+    await uiTest.execute("press", { action: "press", button: "button_g" });
+    await waitForState(uiTest, (state: any) => state.cryptoPulse?.state === "ready");
+    const unavailable = await waitForScreen(uiTest, (lines) => lines.some((line) => line.includes("CHART UNAVAILABLE")));
+    assert.equal(unavailable.some((line) => line.includes("syncing chart")), false, "failed chart must not remain stuck syncing");
+
+    const callsBeforeRetry = yahooCalls;
+    await uiTest.execute("press", { action: "press", button: "button_r" });
+    await waitForScreen(uiTest, (lines) => yahooCalls > callsBeforeRetry && lines.some((line) => line.includes("CHART UNAVAILABLE")));
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
 });
 
 test("PanicRadar kill switch disables the provider end to end", async () => {
