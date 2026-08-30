@@ -21,7 +21,9 @@ concurrency:
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    # The production browser canary host is arm64. Build natively so the
+    # released image cannot accidentally contain an amd64-only runtime.
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     steps:
       - name: Checkout release revision
@@ -57,7 +59,7 @@ jobs:
           set -eu
           image="ghcr.io/protostatis/unbrowser-fin-terminal-browser:${IMAGE_TAG}"
           docker buildx build \
-            --platform linux/amd64 \
+           --platform linux/arm64 \
             --file Dockerfile.browser-terminal \
             --build-arg PUBLIC_BASE_PATH=/fin-terminal-browser/ \
             --build-arg VCS_REF="$GITHUB_SHA" \
