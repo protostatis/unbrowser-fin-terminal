@@ -1,0 +1,52 @@
+FROM node:22.23.2-bookworm-slim@sha256:f32b81066cde10a75dbac96646099533316d94bac4150c55da1636e1f0ffdc46 AS build
+
+WORKDIR /app
+COPY package.json package-lock.json ./
+COPY scripts/patch-pi-brace-expansion.mjs ./scripts/
+RUN npm ci
+
+COPY tsconfig.browser-server.json vite.config.ts ./
+COPY server ./server
+COPY shared ./shared
+COPY web ./web
+COPY .pi/extensions ./.pi/extensions
+
+ARG PUBLIC_BASE_PATH=/fin-terminal-browser/
+RUN PUBLIC_BASE_PATH="$PUBLIC_BASE_PATH" npm run build:browser-terminal
+
+FROM node:22.23.2-bookworm-slim@sha256:f32b81066cde10a75dbac96646099533316d94bac4150c55da1636e1f0ffdc46 AS production-dependencies
+
+WORKDIR /app
+COPY package.json package-lock.json ./
+COPY scripts/patch-pi-brace-expansion.mjs ./scripts/
+RUN npm ci --omit=dev --omit=optional && npm cache clean --force
+
+FROM node:22.23.2-bookworm-slim@sha256:f32b81066cde10a75dbac96646099533316d94bac4150c55da1636e1f0ffdc46 AS runtime
+
+ARG PUBLIC_BASE_PATH=/fin-terminal-browser/
+ARG VCS_REF=unknown
+ENV NODE_ENV=production \
+    HOST=0.0.0.0 \
+    PORT=8787 \
+    PUBLIC_BASE_PATH=$PUBLIC_BASE_PATH \
+    MARKET_ROOT=/app \
+    MARKET_DATA_DIR=/data \
+    HOME=/tmp/home \
+    XDG_CACHE_HOME=/tmp/cache
+
+LABEL org.opencontainers.image.source="https://github.com/protostatis/unbrowser-fin-terminal" \
+      org.opencontainers.image.revision="$VCS_REF"
+
+WORKDIR /app
+COPY --from=production-dependencies /app/node_modules ./node_modules
+COPY --from=build /app/dist-server/server ./dist-server/server
+COPY --from=build /app/dist-server/shared ./dist-server/shared
+COPY --from=build /app/dist-web ./dist-web
+COPY package.json ./package.json
+
+RUN node --input-type=module -e "await import('./dist-server/server/browser-terminal.js')"
+RUN mkdir -p /data/browser-sessions && chown -R node:node /data
+
+USER node
+EXPOSE 8787
+CMD ["node", "dist-server/server/browser-terminal-main.js"]

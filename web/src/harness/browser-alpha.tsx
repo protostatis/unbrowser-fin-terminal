@@ -17,9 +17,11 @@ import { createWebUi, type Panel } from "../../../server/web-ui.js";
 import { resolveWebAction } from "../../../server/web-actions.js";
 import { ansiToHtml } from "../../../server/theme.js";
 import { createBrowserKernelPorts } from "./browser-ports.js";
+import { browserApiUrl } from "./browser-api.js";
 import { createBrowserRuntimeHost, type BrowserRuntimeHost } from "./browser-runtime-host.js";
 import { acquireBrowserRuntimeLock, type BrowserRuntimeLease } from "./browser-runtime-lock.js";
 import browserProcess from "./browser-process.js";
+import { createBrowserHttpStoragePort } from "./browser-storage.js";
 import "./browser-buffer.js";
 
 const DEFAULT_MODEL = import.meta.env.VITE_OPENROUTER_MODEL
@@ -48,7 +50,7 @@ function renderRows(panel: Panel | null, columns: number): string[] {
 	return panel?.render(columns).map(ansiToHtml) ?? [];
 }
 
-export function BrowserAlphaApp() {
+export function BrowserAlphaApp({ authenticated = false }: { authenticated?: boolean } = {}) {
 	const [apiKey, setApiKey] = useState("");
 	const [model, setModel] = useState(DEFAULT_MODEL);
 	const [connected, setConnected] = useState(false);
@@ -67,18 +69,22 @@ export function BrowserAlphaApp() {
 	const terminalFrameRef = useRef<HTMLDivElement>(null);
 	const evidenceTriggerRef = useRef<HTMLButtonElement>(null);
 	const selectResolverRef = useRef<((id: string, value: string | undefined, cancelled: boolean) => void) | null>(null);
+	const persistenceWritesRef = useRef(new Set<Promise<void>>());
+	const persistenceTailRef = useRef(Promise.resolve());
 
 	const dispose = useCallback(async () => {
 		const runtime = runtimeRef.current;
 		if (!runtime || runtime.disposed) return;
-	runtime.disposed = true;
-	runtime.controller.abort();
-	runtime.sendInput = () => {};
-	runtime.disposeUi();
+		runtime.disposed = true;
+		runtime.controller.abort();
+		runtime.sendInput = () => {};
+		runtime.disposeUi();
 		try {
 			delete browserProcess.env.BROWSER_API_KEY;
 			delete browserProcess.env.BROWSER_MODEL;
+			delete browserProcess.env.BROWSER_API_ENDPOINT;
 			delete browserProcess.env.UNBROWSER_MCP_URL;
+			await Promise.allSettled([...persistenceWritesRef.current]);
 			await runtime.host.fireEventAsync({ type: "session_shutdown" }, runtime.ctx);
 		} finally {
 			runtime.resetExtension();
@@ -99,7 +105,7 @@ export function BrowserAlphaApp() {
 	const connect = useCallback(async () => {
 		if (connecting || runtimeRef.current) return;
 		const secret = apiKey.trim();
-		if (!secret) {
+		if (!authenticated && !secret) {
 			setError("Enter your OpenRouter API key");
 			return;
 		}
@@ -111,14 +117,41 @@ export function BrowserAlphaApp() {
 		try {
 			lease = await acquireBrowserRuntimeLock();
 			const controller = new AbortController();
-			const endpoint = import.meta.env.VITE_UNBROWSER_MCP_URL?.trim() || undefined;
-			browserProcess.env.BROWSER_API_KEY = secret;
-			browserProcess.env.BROWSER_MODEL = model.trim() || DEFAULT_MODEL;
+			let sessionModel = model.trim() || DEFAULT_MODEL;
+			if (authenticated) {
+				const sessionResponse = await fetch(browserApiUrl("/api/browser/v1/session"), {
+					headers: { accept: "application/json" },
+				});
+				if (!sessionResponse.ok) throw new Error(`authenticated browser session returned HTTP ${sessionResponse.status}`);
+				const sessionConfig = await sessionResponse.json() as { model?: unknown };
+				if (typeof sessionConfig.model !== "string" || !sessionConfig.model.trim()) throw new Error("Authenticated browser session did not provide a model");
+				sessionModel = sessionConfig.model.trim();
+				setModel(sessionModel);
+			}
+			const mcpEndpoint = authenticated
+				? browserApiUrl("/api/browser/v1/mcp")
+				: import.meta.env.VITE_UNBROWSER_MCP_URL?.trim() || undefined;
+			const apiEndpoint = authenticated ? browserApiUrl("/api/browser/v1/chat/completions") : undefined;
+			const storage = authenticated ? createBrowserHttpStoragePort() : undefined;
+			const watchlistPath = storage?.resolveDataPath("market-watchlist.json", "/browser");
+			const savedWatchlist = storage && watchlistPath
+				? await storage.readJsonFile(watchlistPath)
+				: undefined;
+			const savedSymbols = savedWatchlist && typeof savedWatchlist === "object" && !Array.isArray(savedWatchlist)
+				&& Array.isArray((savedWatchlist as { symbols?: unknown }).symbols)
+				? (savedWatchlist as { symbols: unknown[] }).symbols.filter((symbol): symbol is string => typeof symbol === "string")
+				: [];
+			const sessionBranch = savedSymbols.length > 0
+				? [{ type: "custom", customType: "market-watchlist", data: { symbols: savedSymbols } }]
+				: [];
 			browserProcess.env.MARKET_RESEARCH_WORKER = "0";
 			browserProcess.env.MARKET_PRECACHE_ENABLED = "0";
 			browserProcess.env.MARKET_SCOUT_ENABLED = "0";
 			browserProcess.env.MARKET_RESEARCH_CONCURRENCY = "1";
-			if (endpoint) browserProcess.env.UNBROWSER_MCP_URL = endpoint;
+			browserProcess.env.BROWSER_MODEL = sessionModel;
+			if (authenticated) browserProcess.env.BROWSER_API_ENDPOINT = apiEndpoint;
+			else browserProcess.env.BROWSER_API_KEY = secret;
+			if (mcpEndpoint) browserProcess.env.UNBROWSER_MCP_URL = mcpEndpoint;
 			const ui = createWebUi({
 				onPanel: (next) => {
 					setPanel(next);
@@ -142,11 +175,26 @@ export function BrowserAlphaApp() {
 				ui: ui.ui,
 				cwd: "/browser",
 				hasUI: true,
+				sessionBranch,
+				appendEntry: (type, data) => {
+					if (!storage || !watchlistPath || type !== "market-watchlist" || !Array.isArray(data.symbols) || runtimeRef.current?.disposed) return;
+					const write = persistenceTailRef.current
+						.catch(() => {})
+						.then(() => storage.writeJsonFileAtomic(watchlistPath, { version: 1, symbols: data.symbols }));
+					persistenceTailRef.current = write.catch((writeError: unknown) => {
+						if (!runtimeRef.current?.disposed) setError(writeError instanceof Error ? writeError.message : String(writeError));
+					});
+					persistenceWritesRef.current.add(write);
+					void write.finally(() => persistenceWritesRef.current.delete(write)).catch(() => {});
+				},
 			});
 			const ports = createBrowserKernelPorts({
-				apiKey: secret,
-				model: model.trim() || DEFAULT_MODEL,
-				unbrowserEndpoint: endpoint,
+				...(authenticated ? {} : { apiKey: secret }),
+				model: sessionModel,
+				unbrowserEndpoint: mcpEndpoint,
+				apiEndpoint,
+				serverBroker: authenticated,
+				storage,
 				events: { notify: (message, level) => setError(`${level.toUpperCase()}: ${message}`) },
 			});
 			const extensionModule = await import("../../../.pi/extensions/market-terminal.js");
@@ -183,6 +231,7 @@ export function BrowserAlphaApp() {
 			else {
 				delete browserProcess.env.BROWSER_API_KEY;
 				delete browserProcess.env.BROWSER_MODEL;
+				delete browserProcess.env.BROWSER_API_ENDPOINT;
 				delete browserProcess.env.UNBROWSER_MCP_URL;
 				resetExtension?.();
 				if (lease) await lease.release();
@@ -195,7 +244,7 @@ export function BrowserAlphaApp() {
 		} finally {
 			setConnecting(false);
 		}
-	}, [apiKey, connecting, dispose, model]);
+	}, [apiKey, authenticated, connecting, dispose, model]);
 
 	const sendInput = useCallback((data: string) => {
 		const runtime = runtimeRef.current;
@@ -325,13 +374,15 @@ export function BrowserAlphaApp() {
 		return (
 			<div className="terminal browser-alpha-connect-shell">
 			<div className="browser-alpha-connect">
-				<div className="browser-alpha-eyebrow">BROWSER ALPHA · EPHEMERAL · BYOK IN MEMORY</div>
-				<h2>Connect your OpenRouter key</h2>
-				<p>Stored only in this tab’s memory. Reload or disconnect to clear it. One research worker; scout and pre-cache are disabled.</p>
-				<input type="password" placeholder="sk-or-…" value={apiKey} onChange={(event) => setApiKey(event.target.value)} autoComplete="off" />
-				<input value={model} onChange={(event) => setModel(event.target.value)} aria-label="OpenRouter model" />
+				<div className="browser-alpha-eyebrow">{authenticated ? "AUTHENTICATED · SERVER BROKER · PRIVATE SESSION" : "BROWSER ALPHA · EPHEMERAL · BYOK IN MEMORY"}</div>
+				<h2>{authenticated ? "Open your market terminal" : "Connect your OpenRouter key"}</h2>
+				<p>{authenticated ? "Your account session owns the broker, research, feeds, and archive. No provider key is sent to this browser." : "Stored only in this tab’s memory. Reload or disconnect to clear it. One research worker; scout and pre-cache are disabled."}</p>
+				{!authenticated && <>
+					<input type="password" placeholder="sk-or-…" value={apiKey} onChange={(event) => setApiKey(event.target.value)} autoComplete="off" />
+					<input value={model} onChange={(event) => setModel(event.target.value)} aria-label="OpenRouter model" />
+				</>}
 				{error && <div className="browser-alpha-error">{error}</div>}
-				<button onClick={() => void connect()} disabled={connecting}>{connecting ? "Connecting…" : "Connect"}</button>
+				<button onClick={() => void connect()} disabled={connecting}>{connecting ? "Opening…" : authenticated ? "Open terminal" : "Connect"}</button>
 			</div>
 			</div>
 		);
@@ -341,8 +392,8 @@ export function BrowserAlphaApp() {
 		<div className="terminal browser-alpha-shell" ref={containerRef} data-render-version={renderVersion}>
 			<span ref={rulerRef} className="term-row ruler" aria-hidden="true">M</span>
 			<div className="browser-alpha-banner">
-				BROWSER ALPHA · EPHEMERAL · BYOK IN MEMORY
-				<button onClick={() => void dispose()}>Disconnect &amp; clear key</button>
+				{authenticated ? "AUTHENTICATED · SERVER BROKER · PRIVATE SESSION" : "BROWSER ALPHA · EPHEMERAL · BYOK IN MEMORY"}
+				<button onClick={() => void dispose()}>{authenticated ? "Disconnect session" : "Disconnect &amp; clear key"}</button>
 			</div>
 			<TerminalFrame
 				rows={renderRows(panel, terminalSize.columns)}

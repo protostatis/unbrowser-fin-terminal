@@ -1,0 +1,76 @@
+name: Publish authenticated browser-terminal image
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Immutable release tag, for example browser-terminal-v1"
+        required: true
+        type: string
+  push:
+    tags:
+      - "browser-terminal-v*"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: browser-terminal-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout release revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Resolve and validate image tag
+        id: release
+        env:
+          INPUT_IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -eu
+          image_tag="${INPUT_IMAGE_TAG:-${GITHUB_REF_NAME}}"
+          if [[ ! "$image_tag" =~ ^[a-z0-9][a-z0-9._-]{0,127}$ ]]; then
+            echo "::error::image tag is not a safe immutable release tag"
+            exit 1
+          fi
+          echo "image_tag=$image_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        env:
+          CR_PAT: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$CR_PAT" | docker login ghcr.io \
+            --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Build and publish digest-addressable image
+        env:
+          IMAGE_TAG: ${{ steps.release.outputs.image_tag }}
+        run: |
+          set -eu
+          image="ghcr.io/protostatis/unbrowser-fin-terminal-browser:${IMAGE_TAG}"
+          docker buildx build \
+            --platform linux/amd64 \
+            --file Dockerfile.browser-terminal \
+            --build-arg PUBLIC_BASE_PATH=/fin-terminal-browser/ \
+            --build-arg VCS_REF="$GITHUB_SHA" \
+            --tag "$image" \
+            --push \
+            .
+          digest="$(docker buildx imagetools inspect "$image" --format '{{.Manifest.Digest}}')"
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::published image did not return a manifest digest"
+            exit 1
+          fi
+          {
+            echo "### Authenticated browser-terminal image"
+            echo "- Source revision: \`${GITHUB_SHA}\`"
+            echo "- Image: \`${image}@${digest}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

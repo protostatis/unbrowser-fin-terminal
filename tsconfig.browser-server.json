@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022"],
+    "outDir": "dist-server",
+    "rootDir": ".",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "allowSyntheticDefaultImports": true,
+    "noEmitOnError": false,
+    "types": ["node"]
+  },
+  "include": ["server/browser-terminal.ts", "server/browser-terminal-main.ts", "server/proxy-auth.ts", "shared/**/*.ts"]
+}

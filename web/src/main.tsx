@@ -720,18 +720,28 @@ function PublicLiveRoot() {
   )} />;
 }
 
-const BROWSER_ALPHA = (import.meta as unknown as { env: Record<string, string | undefined> }).env.VITE_SESSION_MODE === "browser";
+const buildEnv = (import.meta as unknown as { env: Record<string, string | undefined> }).env;
+const BROWSER_TERMINAL = buildEnv.VITE_TERMINAL_BUILD_MODE === "browser";
+const BROWSER_ALPHA = buildEnv.VITE_SESSION_MODE === "browser" && !BROWSER_TERMINAL;
 
-function BrowserAlphaLazy() {
-  const [Comp, setComp] = useState<React.ComponentType | null>(null);
+function BrowserAlphaLazy({ authenticated = false }: { authenticated?: boolean } = {}) {
+  const [Comp, setComp] = useState<React.ComponentType<{ authenticated?: boolean }> | null>(null);
   useEffect(() => {
-    void import("./harness/browser-alpha.js").then((m) => setComp(() => m.BrowserAlphaApp as unknown as React.ComponentType));
+    void import("./harness/browser-alpha.js").then((m) => setComp(() => ((props: { authenticated?: boolean }) => <m.BrowserAlphaApp {...props} />)));
   }, []);
   if (!Comp) return <div style={{ padding: 24, fontFamily: "system-ui" }}>Loading browser session…</div>;
-  return <Comp />;
+  return <Comp authenticated={authenticated} />;
 }
 
-const RootApp: React.ComponentType = REPLAY_DEMO ? ReplayApp : PUBLIC_LIVE_DEMO ? PublicLiveRoot : BROWSER_ALPHA ? BrowserAlphaLazy : App;
+const RootApp: React.ComponentType = REPLAY_DEMO
+  ? ReplayApp
+  : PUBLIC_LIVE_DEMO
+    ? PublicLiveRoot
+    : BROWSER_TERMINAL
+      ? (() => <BrowserAlphaLazy authenticated />)
+      : BROWSER_ALPHA
+        ? BrowserAlphaLazy
+        : App;
 
 createRoot(rootEl).render(
   <StrictMode>

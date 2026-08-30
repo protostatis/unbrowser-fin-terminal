@@ -1,4 +1,4 @@
-/** Browser host ports for the personal alpha. */
+/** Browser host ports for the personal alpha and authenticated terminal. */
 import {
 	CHART_SCOPE_CONFIGS,
 	mockMondayChartPayload,
@@ -7,9 +7,16 @@ import {
 	type ChartScope,
 	type Quote,
 } from "../../../shared/kernel/quotes.js";
+import {
+	fetchCryptoPulse,
+	resolveYahooPair,
+	type CryptoPulseFetchOptions,
+	type CryptoPulseSnapshot,
+} from "../../../shared/crypto-pulse.js";
 import type { EventSinkPort, KernelPorts, StoragePort } from "../../../shared/kernel/ports.js";
 import { createBrowserWorkerFactory, type BrowserWorkerFactory } from "./browser-worker-factory.js";
 import { createBrowserStoragePort, createMemoryStoragePort } from "./browser-storage.js";
+import { browserApiUrl } from "./browser-api.js";
 
 interface BrowserPortsOptions {
 	apiKey?: string;
@@ -19,6 +26,10 @@ interface BrowserPortsOptions {
 	workerFactory?: BrowserWorkerFactory;
 	fetchImpl?: typeof fetch;
 	events?: EventSinkPort;
+	/** Route provider calls through the authenticated same-origin broker. */
+	serverBroker?: boolean;
+	/** OpenRouter-compatible endpoint used by isolated research workers. */
+	apiEndpoint?: string;
 	/** Use the in-memory port for a research worker; workers never archive. */
 	workerProcess?: boolean;
 }
@@ -45,23 +56,53 @@ function quoteUrl(symbol: string): URL {
 	return new URL(`${base}${path}`);
 }
 
+function serverQuoteUrl(symbol: string, scope: ChartScope): URL {
+	const url = new URL(browserApiUrl(`/api/browser/v1/quotes/${encodeURIComponent(symbol)}`));
+	url.searchParams.set("scope", scope);
+	return url;
+}
+
 function createBrowserTransport(options: BrowserPortsOptions) {
-	const request = options.fetchImpl ?? globalThis.fetch;
+	const request = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
 	return {
 		async fetchQuote(symbol: string, scope: ChartScope, signal?: AbortSignal, timeoutMs = 12_000): Promise<Quote> {
 			const cfg = CHART_SCOPE_CONFIGS[scope];
 			if (readMarketMockMonday(browserEnv()) && scope === "day") {
 				return parseChartPayloadToQuote(symbol, mockMondayChartPayload(symbol), { ...cfg, chartScope: scope });
 			}
-			const url = quoteUrl(symbol);
-			url.searchParams.set("range", cfg.yahooRange);
-			url.searchParams.set("interval", cfg.yahooInterval);
-			url.searchParams.set("includePrePost", String(cfg.includePrePost));
+			const url = options.serverBroker ? serverQuoteUrl(symbol, scope) : quoteUrl(symbol);
+			if (!options.serverBroker) {
+				url.searchParams.set("range", cfg.yahooRange);
+				url.searchParams.set("interval", cfg.yahooInterval);
+				url.searchParams.set("includePrePost", String(cfg.includePrePost));
+			}
 			const timeout = AbortSignal.timeout(timeoutMs);
 			const requestSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
 			const response = await request(url, { headers: { accept: "application/json" }, signal: requestSignal });
 			if (!response.ok) throw new Error(`quote request returned HTTP ${response.status}`);
-			return parseChartPayloadToQuote(symbol, await response.json(), { ...cfg, chartScope: scope });
+			const payload = await response.json();
+			return options.serverBroker
+				? payload as Quote
+				: parseChartPayloadToQuote(symbol, payload, { ...cfg, chartScope: scope });
+		},
+		async fetchCryptoPulse(
+			pulseOptions: Pick<CryptoPulseFetchOptions, "panicRadarEnabled"> = {},
+			signal?: AbortSignal,
+		): Promise<{ snapshot: CryptoPulseSnapshot; errors: string[] }> {
+			if (!options.serverBroker) return fetchCryptoPulse(pulseOptions, signal);
+			const url = new URL(browserApiUrl("/api/browser/v1/crypto/pulse"));
+			if (pulseOptions.panicRadarEnabled === false) url.searchParams.set("panicRadar", "0");
+			const response = await request(url, { headers: { accept: "application/json" }, signal });
+			if (!response.ok) throw new Error(`crypto pulse request returned HTTP ${response.status}`);
+			return await response.json() as { snapshot: CryptoPulseSnapshot; errors: string[] };
+		},
+		async resolveCryptoPair(symbol: string, signal?: AbortSignal): Promise<string | null> {
+			if (!options.serverBroker) return resolveYahooPair(symbol, request, undefined, undefined, signal);
+			const url = new URL(browserApiUrl(`/api/browser/v1/crypto/pair/${encodeURIComponent(symbol)}`));
+			const response = await request(url, { headers: { accept: "application/json" }, signal });
+			if (!response.ok) throw new Error(`crypto pair request returned HTTP ${response.status}`);
+			const payload = await response.json() as { yahooSymbol?: unknown };
+			return typeof payload.yahooSymbol === "string" && payload.yahooSymbol ? payload.yahooSymbol : null;
 		},
 		unbrowserEndpoint(): string | undefined {
 			const configured = options.unbrowserEndpoint?.trim() || browserEnv().UNBROWSER_MCP_URL?.trim();
@@ -72,8 +113,9 @@ function createBrowserTransport(options: BrowserPortsOptions) {
 
 /**
  * Build ports before registering the canonical extension. The worker factory
- * captures the BYOK settings and adds them to each isolated worker's init
- * environment; the key is never put in IndexedDB or a session message.
+ * captures either legacy alpha settings or the authenticated broker endpoint
+ * and adds them to each isolated worker's init environment. Provider keys are
+ * never put in IndexedDB or a session message.
  */
 export function createBrowserKernelPorts(options: BrowserPortsOptions = {}): KernelPorts {
 	const endpoint = options.unbrowserEndpoint?.trim() || browserEnv().UNBROWSER_MCP_URL?.trim();
@@ -82,6 +124,7 @@ export function createBrowserKernelPorts(options: BrowserPortsOptions = {}): Ker
 		apiKey: options.apiKey,
 		model: options.model,
 		unbrowserEndpoint: endpoint,
+		apiEndpoint: options.apiEndpoint,
 	}));
 	return {
 		clock: { now: () => Date.now() },

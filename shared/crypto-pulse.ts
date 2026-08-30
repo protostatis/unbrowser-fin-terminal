@@ -108,6 +108,7 @@ export async function resolveYahooPair(
   fetchImpl: FetchLike = fetch,
   timeoutMs = 4_000,
   maxResponseBytes = 64 * 1024,
+  signal?: AbortSignal,
 ): Promise<YahooPairResolution> {
   const canonical = symbol.trim().toUpperCase();
   const direct = yahooPairForSymbol(canonical);
@@ -119,10 +120,12 @@ export async function resolveYahooPair(
       fetchImpl,
       timeoutMs,
       maxResponseBytes,
+      signal,
     );
     const bars = (chart as { chart?: { result?: Array<{ timestamp?: unknown[] }> } })?.chart?.result?.[0]?.timestamp?.length ?? 0;
     if (bars > 0) return direct;
-  } catch {
+  } catch (error) {
+    if (signal?.aborted) throw error;
     // Fall through to search if the direct pair fails to parse.
   }
   // Search for the real crypto pair (numeric suffix or renamed ticker).
@@ -132,13 +135,15 @@ export async function resolveYahooPair(
       fetchImpl,
       timeoutMs,
       maxResponseBytes,
+      signal,
     );
     const quotes = (search as { quotes?: Array<{ symbol?: unknown; quoteType?: unknown }> })?.quotes ?? [];
     const cryptoPair = quotes.find(
       (quote) => quote.quoteType === "CRYPTOCURRENCY" && typeof quote.symbol === "string" && /-USD$/.test(quote.symbol),
     )?.symbol;
     return typeof cryptoPair === "string" ? cryptoPair : null;
-  } catch {
+  } catch (error) {
+    if (signal?.aborted) throw error;
     return null;
   }
 }
