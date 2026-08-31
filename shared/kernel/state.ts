@@ -166,7 +166,10 @@ export class MarketState {
 	workerFinalizations = new Set<string>();
 	/** Complete strict pair splits held until both archive mutation and validation finish. */
 	pendingPairedCanvases = new Map<string, { brief: Canvas; why: Canvas }>();
-	researchCandidates = new ResearchCandidateRegistry({ maxExtractions: 4, ttlMs: 15 * 60_000 });
+	// Extraction attempts include bot-walled fetches (failures count against
+	// the budget by design), so the cap must leave recovery room above the
+	// prompt's 2–4 extractions or a single blocked source kills the whole run.
+	researchCandidates = new ResearchCandidateRegistry({ maxExtractions: 8, ttlMs: 15 * 60_000 });
 	researchSequence = 0;
 	publicSessionResearchRuns = 0;
 	// Mutable, session-scoped watchlist so users can add/remove tickers in-terminal.
