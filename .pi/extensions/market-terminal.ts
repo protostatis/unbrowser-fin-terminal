@@ -9713,6 +9713,12 @@ export default function (pi: ExtensionAPI) {
 			try {
 				extraction = await requireUnbrowserMcpClient().extract(safeUrl, mode, signal);
 			} catch (error) {
+				// The fetch failed for infrastructure reasons (challenge, upstream
+				// error). Refund the attempt budget — the candidate stays consumed
+				// so the same source can never be retried, but the run may try a
+				// different one. Bot-walled search results would otherwise burn
+				// the whole budget and kill the research run.
+				state.researchCandidates.release(job.id, String(params.candidate_id));
 				const failureNote = userFacingUnbrowserError(cleanText(error instanceof Error ? error.message : String(error)).replace(/\s+/g, " ").slice(0, 180).trim());
 				recordEvidencePacket(job, {
 					sourceId: candidate.sourceId,
@@ -9752,6 +9758,11 @@ export default function (pi: ExtensionAPI) {
 			const retrievalStatus: EvidencePacket["retrievalStatus"] = extraction.retrievalStatus === "fetched" && !body
 				? "failed"
 				: extraction.retrievalStatus;
+			if (retrievalStatus !== "fetched") {
+				// Challenged/limited/empty sources get their attempt budget back
+				// (same rationale as the transport-failure refund above).
+				state.researchCandidates.release(job.id, String(params.candidate_id));
+			}
 			const evidenceBody = retrievalStatus === "fetched" ? body : "";
 			const failureNote = retrievalStatus === "failed"
 				? "Source returned no extractable content"
