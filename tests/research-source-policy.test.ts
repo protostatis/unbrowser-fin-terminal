@@ -111,3 +111,26 @@ test("capability issuance excludes blocked sources without spending extraction b
     assert.equal(registry.consume("job-1", candidate.candidateId!).sourceId, candidate.id);
   }
 });
+
+test("a released bot-walled attempt refunds the budget but stays single-use", () => {
+  let sequence = 0;
+  const registry = new ResearchCandidateRegistry({
+    maxExtractions: 2,
+    createId: () => `candidate-${++sequence}`,
+  });
+  const candidates: DiscoveryCandidate[] = [
+    { id: "walled", title: "Blocked source", url: "https://walled.example/story", source: "walled.example", status: "search-only" },
+    { id: "usable", title: "Working source", url: "https://usable.example/story", source: "usable.example", status: "search-only" },
+  ];
+  const [walled, usable] = grantAllowedExtractionCandidates(registry, "job-1", candidates);
+
+  registry.consume("job-1", walled.candidateId!);
+  // The model hit a bot wall; the run gets its slot back to try another source.
+  registry.release("job-1", walled.candidateId!);
+  assert.equal(registry.consume("job-1", usable.candidateId!).sourceId, "usable");
+
+  // The released candidate itself can never be retried (anti-bypass stays on).
+  assert.throws(() => registry.consume("job-1", walled.candidateId!), /already used/);
+  // And the hard cap still bounds total successful extractions.
+  assert.throws(() => registry.consume("job-1", walled.candidateId!).sourceId, /extraction limit|already used/);
+});

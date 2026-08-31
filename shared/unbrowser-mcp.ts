@@ -613,6 +613,22 @@ export class ResearchCandidateRegistry {
     };
   }
 
+  /**
+   * Refund the attempt budget after a fetch failed for infrastructure reasons
+   * (bot-wall challenge, upstream error). The candidate stays consumed (used
+   * stays true, so the same source can never be retried), but the run gets
+   * its slot back to try a different candidate — against the live web some
+   * search results are always blocked, and burning the whole budget on
+   * blocked hosts killed every real research run.
+   */
+  release(researchId: string, candidateId: string): void {
+    const grant = this.grants.get(researchId);
+    if (!grant) return;
+    const candidate = grant.candidates.get(candidateId);
+    if (!candidate || !candidate.used) return;
+    grant.extractionCount = Math.max(0, grant.extractionCount - 1);
+  }
+
   clear(researchId: string): void {
     this.grants.delete(researchId);
   }
