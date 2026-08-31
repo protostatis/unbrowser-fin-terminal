@@ -83,6 +83,17 @@ export interface TransportPort {
 	 * gate for day scope); `timeoutMs` defaults to QUOTE_REQUEST_TIMEOUT_MS.
 	 */
 	fetchQuote(symbol: string, scope: ChartScope, signal?: AbortSignal, timeoutMs?: number): Promise<Quote>;
+	/**
+	 * Optional whole-universe fetch for a market-map refresh. The Pi TUI talks
+	 * to the chart provider directly, but the authenticated browser broker
+	 * rate-limits per-symbol quote traffic, so a ~130-symbol universe cannot
+	 * fit its per-minute budget one request at a time. Hosts that can serve a
+	 * batch (the server broker fans out upstream itself) implement this seam;
+	 * `fetchQuotes` uses it when present and falls back to the per-symbol
+	 * worker pool otherwise. Failed symbols are omitted, never thrown, so the
+	 * caller's partial-universe handling stays identical to the pool path.
+	 */
+	fetchQuotesBatch?(symbols: readonly string[], scope: ChartScope, signal?: AbortSignal, timeoutMs?: number): Promise<Quote[]>;
 	/** Fetch the normalized crypto pulse through the host's trusted transport. */
 	fetchCryptoPulse(options?: Pick<CryptoPulseFetchOptions, "panicRadarEnabled">, signal?: AbortSignal): Promise<{
 		snapshot: CryptoPulseSnapshot;

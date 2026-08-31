@@ -15,6 +15,7 @@ import {
   normalizeChartScope,
   parseChartPayloadToQuote,
   type ChartScope,
+  type Quote,
 } from "../shared/kernel/quotes.js";
 import {
   fetchCryptoPulse,
@@ -50,6 +51,15 @@ const UPSTREAM_CHAT_TIMEOUT_MS = 75_000;
 const UPSTREAM_MCP_TIMEOUT_MS = 35_000;
 const UPSTREAM_QUOTE_TIMEOUT_MS = 15_000;
 const UPSTREAM_MCP_CLOSE_TIMEOUT_MS = 5_000;
+// Whole-universe batch quote fetch. One batch request replaces ~130 per-symbol
+// requests, so the overall deadline must fit inside the browser's own 12s
+// refresh deadline and the per-symbol upstream timeout stays the single-quote
+// bound.
+const QUOTE_BATCH_MAX_SYMBOLS = 200;
+const QUOTE_BATCH_CACHE_TTL_MS = 20_000;
+const QUOTE_BATCH_DEADLINE_MS = 10_000;
+const QUOTE_BATCH_UPSTREAM_CONCURRENCY = 6;
+const QUOTE_BATCH_CACHE_MAX_ENTRIES = 8;
 const MCP_READINESS_TIMEOUT_MS = 10_000;
 const MCP_READINESS_CACHE_MS = 10_000;
 const MCP_PROTOCOL_VERSION = "2025-03-26";
@@ -109,7 +119,14 @@ type McpSession = {
 };
 
 type CryptoCacheEntry = {
-  result: { snapshot: CryptoPulseSnapshot; errors: string[] };
+  result: { snapshot: unknown; errors: string[] };
+  cachedAt: number;
+};
+
+type QuoteBatchEntry = {
+  chartScope: ChartScope;
+  requested: number;
+  quotes: Quote[];
   cachedAt: number;
 };
 
@@ -170,6 +187,20 @@ function validScope(value: unknown): ChartScope | undefined {
   if (typeof value !== "string") return undefined;
   const scope = normalizeChartScope(value);
   return value === scope ? scope : undefined;
+}
+
+/** Parse the batch quote symbol list: comma-separated, validated, deduped, order-preserving. */
+function parseQuoteBatchSymbols(value: unknown): string[] | undefined {
+  if (typeof value !== "string") return undefined;
+  const symbols: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of value.split(",")) {
+    const symbol = quoteSymbol(raw.trim());
+    if (!symbol || seen.has(symbol)) continue;
+    seen.add(symbol);
+    symbols.push(symbol);
+  }
+  return symbols;
 }
 
 function validMcpSessionId(value: string | undefined): string | undefined {
@@ -323,6 +354,8 @@ export function createBrowserTerminalApp(options: BrowserTerminalAppOptions = {}
   const storageLocks = new Map<string, Promise<void>>();
   const cryptoCache = new Map<boolean, CryptoCacheEntry>();
   const cryptoInFlight = new Map<boolean, Promise<CryptoCacheEntry["result"]>>();
+  const quoteBatchCache = new Map<string, QuoteBatchEntry>();
+  const quoteBatchInFlight = new Map<string, Promise<QuoteBatchEntry>>();
   let mcpReadiness: McpReadiness | undefined;
   let mcpReadinessInFlight: Promise<boolean> | undefined;
 
@@ -550,6 +583,124 @@ export function createBrowserTerminalApp(options: BrowserTerminalAppOptions = {}
       features: { broker: true, mcp: Boolean(mcpEndpoint), quotes: true, cryptoPulse: true, persistence: true },
     });
   });
+
+  // Whole-universe market-map fetch. The canonical extension refreshes ~130
+  // symbols per sync; doing that through the per-symbol endpoint below would
+  // blow through the quote lane's 60/min budget and silently truncate every
+  // map to the first 60 symbols. The broker fans out upstream itself, so one
+  // batch request costs one lane slot and the universe arrives whole. This
+  // literal route must stay registered before "/:symbol" or Express would
+  // match "batch" as a ticker symbol.
+  app.get("/api/browser/v1/quotes/batch", async (req, res) => {
+    const scope = validScope(req.query.scope);
+    if (!scope) {
+      res.status(400).json({ error: "Invalid quote scope" });
+      return;
+    }
+    const symbols = parseQuoteBatchSymbols(req.query.symbols);
+    if (!symbols || symbols.length === 0) {
+      res.status(400).json({ error: "Invalid quote symbols" });
+      return;
+    }
+    if (symbols.length > QUOTE_BATCH_MAX_SYMBOLS) {
+      res.status(400).json({ error: "Too many quote symbols" });
+      return;
+    }
+    const batchKey = `${scope}\0${symbols.join(",")}`;
+
+    const respondWith = (entry: QuoteBatchEntry): void => {
+      res.json({ version: 1, chartScope: entry.chartScope, requested: entry.requested, quotes: entry.quotes });
+    };
+
+    const cached = quoteBatchCache.get(batchKey);
+    // A fresh batch serves every principal without touching the lane budget.
+    if (cached && now() - cached.cachedAt < QUOTE_BATCH_CACHE_TTL_MS) {
+      respondWith(cached);
+      return;
+    }
+    // Concurrent identical requests share one upstream fan-out.
+    const pending = quoteBatchInFlight.get(batchKey);
+    if (pending) {
+      try {
+        respondWith(await pending);
+      } catch {
+        safeUpstreamFailure(res);
+      }
+      return;
+    }
+
+    const release = acquireBrokerRequest(getPrincipal(req), "quote");
+    if (!release) {
+      respondBusy(res);
+      return;
+    }
+    try {
+      // Re-check after acquiring: an identical fan-out may have started while
+      // this request waited for a lane slot.
+      const racedPending = quoteBatchInFlight.get(batchKey);
+      if (racedPending) {
+        respondWith(await racedPending);
+        return;
+      }
+      const racedFresh = quoteBatchCache.get(batchKey);
+      if (racedFresh && now() - racedFresh.cachedAt < QUOTE_BATCH_CACHE_TTL_MS) {
+        respondWith(racedFresh);
+        return;
+      }
+      respondWith(await runQuoteBatch(batchKey, scope, symbols));
+    } catch {
+      safeUpstreamFailure(res);
+    } finally {
+      release();
+    }
+  });
+
+  async function runQuoteBatch(batchKey: string, scope: ChartScope, symbols: readonly string[]): Promise<QuoteBatchEntry> {
+    const run = (async (): Promise<QuoteBatchEntry> => {
+      const cfg = CHART_SCOPE_CONFIGS[scope];
+      const deadline = AbortSignal.timeout(QUOTE_BATCH_DEADLINE_MS);
+      const quotes: Quote[] = [];
+      let cursor = 0;
+      const workerCount = Math.min(QUOTE_BATCH_UPSTREAM_CONCURRENCY, symbols.length);
+      await Promise.all(Array.from({ length: workerCount }, async () => {
+        while (cursor < symbols.length && !deadline.aborted) {
+          const symbol = symbols[cursor++]!;
+          try {
+            const url = new URL(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}`);
+            url.searchParams.set("range", cfg.yahooRange);
+            url.searchParams.set("interval", cfg.yahooInterval);
+            url.searchParams.set("includePrePost", String(cfg.includePrePost));
+            const response = await request(url, { headers: { accept: "application/json", "user-agent": "market-terminal/0.1" }, signal: deadline });
+            if (!response.ok) continue;
+            const payload = JSON.parse((await responseBuffer(response, MAX_QUOTE_RESPONSE_BYTES)).toString("utf8"));
+            quotes.push(parseChartPayloadToQuote(symbol, payload, { ...cfg, chartScope: scope }));
+          } catch {
+            // A partial universe is still useful; failed symbols are omitted
+            // and the caller's partial-universe guard decides usability.
+            continue;
+          }
+        }
+      }));
+      const entry: QuoteBatchEntry = { chartScope: scope, requested: symbols.length, quotes, cachedAt: now() };
+      // Only a usable majority is worth serving to the next caller; a degraded
+      // fan-out should not poison the cache for the TTL window.
+      if (entry.quotes.length * 2 >= entry.requested) {
+        while (quoteBatchCache.size >= QUOTE_BATCH_CACHE_MAX_ENTRIES) {
+          const oldest = [...quoteBatchCache.entries()].sort((a, b) => a[1].cachedAt - b[1].cachedAt)[0];
+          if (!oldest) break;
+          quoteBatchCache.delete(oldest[0]);
+        }
+        quoteBatchCache.set(batchKey, entry);
+      }
+      return entry;
+    })();
+    quoteBatchInFlight.set(batchKey, run);
+    try {
+      return await run;
+    } finally {
+      if (quoteBatchInFlight.get(batchKey) === run) quoteBatchInFlight.delete(batchKey);
+    }
+  }
 
   app.get("/api/browser/v1/quotes/:symbol", async (req, res) => {
     const symbol = quoteSymbol(req.params.symbol);

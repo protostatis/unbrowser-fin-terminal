@@ -201,6 +201,8 @@ type MarketSnapshot = {
 	quotes: Quote[];
 	movers: RankedMover[];
 	headlines: Headline[];
+	/** How many symbols the refresh asked for; quotes below half of this mean the provider degraded. */
+	requested: number;
 	challenge?: string;
 	blockedDomains?: string[];
 	blockedSourceCount?: number;
@@ -1972,12 +1974,32 @@ async function unbrowserHeadlines(pi: ExtensionAPI, query: string, signal?: Abor
 	};
 }
 
+/**
+ * A refresh that came back with less than half of its requested universe is a
+ * degraded provider response, not a usable board. Exported so tests pin the
+ * threshold semantics without booting the terminal controller.
+ */
+export function snapshotUniverseDegraded(quoteCount: number, requested: number): boolean {
+	return requested > 0 && quoteCount * 2 < requested;
+}
+
 export async function fetchQuotes(
 	symbols: readonly string[],
 	scope: ChartScope = DEFAULT_CHART_SCOPE,
 	signal?: AbortSignal,
 	timeoutMs = QUOTE_REQUEST_TIMEOUT_MS,
 ): Promise<Quote[]> {
+	const batch = state.ports.transport.fetchQuotesBatch;
+	if (batch) {
+		try {
+			return await batch(symbols, scope, signal, timeoutMs);
+		} catch {
+			// Transport-level failure (lane busy, offline, abort). An empty
+			// result keeps the refresh error path identical to a fully failed
+			// universe; per-symbol failures are omitted inside the batch.
+			return [];
+		}
+	}
 	const results: Array<Quote | undefined> = Array.from({ length: symbols.length });
 	let cursor = 0;
 	const workerCount = Math.min(QUOTE_FETCH_CONCURRENCY, symbols.length);
@@ -2015,6 +2037,7 @@ async function fetchMarketSnapshot(pi: ExtensionAPI, scope: ChartScope = DEFAULT
 	return {
 		quotes,
 		movers,
+		requested: allSymbols.length,
 		headlines: news.headlines,
 		challenge: news.challenge,
 		...(news.blockedDomains.length ? { blockedDomains: news.blockedDomains, blockedSourceCount: news.blockedSourceCount } : {}),
@@ -5558,6 +5581,14 @@ class MarketHub {
 			if (generation !== this.snapshotGeneration || scope !== this.chartScope) return;
 			if (snapshot.chartScope !== scope) throw new Error(`scope mismatch: requested ${scope}, received ${snapshot.chartScope}`);
 			if (snapshot.quotes.length === 0) throw new Error("quote universe returned no usable quotes");
+			// A snapshot missing half its universe is a degraded provider, not a
+			// usable board. Accepting it would rank movers over a truncated
+			// universe and mix scopes in the relay (the old map kept rendering a
+			// max-scope partial as if it were the previous scope). Retain the
+			// current map instead and surface the degradation honestly.
+			if (snapshotUniverseDegraded(snapshot.quotes.length, snapshot.requested)) {
+				throw new Error(`quote universe returned ${snapshot.quotes.length} of ${snapshot.requested} quotes`);
+			}
 			this.snapshot = snapshot;
 			this.status = "MARKET MAP SYNCED";
 			this.clampSelection();
@@ -6874,6 +6905,7 @@ function makeTestSnapshot(updatedAt = 1_700_000_000_000, viewWatchlist: readonly
 	return {
 		quotes,
 		movers: rankMovers(quotes),
+		requested: symbols.length,
 		headlines: [
 			{ source: "demo.news", title: "Technology leadership broadens as index futures advance", url: "https://example.test/tech" },
 			{ source: "demo.news", title: "Investors assess earnings guidance and capital-spending plans", url: "https://example.test/earnings" },
@@ -7672,7 +7704,7 @@ async function openMarketMap(
 	const initialLiveCanvas = researchSlotHeld(initialResearch) && isSignalsResearchKey(initialResearch!.researchKey)
 		? canvasForResearch("MARKET", scope, initialResearch!.researchKey)
 		: latestCanvasForDisplay("MARKET", scope, (canvas) => isSignalsResearchKey(canvasResearchKey(canvas)));
-	const snapshot: MarketSnapshot = { quotes: [], movers: [], headlines: [], updatedAt: Date.now(), chartScope: scope };
+	const snapshot: MarketSnapshot = { quotes: [], movers: [], requested: 0, headlines: [], updatedAt: Date.now(), chartScope: scope };
 	let removeTerminalInputListener: (() => void) | undefined;
 	let overlayHandle: OverlayHandle | undefined;
 	let terminal: MarketHub | undefined;

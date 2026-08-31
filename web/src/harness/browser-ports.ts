@@ -85,6 +85,26 @@ function createBrowserTransport(options: BrowserPortsOptions) {
 				? payload as Quote
 				: parseChartPayloadToQuote(symbol, payload, { ...cfg, chartScope: scope });
 		},
+		// Only the authenticated broker can serve a whole universe in one
+		// request; the direct-Yahoo dev alpha keeps the per-symbol pool, so the
+		// batch seam stays undefined there and fetchQuotes falls back.
+		...(options.serverBroker ? {
+			async fetchQuotesBatch(symbols: readonly string[], scope: ChartScope, signal?: AbortSignal, timeoutMs = 12_000): Promise<Quote[]> {
+				const cfg = CHART_SCOPE_CONFIGS[scope];
+				if (readMarketMockMonday(browserEnv()) && scope === "day") {
+					return symbols.map((symbol) => parseChartPayloadToQuote(symbol, mockMondayChartPayload(symbol), { ...cfg, chartScope: scope }));
+				}
+				const url = new URL(browserApiUrl("/api/browser/v1/quotes/batch"));
+				url.searchParams.set("scope", scope);
+				url.searchParams.set("symbols", symbols.join(","));
+				const timeout = AbortSignal.timeout(timeoutMs);
+				const requestSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+				const response = await request(url, { headers: { accept: "application/json" }, signal: requestSignal });
+				if (!response.ok) throw new Error(`quote batch returned HTTP ${response.status}`);
+				const payload = await response.json() as { quotes?: unknown };
+				return Array.isArray(payload?.quotes) ? payload.quotes as Quote[] : [];
+			},
+		} : {}),
 		async fetchCryptoPulse(
 			pulseOptions: Pick<CryptoPulseFetchOptions, "panicRadarEnabled"> = {},
 			signal?: AbortSignal,
