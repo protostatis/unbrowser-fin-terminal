@@ -24,7 +24,8 @@ import {
   type CryptoPulseSnapshot,
   type FetchLike,
 } from "../shared/crypto-pulse.js";
-import { MARKET_RESEARCH_TOOL_NAMES } from "../shared/research-tool-policy.js";
+import { isMarketResearchToolName, MARKET_RESEARCH_TOOL_NAMES } from "../shared/research-tool-policy.js";
+import { isUnbrowserMcpToolName } from "../shared/unbrowser-mcp.js";
 import { normalizeWatchlistSymbol, WATCHLIST_MAX_SYMBOLS } from "../shared/watchlist-symbols.js";
 import { matchesProxyToken, normalizePrincipal, singleHeader } from "./proxy-auth.js";
 
@@ -872,7 +873,14 @@ export function createBrowserTerminalApp(options: BrowserTerminalAppOptions = {}
     if (method === "tools/call") {
       const params = asRecord(body.params);
       const name = params?.name;
-      if (!params || typeof name !== "string" || !MARKET_RESEARCH_TOOL_NAMES.includes(name as never) || (params.arguments !== undefined && !asRecord(params.arguments))) {
+      // The browser research worker rides this endpoint for BOTH surfaces: the
+      // raw unbrowser tools (navigate/text_main/… for market_discover and
+      // market_extract) and the market research tools (public-gateway path).
+      // An allowlist that omits either breaks research with the generic
+      // "Source retrieval is temporarily unavailable" mapping.
+      const toolAllowed = typeof name === "string"
+        && (isMarketResearchToolName(name) || isUnbrowserMcpToolName(name));
+      if (!params || !toolAllowed || (params.arguments !== undefined && !asRecord(params.arguments))) {
          res.status(400).json({ error: "MCP tool is not allowed" });
          return;
       }
