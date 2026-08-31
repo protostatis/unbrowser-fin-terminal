@@ -22,6 +22,28 @@ type McpToolResult = {
 
 export type UnbrowserExtractionMode = "text_main" | "table_to_json" | "extract_cards";
 
+/**
+ * The fixed raw tool surface UnbrowserMcpClient calls on any UNBROWSER_MCP_URL.
+ * Hosted brokers that proxy MCP for browser research workers must allow exactly
+ * these (plus the market research tools, which ride the same endpoint in the
+ * public-gateway path) — an allowlist that omits them silently breaks source
+ * discovery: every unbrowser call 400s and the model sees only the generic
+ * "Source retrieval is temporarily unavailable" mapping.
+ */
+export const UNBROWSER_MCP_TOOL_NAMES = [
+  "navigate",
+  "text_main",
+  "table_to_json",
+  "extract_cards",
+  "body",
+] as const;
+
+export type UnbrowserMcpToolName = (typeof UNBROWSER_MCP_TOOL_NAMES)[number];
+
+export function isUnbrowserMcpToolName(name: string): name is UnbrowserMcpToolName {
+  return (UNBROWSER_MCP_TOOL_NAMES as readonly string[]).includes(name);
+}
+
 export type UnbrowserNavigation = {
   url?: string;
   status?: number;

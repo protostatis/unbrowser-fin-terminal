@@ -196,10 +196,27 @@ test("MCP proxy maps upstream sessions and binds them to the authenticated princ
 		});
 		assert.equal(otherPrincipal.status, 404);
 
+		// The browser research worker calls the raw unbrowser tools through this
+		// proxy (market_discover → navigate; market_extract → text_main/…).
+		// Blocking them broke production discovery with the generic
+		// "Source retrieval is temporarily unavailable" mapping.
+		const navigate = await fetch(`${base}/api/browser/v1/mcp`, {
+			method: "POST",
+			headers: { ...headers(), "mcp-session-id": browserSession! },
+			body: JSON.stringify({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "navigate", arguments: { url: "https://lite.duckduckgo.com/lite/?q=test" } } }),
+		});
+		assert.equal(navigate.status, 200);
+		const textMain = await fetch(`${base}/api/browser/v1/mcp`, {
+			method: "POST",
+			headers: { ...headers(), "mcp-session-id": browserSession! },
+			body: JSON.stringify({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "text_main", arguments: {} } }),
+		});
+		assert.equal(textMain.status, 200);
+
 		const arbitraryTool = await fetch(`${base}/api/browser/v1/mcp`, {
 			method: "POST",
 			headers: { ...headers(), "mcp-session-id": browserSession! },
-			body: JSON.stringify({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "navigate", arguments: { url: "https://evil.example" } } }),
+			body: JSON.stringify({ jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "shell_exec", arguments: { command: "rm -rf /" } } }),
 		});
 		assert.equal(arbitraryTool.status, 400);
   });
