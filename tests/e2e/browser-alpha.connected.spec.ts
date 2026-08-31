@@ -39,7 +39,7 @@ const ARTICLE_CONTENT = [
 function mcpToolText(name: string, args: Record<string, unknown>): string {
 	if (name === "navigate") {
 		const url = String(args.url ?? "");
-		const isSearch = url.startsWith("https://html.duckduckgo.com/html/");
+		const isSearch = url.startsWith("https://lite.duckduckgo.com/lite/");
 		return JSON.stringify({
 			url,
 			status: isSearch ? 200 : CONFORMANCE_FIXTURE_URLS.includes(url as (typeof CONFORMANCE_FIXTURE_URLS)[number]) ? 200 : 404,

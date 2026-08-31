@@ -7,7 +7,7 @@
  * extract_cards|body, DELETE to close.
  *
  * Behavior (fully deterministic, no network):
- *  - navigate on html.duckduckgo.com → blockmap.interactives.link_samples for
+ *  - navigate on lite.duckduckgo.com → blockmap.interactives.link_samples for
  *    the CONFORMANCE_FIXTURE_URLS (drives market_discover candidates).
  *  - navigate on any fixture URL → plain article page (density normal, no
  *    challenge, no link samples).
@@ -24,7 +24,7 @@ import {
 } from "../../server/conformance-mock-model.js";
 
 const MOCK_SESSION_ID = "conformance-session-1";
-const DUCKDUCKGO_PREFIX = "https://html.duckduckgo.com/html/";
+const DUCKDUCKGO_PREFIX = "https://lite.duckduckgo.com/lite/";
 
 const ARTICLE_CONTENT = [
   "# Apple Q2 2026 reporting",

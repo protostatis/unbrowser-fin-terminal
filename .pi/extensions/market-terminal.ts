@@ -1754,6 +1754,19 @@ async function fetchQuote(symbol: string, scope: ChartScope = DEFAULT_CHART_SCOP
 	return state.ports.transport.fetchQuote(symbol, scope, signal, timeoutMs);
 }
 
+/**
+ * Public-web search backend. `html.duckduckgo.com` serves its anti-bot
+ * challenge to datacenter egress IPs (the hosted sidecar never sees a single
+ * candidate), while the `lite` variant serves real result links to the same
+ * client. Both wrap destinations in `//duckduckgo.com/l/?uddg=<encoded>`,
+ * which extractSearchCandidates already unwraps. The base is also the
+ * resolution root for any truly relative result hrefs.
+ */
+const SEARCH_RESULT_BASE = "https://lite.duckduckgo.com";
+function searchUrl(query: string): string {
+	return `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`;
+}
+
 export function extractSearchCandidates(samples: Array<{ text?: unknown; href?: unknown }>, limit = 8): {
 	candidates: Array<{ text: string; url: string }>;
 	blockedDomains: string[];
@@ -1766,7 +1779,7 @@ export function extractSearchCandidates(samples: Array<{ text?: unknown; href?: 
 		if (!rawHref) continue;
 		let destination = rawHref;
 		try {
-			const parsed = new URL(rawHref.startsWith("//") ? `https:${rawHref}` : rawHref, "https://html.duckduckgo.com");
+			const parsed = new URL(rawHref.startsWith("//") ? `https:${rawHref}` : rawHref, SEARCH_RESULT_BASE);
 			if (parsed.hostname === "duckduckgo.com" || parsed.hostname.endsWith(".duckduckgo.com")) {
 				const redirected = parsed.searchParams.get("uddg");
 				if (!redirected) continue;
@@ -1930,7 +1943,7 @@ async function navigatePublicPage(pi: ExtensionAPI, url: string, signal?: AbortS
 
 async function unbrowserResearch(pi: ExtensionAPI, symbol: string, question: string, signal?: AbortSignal) {
 	const query = `${symbol} stock ${question || "latest news and catalysts"}`;
-	const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+	const url = searchUrl(query);
 	const result = await navigatePublicPage(pi, url, signal);
 
 	const challenge = result.challenge;
@@ -1955,7 +1968,7 @@ async function unbrowserHeadlines(pi: ExtensionAPI, query: string, signal?: Abor
 	blockedDomains: string[];
 	blockedSourceCount: number;
 }> {
-	const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+	const url = searchUrl(query);
 	const result = await navigatePublicPage(pi, url, signal) as { challenge?: { provider?: string }; blockmap?: { interactives?: { link_samples?: Array<{ text?: string; href?: string }> } } };
 	const discovery = extractSearchCandidates(result.blockmap?.interactives?.link_samples ?? [], 8);
 	const headlines = discovery.candidates
