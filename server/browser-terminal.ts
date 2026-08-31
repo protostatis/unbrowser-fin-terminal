@@ -69,7 +69,11 @@ const STORAGE_NAMES = new Set(["market-research-archive.json", "market-watchlist
 const MAX_MCP_SESSIONS = 8;
 const MAX_MCP_SESSIONS_PER_PRINCIPAL = 4;
 const MCP_INITIALIZE_RATE_WINDOW_MS = 60_000;
-const MCP_INITIALIZE_RATE_LIMIT = 12;
+// A single research run opens one upstream session per unbrowser client call
+// (initialize + notifications + tools/call + DELETE). A healthy J run makes
+// ~6-7 sessions and a J+K session more, so the cap must sit comfortably above
+// that or discovery 429s mid-run.
+const MCP_INITIALIZE_RATE_LIMIT = 30;
 
 // Quote refreshes are intentionally high-volume. They must not consume the
 // same per-minute budget as crypto, interactive research, or control traffic;
@@ -77,7 +81,11 @@ const MCP_INITIALIZE_RATE_LIMIT = 12;
 // the rest of the minute and can starve the crypto pulse endpoint.
 const QUOTE_RATE_LIMIT = 60;
 const CRYPTO_RATE_LIMIT = 30;
-const RESEARCH_RATE_LIMIT = 24;
+// The research lane carries BOTH the model's chat turns and the worker's MCP
+// traffic (chat ~8 + MCP ~26 per run). 24/min made every working research run
+// exhaust its own budget: the model's next chat call got 429 and the run died
+// as "Research model request failed" right after the extractions succeeded.
+const RESEARCH_RATE_LIMIT = 90;
 const CONTROL_RATE_LIMIT = 60;
 
 type BrokerLane = "quote" | "crypto" | "research" | "control";
