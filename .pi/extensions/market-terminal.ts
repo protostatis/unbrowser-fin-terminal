@@ -201,6 +201,8 @@ type MarketSnapshot = {
 	quotes: Quote[];
 	movers: RankedMover[];
 	headlines: Headline[];
+	/** How many symbols the refresh asked for; quotes below half of this mean the provider degraded. */
+	requested: number;
 	challenge?: string;
 	blockedDomains?: string[];
 	blockedSourceCount?: number;
@@ -1752,6 +1754,19 @@ async function fetchQuote(symbol: string, scope: ChartScope = DEFAULT_CHART_SCOP
 	return state.ports.transport.fetchQuote(symbol, scope, signal, timeoutMs);
 }
 
+/**
+ * Public-web search backend. `html.duckduckgo.com` serves its anti-bot
+ * challenge to datacenter egress IPs (the hosted sidecar never sees a single
+ * candidate), while the `lite` variant serves real result links to the same
+ * client. Both wrap destinations in `//duckduckgo.com/l/?uddg=<encoded>`,
+ * which extractSearchCandidates already unwraps. The base is also the
+ * resolution root for any truly relative result hrefs.
+ */
+const SEARCH_RESULT_BASE = "https://lite.duckduckgo.com";
+function searchUrl(query: string): string {
+	return `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`;
+}
+
 export function extractSearchCandidates(samples: Array<{ text?: unknown; href?: unknown }>, limit = 8): {
 	candidates: Array<{ text: string; url: string }>;
 	blockedDomains: string[];
@@ -1764,7 +1779,7 @@ export function extractSearchCandidates(samples: Array<{ text?: unknown; href?: 
 		if (!rawHref) continue;
 		let destination = rawHref;
 		try {
-			const parsed = new URL(rawHref.startsWith("//") ? `https:${rawHref}` : rawHref, "https://html.duckduckgo.com");
+			const parsed = new URL(rawHref.startsWith("//") ? `https:${rawHref}` : rawHref, SEARCH_RESULT_BASE);
 			if (parsed.hostname === "duckduckgo.com" || parsed.hostname.endsWith(".duckduckgo.com")) {
 				const redirected = parsed.searchParams.get("uddg");
 				if (!redirected) continue;
@@ -1928,7 +1943,7 @@ async function navigatePublicPage(pi: ExtensionAPI, url: string, signal?: AbortS
 
 async function unbrowserResearch(pi: ExtensionAPI, symbol: string, question: string, signal?: AbortSignal) {
 	const query = `${symbol} stock ${question || "latest news and catalysts"}`;
-	const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+	const url = searchUrl(query);
 	const result = await navigatePublicPage(pi, url, signal);
 
 	const challenge = result.challenge;
@@ -1953,7 +1968,7 @@ async function unbrowserHeadlines(pi: ExtensionAPI, query: string, signal?: Abor
 	blockedDomains: string[];
 	blockedSourceCount: number;
 }> {
-	const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+	const url = searchUrl(query);
 	const result = await navigatePublicPage(pi, url, signal) as { challenge?: { provider?: string }; blockmap?: { interactives?: { link_samples?: Array<{ text?: string; href?: string }> } } };
 	const discovery = extractSearchCandidates(result.blockmap?.interactives?.link_samples ?? [], 8);
 	const headlines = discovery.candidates
@@ -1972,12 +1987,32 @@ async function unbrowserHeadlines(pi: ExtensionAPI, query: string, signal?: Abor
 	};
 }
 
+/**
+ * A refresh that came back with less than half of its requested universe is a
+ * degraded provider response, not a usable board. Exported so tests pin the
+ * threshold semantics without booting the terminal controller.
+ */
+export function snapshotUniverseDegraded(quoteCount: number, requested: number): boolean {
+	return requested > 0 && quoteCount * 2 < requested;
+}
+
 export async function fetchQuotes(
 	symbols: readonly string[],
 	scope: ChartScope = DEFAULT_CHART_SCOPE,
 	signal?: AbortSignal,
 	timeoutMs = QUOTE_REQUEST_TIMEOUT_MS,
 ): Promise<Quote[]> {
+	const batch = state.ports.transport.fetchQuotesBatch;
+	if (batch) {
+		try {
+			return await batch(symbols, scope, signal, timeoutMs);
+		} catch {
+			// Transport-level failure (lane busy, offline, abort). An empty
+			// result keeps the refresh error path identical to a fully failed
+			// universe; per-symbol failures are omitted inside the batch.
+			return [];
+		}
+	}
 	const results: Array<Quote | undefined> = Array.from({ length: symbols.length });
 	let cursor = 0;
 	const workerCount = Math.min(QUOTE_FETCH_CONCURRENCY, symbols.length);
@@ -2015,6 +2050,7 @@ async function fetchMarketSnapshot(pi: ExtensionAPI, scope: ChartScope = DEFAULT
 	return {
 		quotes,
 		movers,
+		requested: allSymbols.length,
 		headlines: news.headlines,
 		challenge: news.challenge,
 		...(news.blockedDomains.length ? { blockedDomains: news.blockedDomains, blockedSourceCount: news.blockedSourceCount } : {}),
@@ -5558,6 +5594,14 @@ class MarketHub {
 			if (generation !== this.snapshotGeneration || scope !== this.chartScope) return;
 			if (snapshot.chartScope !== scope) throw new Error(`scope mismatch: requested ${scope}, received ${snapshot.chartScope}`);
 			if (snapshot.quotes.length === 0) throw new Error("quote universe returned no usable quotes");
+			// A snapshot missing half its universe is a degraded provider, not a
+			// usable board. Accepting it would rank movers over a truncated
+			// universe and mix scopes in the relay (the old map kept rendering a
+			// max-scope partial as if it were the previous scope). Retain the
+			// current map instead and surface the degradation honestly.
+			if (snapshotUniverseDegraded(snapshot.quotes.length, snapshot.requested)) {
+				throw new Error(`quote universe returned ${snapshot.quotes.length} of ${snapshot.requested} quotes`);
+			}
 			this.snapshot = snapshot;
 			this.status = "MARKET MAP SYNCED";
 			this.clampSelection();
@@ -6874,6 +6918,7 @@ function makeTestSnapshot(updatedAt = 1_700_000_000_000, viewWatchlist: readonly
 	return {
 		quotes,
 		movers: rankMovers(quotes),
+		requested: symbols.length,
 		headlines: [
 			{ source: "demo.news", title: "Technology leadership broadens as index futures advance", url: "https://example.test/tech" },
 			{ source: "demo.news", title: "Investors assess earnings guidance and capital-spending plans", url: "https://example.test/earnings" },
@@ -7672,7 +7717,7 @@ async function openMarketMap(
 	const initialLiveCanvas = researchSlotHeld(initialResearch) && isSignalsResearchKey(initialResearch!.researchKey)
 		? canvasForResearch("MARKET", scope, initialResearch!.researchKey)
 		: latestCanvasForDisplay("MARKET", scope, (canvas) => isSignalsResearchKey(canvasResearchKey(canvas)));
-	const snapshot: MarketSnapshot = { quotes: [], movers: [], headlines: [], updatedAt: Date.now(), chartScope: scope };
+	const snapshot: MarketSnapshot = { quotes: [], movers: [], requested: 0, headlines: [], updatedAt: Date.now(), chartScope: scope };
 	let removeTerminalInputListener: (() => void) | undefined;
 	let overlayHandle: OverlayHandle | undefined;
 	let terminal: MarketHub | undefined;

@@ -569,3 +569,131 @@ test("quote and crypto providers are server-side browser transports", async () =
 		assert.ok(providerCalls.some((url) => url.includes("coinmarketcap.com")));
 	});
 });
+
+function yahooChartFixture(symbol: string): unknown {
+	const timestamp = Math.floor(Date.now() / 1_000);
+	return { chart: { result: [{
+		meta: {
+			symbol, currency: "USD", shortName: `${symbol} Inc.`,
+			fullExchangeName: "NasdaqGS", exchangeTimezoneName: "America/New_York",
+			dataGranularity: "5m", regularMarketPrice: 101, regularMarketVolume: 1_000,
+			regularMarketTime: timestamp, chartPreviousClose: 100,
+		},
+		timestamp: [timestamp - 86_400, timestamp],
+		indicators: { quote: [{ close: [100, 101], volume: [900, 1_000] }] },
+	}] } };
+}
+
+test("quote batch serves the whole universe for one lane slot", async () => {
+	const fetchedSymbols: string[] = [];
+	const fakeFetch: typeof fetch = async (input) => {
+		const url = String(input);
+		const match = /\/v8\/finance\/chart\/([^?]+)/.exec(url);
+		if (match) {
+			fetchedSymbols.push(decodeURIComponent(match[1]!));
+			return new Response(JSON.stringify(yahooChartFixture(decodeURIComponent(match[1]!))), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		}
+		throw new Error(`unexpected upstream ${url}`);
+	};
+
+	await withServer(fakeFetch, async (base) => {
+		const batch = await fetch(`${base}/api/browser/v1/quotes/batch?scope=day&symbols=AAPL,MSFT,NVDA`, { headers: headers() });
+		assert.equal(batch.status, 200);
+		const body = await batch.json() as { version: number; chartScope: string; requested: number; quotes: Array<{ symbol: string }> };
+		assert.equal(body.version, 1);
+		assert.equal(body.chartScope, "day");
+		assert.equal(body.requested, 3);
+		assert.deepEqual(body.quotes.map((quote) => quote.symbol).sort(), ["AAPL", "MSFT", "NVDA"]);
+		assert.deepEqual([...fetchedSymbols].sort(), ["AAPL", "MSFT", "NVDA"]);
+
+		// The whole universe cost a single lane request, so 59 per-symbol
+		// refreshes still fit the same minute window and the 60th is rejected.
+		for (let index = 0; index < 59; index += 1) {
+			const single = await fetch(`${base}/api/browser/v1/quotes/AAPL?scope=day`, { headers: headers() });
+			assert.equal(single.status, 200);
+		}
+		const overflow = await fetch(`${base}/api/browser/v1/quotes/AAPL?scope=day`, { headers: headers() });
+		assert.equal(overflow.status, 429);
+	});
+});
+
+test("quote batch coalesces identical concurrent requests and caches within the TTL", async () => {
+	let clock = 1_000_000;
+	let yahooCalls = 0;
+	const fakeFetch: typeof fetch = async (input) => {
+		const url = String(input);
+		if (url.includes("/v8/finance/chart/")) {
+			yahooCalls += 1;
+			return new Response(JSON.stringify(yahooChartFixture("AAPL")), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		}
+		throw new Error(`unexpected upstream ${url}`);
+	};
+
+	await withServer(fakeFetch, async (base) => {
+		const first = fetch(`${base}/api/browser/v1/quotes/batch?scope=week&symbols=AAPL,MSFT`, { headers: headers() });
+		const second = fetch(`${base}/api/browser/v1/quotes/batch?scope=week&symbols=AAPL,MSFT`, { headers: headers() });
+		const [firstBody, secondBody] = await Promise.all([first, second]);
+		assert.equal(firstBody.status, 200);
+		assert.equal(secondBody.status, 200);
+		assert.equal(yahooCalls, 2, "two symbols fetched once each, not once per concurrent request");
+
+		clock += 5_000;
+		const cacheHit = await fetch(`${base}/api/browser/v1/quotes/batch?scope=week&symbols=AAPL,MSFT`, { headers: headers() });
+		assert.equal(cacheHit.status, 200);
+		assert.equal(yahooCalls, 2, "a fresh cache entry serves without upstream calls");
+
+		clock += 25_000;
+		const afterTtl = await fetch(`${base}/api/browser/v1/quotes/batch?scope=week&symbols=AAPL,MSFT`, { headers: headers() });
+		assert.equal(afterTtl.status, 200);
+		assert.ok(yahooCalls > 2, "an expired cache entry refetches the universe");
+	}, () => clock);
+});
+
+test("quote batch validates scope, symbols, and universe size", async () => {
+	const fakeFetch: typeof fetch = async () => { throw new Error("unexpected upstream"); };
+	await withServer(fakeFetch, async (base) => {
+		const badScope = await fetch(`${base}/api/browser/v1/quotes/batch?scope=decade&symbols=AAPL`, { headers: headers() });
+		assert.equal(badScope.status, 400);
+		const noSymbols = await fetch(`${base}/api/browser/v1/quotes/batch?scope=day`, { headers: headers() });
+		assert.equal(noSymbols.status, 400);
+		const garbage = await fetch(`${base}/api/browser/v1/quotes/batch?scope=day&symbols=,,`, { headers: headers() });
+		assert.equal(garbage.status, 400);
+		const tooMany = await fetch(`${base}/api/browser/v1/quotes/batch?scope=day&symbols=${Array.from({ length: 201 }, (_unused, index) => `S${index}`).join(",")}`, { headers: headers() });
+		assert.equal(tooMany.status, 400);
+	});
+});
+
+test("a degraded quote batch is returned but not cached", async () => {
+	let clock = 2_000_000;
+	let yahooCalls = 0;
+	const fakeFetch: typeof fetch = async (input) => {
+		const url = String(input);
+		if (url.includes("/v8/finance/chart/AAPL")) {
+			yahooCalls += 1;
+			return new Response(JSON.stringify(yahooChartFixture("AAPL")), { status: 200, headers: { "content-type": "application/json" } });
+		}
+		if (url.includes("/v8/finance/chart/")) {
+			yahooCalls += 1;
+			return new Response(JSON.stringify({ chart: { result: [] } }), { status: 200, headers: { "content-type": "application/json" } });
+		}
+		throw new Error(`unexpected upstream ${url}`);
+	};
+
+	await withServer(fakeFetch, async (base) => {
+		const degraded = await fetch(`${base}/api/browser/v1/quotes/batch?scope=day&symbols=AAPL,MSFT,NVDA`, { headers: headers() });
+		assert.equal(degraded.status, 200);
+		const body = await degraded.json() as { requested: number; quotes: unknown[] };
+		assert.equal(body.requested, 3);
+		assert.equal(body.quotes.length, 1, "failed symbols are omitted, not failed wholesale");
+
+		clock += 25_000;
+		await fetch(`${base}/api/browser/v1/quotes/batch?scope=day&symbols=AAPL,MSFT,NVDA`, { headers: headers() });
+		assert.equal(yahooCalls, 6, "a below-half universe is not cached; the next window refetches everything");
+	}, () => clock);
+});
