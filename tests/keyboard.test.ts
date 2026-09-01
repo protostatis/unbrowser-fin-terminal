@@ -66,6 +66,8 @@ test("default key mapping outside controls is unchanged", () => {
   assert.equal(keyToData(event({ key: "End" })), "\x1b[F");
   assert.equal(keyToData(event({ key: "j" })), "j");
   assert.equal(keyToData(event({ key: "J" })), "J");
+  assert.equal(keyToData(event({ key: "g" })), "g");
+  assert.equal(keyToData(event({ key: "G" })), "G");
   assert.equal(keyToData(event({ key: "/" })), "/");
 });
 

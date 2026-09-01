@@ -234,6 +234,8 @@ body,
   gap: 12px;
   min-height: 30px;
   padding: 5px 12px 4px;
+  background: linear-gradient(180deg, #10151e, #0d1117);
+  border-bottom: 1px solid #21262d;
 }
 
 .browser-alpha-session-label {
@@ -262,6 +264,18 @@ body,
   outline-offset: 2px;
 }
 
+.browser-alpha-connect input:focus-visible {
+  outline: 2px solid #58a6ff;
+  outline-offset: 1px;
+  border-color: #58a6ff;
+}
+
+.browser-alpha-connect button:disabled,
+.browser-alpha-disconnect:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
 /* The importer shares the banner action row with Disconnect. Keeping it in
  * normal flow prevents it from covering the terminal's delayed-status text. */
 .browser-alpha-banner .watchlist-import-trigger {
@@ -282,6 +296,19 @@ body,
   padding: 8px 10px;
   background: #0d1117;
   border: 1px solid #f85149;
+}
+
+.browser-alpha-notice {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 49;
+  max-width: min(420px, calc(100% - 32px));
+  padding: 8px 10px;
+  color: #56d364;
+  background: #0d1117;
+  border: 1px solid #3fb950;
+  line-height: 1.45;
 }
 
 /* ── Theme color palette ────────────────────────────────────────────────────
@@ -424,6 +451,8 @@ strong {
   border-top: 3px solid #58a6ff;
   border-radius: 5px;
   box-shadow: 0 20px 70px #000c;
+  scrollbar-color: #30363d #0b0e14;
+  scrollbar-width: thin;
 }
 
 .watchlist-import-header {
@@ -2123,6 +2152,20 @@ strong {
     justify-content: center;
   }
 
+   /* Keep the persistent banner actions usable with a thumb. The desktop
+      banner is intentionally compact; BYOK retains its clear-key action while
+      authenticated sessions end through tab lifecycle instead. */
+  .browser-alpha-banner .watchlist-import-trigger,
+  .browser-alpha-banner .browser-alpha-disconnect {
+    min-height: 40px;
+    padding-block: 8px;
+  }
+
+  .watchlist-import-close {
+    width: 40px;
+    height: 40px;
+  }
+
   .terminal-frame {
     touch-action: pan-y pinch-zoom;
   }
@@ -2277,10 +2320,11 @@ strong {
   display: flex;
   align-items: center;
   margin: 0 auto 8px 8px;
-  width: 28px;
+  min-width: 28px;
   height: 28px;
   justify-content: center;
-  padding: 0;
+  gap: 5px;
+  padding: 0 7px;
   color: #8b949e;
   background: #0d1117ee;
   border: 1px solid #30363d;
@@ -2298,6 +2342,11 @@ strong {
 .interaction-toggle-chevron {
   color: #58a6ff;
   font-size: 9px;
+}
+
+.interaction-toggle-label {
+  font-size: 9px;
+  letter-spacing: 0.08em;
 }
 
 .interaction-toggle:hover {
@@ -2330,6 +2379,32 @@ strong {
   border-radius: 8px;
   box-shadow: 0 8px 32px #000b;
   backdrop-filter: blur(10px);
+  scrollbar-color: #30363d #0b0e14;
+  scrollbar-width: thin;
+}
+
+.interaction-panel-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 1px 2px 7px;
+  color: #58a6ff;
+  border-bottom: 1px solid #21262d;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+}
+
+.interaction-panel-head span {
+  min-width: 0;
+  overflow: hidden;
+  color: #8b949e;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ── Selectable list ─────────────────────────────────────────────────────── */
@@ -2673,6 +2748,50 @@ strong {
   color: #484f58;
 }
 
+.interaction-market-toggle {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 36px;
+  padding: 6px 8px;
+  color: #79c0ff;
+  background: #101826;
+  border: 1px solid #1f6feb;
+  border-radius: 4px;
+  font: inherit;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  cursor: pointer;
+}
+
+.interaction-market-toggle:hover {
+  color: #c9d1d9;
+  background: #142033;
+  border-color: #58a6ff;
+}
+
+.interaction-market-toggle:focus-visible {
+  outline: 2px solid #58a6ff;
+  outline-offset: 1px;
+}
+
+.interaction-market-toggle:disabled {
+  opacity: 0.48;
+  cursor: default;
+}
+
+.interaction-market-toggle-key {
+  min-width: 18px;
+  padding: 1px 4px;
+  color: #0b0e14;
+  background: #58a6ff;
+  border-radius: 2px;
+  font-size: 9px;
+}
+
 /* ── Unavailable state ───────────────────────────────────────────────────── */
 
 .interaction-unavailable {
@@ -2726,6 +2845,10 @@ strong {
     font-size: 8px;
   }
 
+  .interaction-toggle-label {
+    display: none;
+  }
+
   .interaction-panel {
     margin: 0 6px 6px;
     border-radius: 8px 8px 0 0;
@@ -2775,6 +2898,10 @@ strong {
     border-radius: 50%;
     padding: 0;
     font-size: 13px;
+  }
+
+  .interaction-toggle-label {
+    display: none;
   }
 
   .interaction-toggle-chevron {

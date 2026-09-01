@@ -31,7 +31,8 @@ and never calls `createAgentSession`. The browser still owns the canonical
 terminal UI and isolated research workers, while the same-origin Node broker
 owns:
 
-- authenticated principal binding from Caddy's `X-Fin-Terminal-User`;
+- authenticated principal binding from Caddy's `X-Fin-Terminal-User` (one stable
+  opaque principal per approved signed-in UnchainedSky account);
 - the fixed OpenRouter chat-completions upstream and server-selected model;
 - a session-bound, allowlisted Unbrowser MCP proxy;
 - Yahoo quotes, crypto-pair resolution, and cached CMC/PanicRadar crypto pulse;
@@ -41,6 +42,9 @@ The browser sends no provider key. Broker routes reject cross-origin requests,
 unknown MCP methods/tools, arbitrary upstream URLs, oversized payloads, and
 requests without the reverse-proxy token/principal contract. The browser
 client's IndexedDB adapter remains available only for the personal alpha.
+The authenticated terminal starts its browser runtime automatically after
+forward authentication; reload or closing the tab is the normal way to end the
+client session. Broker and MCP expiry remain the server-side cleanup boundary.
 
 ## Node/Pi runtime
 

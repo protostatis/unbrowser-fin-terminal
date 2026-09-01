@@ -593,6 +593,7 @@ export function App({
         state={frameStateRef.current}
         disabled={cs !== "connected" || Boolean(selectReq) || evidenceOpen || isClosedRef.current}
         onAction={handleWebAction}
+        onInput={handleTouchInput}
         onReturnToTerminal={focusTerminal}
       />
 
@@ -730,15 +731,36 @@ function BrowserAlphaLazy({ authenticated = false }: { authenticated?: boolean }
     void import("./harness/browser-alpha.js").then((m) => setComp(() => ((props: { authenticated?: boolean }) => <m.BrowserAlphaApp {...props} />)));
   }, []);
   if (!Comp) return <div style={{ padding: 24, fontFamily: "system-ui" }}>Loading browser session…</div>;
-  return <Comp authenticated={authenticated} />;
+	return <Comp authenticated={authenticated} />;
+}
+
+type BrowserTerminalTestControls = {
+	unmount: () => void;
+	remount: () => void;
+};
+
+function BrowserTerminalRoot() {
+	const [mounted, setMounted] = useState(true);
+	useEffect(() => {
+		if (buildEnv.VITE_BROWSER_TERMINAL_TEST_HARNESS !== "1") return;
+		const target = window as typeof window & { __browserTerminalTest?: BrowserTerminalTestControls };
+		target.__browserTerminalTest = {
+			unmount: () => setMounted(false),
+			remount: () => setMounted(true),
+		};
+		return () => {
+			if (target.__browserTerminalTest) delete target.__browserTerminalTest;
+		};
+	}, []);
+	return mounted ? <BrowserAlphaLazy authenticated /> : null;
 }
 
 const RootApp: React.ComponentType = REPLAY_DEMO
   ? ReplayApp
   : PUBLIC_LIVE_DEMO
-    ? PublicLiveRoot
-    : BROWSER_TERMINAL
-      ? (() => <BrowserAlphaLazy authenticated />)
+		? PublicLiveRoot
+		: BROWSER_TERMINAL
+			? BrowserTerminalRoot
       : BROWSER_ALPHA
         ? BrowserAlphaLazy
         : App;
