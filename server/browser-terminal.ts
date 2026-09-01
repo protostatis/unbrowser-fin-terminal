@@ -28,6 +28,12 @@ import { isMarketResearchToolName, MARKET_RESEARCH_TOOL_NAMES } from "../shared/
 import { isUnbrowserMcpToolName } from "../shared/unbrowser-mcp.js";
 import { normalizeWatchlistSymbol, WATCHLIST_MAX_SYMBOLS } from "../shared/watchlist-symbols.js";
 import { matchesProxyToken, normalizePrincipal, singleHeader } from "./proxy-auth.js";
+import {
+  extractWatchlistFromScreenshot,
+  WATCHLIST_SCREENSHOT_MAX_BYTES,
+  WatchlistScreenshotImportError,
+  WatchlistScreenshotImportLimiter,
+} from "./watchlist-screenshot-import.js";
 
 const USER_HEADER = "x-fin-terminal-user";
 const PROXY_TOKEN_HEADER = "x-fin-terminal-proxy-token";
@@ -109,6 +115,9 @@ export interface BrowserTerminalAppOptions {
   webDist?: string;
   now?: () => number;
   proxyToken?: string;
+  watchlistImportApiKey?: string;
+  watchlistImportModel?: string;
+  watchlistImportUrl?: string;
 }
 
 type PrincipalRequestState = {
@@ -350,6 +359,9 @@ export function createBrowserTerminalApp(options: BrowserTerminalAppOptions = {}
     || process.env.OPENROUTER_MODEL?.trim()
     || process.env.MARKET_MODEL_ID?.trim()
     || DEFAULT_MODEL;
+  const watchlistImportApiKey = options.watchlistImportApiKey?.trim() || process.env.WATCHLIST_IMPORT_API_KEY?.trim() || "";
+  const watchlistImportModel = options.watchlistImportModel?.trim() || process.env.WATCHLIST_IMPORT_MODEL?.trim() || "";
+  const watchlistImportUrl = options.watchlistImportUrl?.trim() || process.env.WATCHLIST_IMPORT_URL?.trim() || "";
   const mcpEndpoint = options.mcpEndpoint ?? process.env.UNBROWSER_MCP_URL?.trim();
   const storageRoot = options.storageRoot ?? path.resolve(process.env.MARKET_DATA_DIR?.trim() || "/data", "browser-sessions");
   const webDist = options.webDist ?? path.resolve(process.env.MARKET_ROOT?.trim() || process.cwd(), "dist-web");
@@ -365,6 +377,7 @@ export function createBrowserTerminalApp(options: BrowserTerminalAppOptions = {}
   const cryptoInFlight = new Map<boolean, Promise<CryptoCacheEntry["result"]>>();
   const quoteBatchCache = new Map<string, QuoteBatchEntry>();
   const quoteBatchInFlight = new Map<string, Promise<QuoteBatchEntry>>();
+  const screenshotImportLimiter = new WatchlistScreenshotImportLimiter();
   let mcpReadiness: McpReadiness | undefined;
   let mcpReadinessInFlight: Promise<boolean> | undefined;
 
@@ -585,6 +598,17 @@ export function createBrowserTerminalApp(options: BrowserTerminalAppOptions = {}
 
   const getPrincipal = (req: Request): string => (req as Request & { browserPrincipal?: string }).browserPrincipal ?? "local";
 
+  const screenshotImportEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    // The browser entrypoint already holds the server-side OpenRouter key. It
+    // is safe to expose it to the importer only through the module's default
+    // OpenRouter endpoint; custom endpoints still require their own key.
+    ...(openRouterApiKey ? { OPENROUTER_API_KEY: openRouterApiKey } : {}),
+    ...(watchlistImportApiKey ? { WATCHLIST_IMPORT_API_KEY: watchlistImportApiKey } : {}),
+    ...(watchlistImportModel ? { WATCHLIST_IMPORT_MODEL: watchlistImportModel } : {}),
+    ...(watchlistImportUrl ? { WATCHLIST_IMPORT_URL: watchlistImportUrl } : {}),
+  };
+
   app.get("/api/browser/v1/session", (_req, res) => {
     res.json({
       version: 1,
@@ -592,6 +616,34 @@ export function createBrowserTerminalApp(options: BrowserTerminalAppOptions = {}
       features: { broker: true, mcp: Boolean(mcpEndpoint), quotes: true, cryptoPulse: true, persistence: true },
     });
   });
+
+  // Screenshot import is an authenticated browser-terminal capability. Keep
+  // it on this entrypoint as well as the legacy live server: the canary does
+  // not run server/index.ts, so omitting this route turns the UI into a 404.
+  app.post(
+    "/api/watchlist/import",
+    express.raw({ type: "*/*", limit: WATCHLIST_SCREENSHOT_MAX_BYTES }),
+    async (req, res) => {
+      const rate = screenshotImportLimiter.consume(getPrincipal(req));
+      if (!rate.allowed) {
+        res.status(429).json({
+          error: "Screenshot import is temporarily rate limited. Try again shortly.",
+          retryAfterSeconds: Math.ceil((rate.retryAfterMs ?? 0) / 1_000),
+        });
+        return;
+      }
+      try {
+        const image = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+        const result = await extractWatchlistFromScreenshot(image, screenshotImportEnv, request);
+        res.status(200).json(result);
+      } catch (error) {
+        const failure = error instanceof WatchlistScreenshotImportError
+          ? error
+          : new WatchlistScreenshotImportError("Screenshot import failed.", 500);
+        res.status(failure.status).json({ error: failure.message });
+      }
+    },
+  );
 
   // Whole-universe market-map fetch. The canonical extension refreshes ~130
   // symbols per sync; doing that through the per-symbol endpoint below would

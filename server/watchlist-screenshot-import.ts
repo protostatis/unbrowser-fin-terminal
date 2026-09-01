@@ -264,6 +264,7 @@ const SYSTEM_PROMPT = [
 export async function extractWatchlistFromScreenshot(
   image: Buffer,
   env: NodeJS.ProcessEnv = process.env,
+  fetchImpl: typeof fetch = fetch,
 ): Promise<WatchlistScreenshotImportResult> {
   if (image.length === 0 || image.length > WATCHLIST_SCREENSHOT_MAX_BYTES) {
     throw new WatchlistScreenshotImportError("Use a PNG, JPEG, or WebP screenshot smaller than 6 MiB.", 413);
@@ -275,7 +276,7 @@ export async function extractWatchlistFromScreenshot(
   const config = await screenshotImportConfig(env);
   let response: Response;
   try {
-    response = await fetch(config.endpoint, {
+    response = await fetchImpl(config.endpoint, {
       method: "POST",
       headers: {
         authorization: `Bearer ${config.apiKey}`,

@@ -206,9 +206,10 @@ export function WatchlistImport({
         <div className="watchlist-import-backdrop" role="presentation">
           <section
             className="watchlist-import-modal"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="watchlist-import-title"
+           role="dialog"
+           aria-modal="true"
+           aria-labelledby="watchlist-import-title"
+           aria-describedby="watchlist-import-intro"
           >
             <header className="watchlist-import-header">
               <div>
@@ -226,7 +227,7 @@ export function WatchlistImport({
               </button>
             </header>
 
-            <p className="watchlist-import-intro">
+            <p id="watchlist-import-intro" className="watchlist-import-intro">
               The scanner extracts visible instruments and maps crypto tickers to Yahoo pairs, such as BTC to BTC-USD. It never imports balances, prices, or transactions.
             </p>
 

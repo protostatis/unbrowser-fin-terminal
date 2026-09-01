@@ -155,7 +155,15 @@ export function parseChartPayloadToQuote(
 	const price = extendedPrice ?? number("regularMarketPrice") ?? closes.at(-1);
 	if (price === undefined || price === null) throw new Error("quote response contained no market price");
 	const previousClose = number("previousClose") ?? number("chartPreviousClose");
-	const change = previousClose === null ? null : price - previousClose;
+	// Yahoo exposes two different references here. `previousClose` is the
+	// latest regular-session close, while `chartPreviousClose` is the close
+	// immediately before the requested chart range. Movers and quote headers
+	// must follow the selected scope, otherwise WEEK/MONTH silently display the
+	// current daily move even though their chart starts much earlier.
+	const scopeBaseline = cfg.chartScope === "day"
+		? previousClose
+		: number("chartPreviousClose") ?? closes[0] ?? previousClose;
+	const change = scopeBaseline === null ? null : price - scopeBaseline;
 	// Pre/post volume is not part of the public chart meta; the bars also tag it
 	// null there. Opportunistic capture keeps the mover volume leg honest when a
 	// future/alternate feed does ship it. Volumes are aligned with sessions at
@@ -189,7 +197,7 @@ export function parseChartPayloadToQuote(
 		currency: typeof meta.currency === "string" && meta.currency.trim() ? meta.currency.trim().toUpperCase() : "XXX",
 		price,
 		change,
-		changePercent: change === null || previousClose === null || previousClose === 0 ? null : (change / previousClose) * 100,
+		changePercent: change === null || scopeBaseline === null || scopeBaseline === 0 ? null : (change / scopeBaseline) * 100,
 		previousClose,
 		dayLow: number("regularMarketDayLow"),
 		dayHigh: number("regularMarketDayHigh"),

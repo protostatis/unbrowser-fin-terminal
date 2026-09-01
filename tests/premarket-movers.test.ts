@@ -309,6 +309,25 @@ test("parseChartPayloadToQuote honors meta.marketState when present and keeps sa
   assert.equal(quote.chartScope, "week");
 });
 
+test("parseChartPayloadToQuote uses the selected chart range baseline for non-day moves", () => {
+  const payload = makeChartPayload(
+    [
+      { t: REGULAR_START + 500, close: 300 },
+      { t: REGULAR_END - 500, close: 308 },
+    ],
+    { regularMarketPrice: 308, previousClose: 290, chartPreviousClose: 280 },
+  );
+  const quote = parseChartPayloadToQuote("AAPL", payload, {
+    yahooInterval: "15m",
+    includePrePost: false,
+    chartScope: "week",
+  });
+
+  assert.equal(quote.previousClose, 290, "keep the latest daily close for day-chart references");
+  assert.equal(quote.change, 28, "WEEK change starts from chartPreviousClose");
+  assert.ok(Math.abs(quote.changePercent! - 10) < 1e-9);
+});
+
 test("mockMondayChartPayload produces a PRE-session quote through the real parser (as-of-Monday path)", () => {
   // The public feed cannot be observed in PRE on weekends, so the mock is the
   // stand-in that exercises the full as-of-Monday pipeline in CI.
