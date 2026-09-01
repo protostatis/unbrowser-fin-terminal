@@ -30,6 +30,7 @@ async function withServer<T>(
 		},
 		openRouterApiKey: "server-secret",
 		openRouterModel: "server/model",
+		watchlistImportModel: "vision/model",
 		mcpEndpoint: "https://mcp.test/mcp",
 		storageRoot: root,
 		webDist: "",
@@ -90,6 +91,31 @@ test("authenticated browser broker overrides model and never forwards browser au
 
 		const crossOrigin = await fetch(`${base}/api/browser/v1/session`, { headers: { ...headers(), origin: "https://evil.example" } });
 		assert.equal(crossOrigin.status, 403);
+  });
+});
+
+test("authenticated browser broker serves screenshot watchlist import", async () => {
+  let visionBody: Record<string, unknown> | undefined;
+  const fakeFetch: typeof fetch = async (input, init) => {
+    if (String(input) !== "https://openrouter.ai/api/v1/chat/completions") throw new Error(`unexpected upstream ${String(input)}`);
+    visionBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return new Response(JSON.stringify({
+      choices: [{ message: { content: JSON.stringify({ instruments: [
+        { symbol: "AAPL", name: "Apple", assetType: "stock", confidence: 0.99 },
+        { symbol: "BTC", name: "Bitcoin", assetType: "crypto", confidence: 0.96 },
+      ] }) } }],
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+
+  await withServer(fakeFetch, async (base) => {
+    const response = await fetch(`${base}/api/watchlist/import`, {
+      method: "POST",
+      headers: { ...headers(), "content-type": "image/png" },
+      body: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual((await response.json()).candidates.map((candidate: { symbol: string }) => candidate.symbol), ["AAPL", "BTC-USD"]);
+    assert.equal(visionBody?.model, "vision/model");
   });
 });
 

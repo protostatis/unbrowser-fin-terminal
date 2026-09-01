@@ -201,7 +201,7 @@ body,
 }
 
 .browser-alpha-connect button,
-.browser-alpha-banner button {
+.browser-alpha-disconnect {
   padding: 8px 12px;
   color: #c9d1d9;
   background: #161b22;
@@ -211,7 +211,7 @@ body,
 }
 
 .browser-alpha-connect button:hover,
-.browser-alpha-banner button:hover {
+.browser-alpha-disconnect:hover {
   border-color: #58a6ff;
 }
 
@@ -228,17 +228,49 @@ body,
 }
 
 .browser-alpha-banner {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  justify-content: space-between;
   gap: 12px;
-  padding: 6px 12px 0;
+  min-height: 30px;
+  padding: 5px 12px 4px;
 }
 
-.browser-alpha-banner button {
+.browser-alpha-session-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.browser-alpha-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+}
+
+.browser-alpha-disconnect {
   padding: 3px 7px;
   color: #8b949e;
   font-size: 11px;
+}
+
+.browser-alpha-disconnect:focus-visible {
+  outline: 2px solid #58a6ff;
+  outline-offset: 2px;
+}
+
+/* The importer shares the banner action row with Disconnect. Keeping it in
+ * normal flow prevents it from covering the terminal's delayed-status text. */
+.browser-alpha-banner .watchlist-import-trigger {
+  position: static;
+  top: auto;
+  right: auto;
+  z-index: auto;
+  min-height: 24px;
+  padding: 3px 8px;
 }
 
 .browser-alpha-toast {

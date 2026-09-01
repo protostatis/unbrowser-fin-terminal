@@ -392,8 +392,25 @@ export function BrowserAlphaApp({ authenticated = false }: { authenticated?: boo
 		<div className="terminal browser-alpha-shell" ref={containerRef} data-render-version={renderVersion}>
 			<span ref={rulerRef} className="term-row ruler" aria-hidden="true">M</span>
 			<div className="browser-alpha-banner">
-				{authenticated ? "AUTHENTICATED · SERVER BROKER · PRIVATE SESSION" : "BROWSER ALPHA · EPHEMERAL · BYOK IN MEMORY"}
-				<button onClick={() => void dispose()}>{authenticated ? "Disconnect session" : "Disconnect &amp; clear key"}</button>
+				<span className="browser-alpha-session-label">
+					{authenticated ? "AUTHENTICATED · SERVER BROKER · PRIVATE SESSION" : "BROWSER ALPHA · EPHEMERAL · BYOK IN MEMORY"}
+				</span>
+				<div className="browser-alpha-actions">
+					{!evidenceOpen && (
+						<button
+							type="button"
+							className="watchlist-import-trigger"
+							onClick={() => setWatchlistImportOpen(true)}
+							disabled={!panel || evidenceOpen || Boolean(selectReq)}
+							title="Import a watchlist from a screenshot"
+						>
+							<span aria-hidden="true">+</span> IMPORTER
+						</button>
+					)}
+					<button type="button" className="browser-alpha-disconnect" onClick={() => void dispose()}>
+						{authenticated ? "Disconnect session" : "Disconnect &amp; clear key"}
+					</button>
+				</div>
 			</div>
 			<TerminalFrame
 				rows={renderRows(panel, terminalSize.columns)}
@@ -403,17 +420,6 @@ export function BrowserAlphaApp({ authenticated = false }: { authenticated?: boo
 				onWebAction={handleWebAction}
 				terminalRef={terminalFrameRef}
 			/>
-			{!evidenceOpen && (
-				<button
-					type="button"
-					className="watchlist-import-trigger"
-					onClick={() => setWatchlistImportOpen(true)}
-					disabled={!panel || evidenceOpen || Boolean(selectReq)}
-					title="Import a watchlist from a screenshot"
-				>
-					<span aria-hidden="true">+</span> IMPORTER
-				</button>
-			)}
 			<div className="status-line">
 				{dossier && (
 					<EvidenceControl
