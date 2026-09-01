@@ -20,6 +20,7 @@ export interface InteractionOverlayProps {
   state?: TerminalFrameState;
   disabled: boolean;
   onAction(action: TerminalWebAction): void;
+  onInput?(data: string): void;
   onReturnToTerminal?(): void;
 }
 
@@ -29,6 +30,7 @@ export function InteractionOverlay({
   state,
   disabled,
   onAction,
+  onInput,
   onReturnToTerminal,
 }: InteractionOverlayProps) {
   const [open, setOpen] = useState(false);
@@ -59,6 +61,7 @@ export function InteractionOverlay({
     paneModel !== undefined && paneModel.panes.length > 1;
 
   const isTicker = state?.mode === "ticker";
+  const hasMarketViewToggle = state?.mode === "market" && state.screen?.toUpperCase() === "MARKET";
   const hasItems = items.length > 0;
   const hasScroll = scrollCtrls.some((c) => c.scrollable);
 
@@ -80,7 +83,22 @@ export function InteractionOverlay({
     [actionDisabled, onAction, onReturnToTerminal],
   );
 
-  const toggleOpen = useCallback(() => setOpen((v) => !v), []);
+  const toggleOpen = useCallback(() => {
+    setOpen((v) => !v);
+    // The overlay is a mouse/touch aid, not a second terminal focus model.
+    // Keep the terminal hot after opening or closing it so normal shortcuts
+    // such as G continue to work immediately.
+    setTimeout(() => onReturnToTerminal?.(), 0);
+  }, [onReturnToTerminal]);
+
+  const emitInput = useCallback(
+    (input: string) => {
+      if (disabled || !state || cacheLocked || searching) return;
+      onInput?.(input);
+      setTimeout(() => onReturnToTerminal?.(), 0);
+    },
+    [cacheLocked, disabled, onInput, onReturnToTerminal, searching, state],
+  );
 
   if (dismissed) return null;
 
@@ -106,11 +124,21 @@ export function InteractionOverlay({
         <span aria-hidden="true" className="interaction-toggle-chevron">
           {open ? "▾" : "▸"}
         </span>
+        <span aria-hidden="true" className="interaction-toggle-label">CTRL</span>
       </button>
 
       {/* Collapsible panel */}
       {open && (
-        <div className="interaction-panel" id="interaction-panel">
+        <div
+          className="interaction-panel"
+          id="interaction-panel"
+          role="region"
+          aria-labelledby="interaction-panel-title"
+        >
+          <div className="interaction-panel-head">
+            <strong id="interaction-panel-title">MARKET CONTROLS</strong>
+            <span>{isTicker ? state?.symbol || "TICKER" : state?.screen || "MARKET"}</span>
+          </div>
           {/* ── Selectable list ─────────────────────────────────────── */}
           {hasItems && (
             <div
@@ -294,6 +322,19 @@ export function InteractionOverlay({
             </div>
           )}
 
+          {hasMarketViewToggle && onInput && (
+            <button
+              type="button"
+              className="interaction-market-toggle"
+              disabled={disabled || cacheLocked || searching}
+              onClick={() => emitInput("g")}
+              aria-label={state?.marketView === "crypto" ? "Switch to global market view" : "Switch to crypto market view"}
+            >
+              <span className="interaction-market-toggle-key">G</span>
+              <span>{state?.marketView === "crypto" ? "GLOBAL VIEW" : "CRYPTO PULSE"}</span>
+            </button>
+          )}
+
           {/* ── Dismiss the corner toggle entirely ─────────────────────── */}
           <button
             type="button"
@@ -301,6 +342,7 @@ export function InteractionOverlay({
             onClick={() => {
               setDismissed(true);
               setOpen(false);
+              setTimeout(() => onReturnToTerminal?.(), 0);
             }}
           >
             Hide controls

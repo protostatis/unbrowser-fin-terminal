@@ -33,7 +33,14 @@ import {
   WATCHLIST_SCREENSHOT_MAX_BYTES,
   WatchlistScreenshotImportError,
   WatchlistScreenshotImportLimiter,
+  validateWatchlistScreenshotImport,
 } from "./watchlist-screenshot-import.js";
+import {
+  createPersistentProviderBudget,
+  estimateChatProviderCost,
+  providerBudgetConfigFromEnv,
+  type ProviderBudgetConfig,
+} from "./provider-budget.js";
 
 const USER_HEADER = "x-fin-terminal-user";
 const PROXY_TOKEN_HEADER = "x-fin-terminal-proxy-token";
@@ -118,6 +125,7 @@ export interface BrowserTerminalAppOptions {
   watchlistImportApiKey?: string;
   watchlistImportModel?: string;
   watchlistImportUrl?: string;
+  providerBudget?: Partial<ProviderBudgetConfig>;
 }
 
 type PrincipalRequestState = {
@@ -378,6 +386,11 @@ export function createBrowserTerminalApp(options: BrowserTerminalAppOptions = {}
   const quoteBatchCache = new Map<string, QuoteBatchEntry>();
   const quoteBatchInFlight = new Map<string, Promise<QuoteBatchEntry>>();
   const screenshotImportLimiter = new WatchlistScreenshotImportLimiter();
+  const providerBudget = createPersistentProviderBudget({
+    filePath: path.join(storageRoot, "provider-budget.json"),
+    now,
+    config: options.providerBudget ?? providerBudgetConfigFromEnv(),
+  });
   let mcpReadiness: McpReadiness | undefined;
   let mcpReadinessInFlight: Promise<boolean> | undefined;
 
@@ -632,8 +645,29 @@ export function createBrowserTerminalApp(options: BrowserTerminalAppOptions = {}
         });
         return;
       }
+      const image = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
       try {
-        const image = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+        await validateWatchlistScreenshotImport(image, screenshotImportEnv);
+      } catch (error) {
+        const failure = error instanceof WatchlistScreenshotImportError
+          ? error
+          : new WatchlistScreenshotImportError("Screenshot import is not configured.", 503);
+        res.status(failure.status).json({ error: failure.message });
+        return;
+      }
+      let budget;
+      try {
+        budget = await providerBudget.consume(getPrincipal(req), "import", providerBudget.config.importEstimateUsd);
+      } catch {
+        safeUpstreamFailure(res, 503);
+        return;
+      }
+      if (!budget.allowed) {
+        res.setHeader("retry-after", String(budget.retryAfterSeconds));
+        res.status(429).json({ error: budget.reason === "principal-quota" ? "Daily watchlist import limit reached" : "Daily provider budget reached" });
+        return;
+      }
+      try {
         const result = await extractWatchlistFromScreenshot(image, screenshotImportEnv, request);
         res.status(200).json(result);
       } catch (error) {
@@ -870,6 +904,22 @@ export function createBrowserTerminalApp(options: BrowserTerminalAppOptions = {}
     try {
       if (!openRouterApiKey) {
         res.status(503).json({ error: "Research broker is not configured" });
+        return;
+      }
+      let budget;
+      try {
+        budget = await providerBudget.consume(
+          principal,
+          "research",
+          estimateChatProviderCost(req.body, readMaxOutputTokens(), providerBudget.config),
+        );
+      } catch {
+        safeUpstreamFailure(res, 503);
+        return;
+      }
+      if (!budget.allowed) {
+        res.setHeader("retry-after", String(budget.retryAfterSeconds));
+        res.status(429).json({ error: budget.reason === "principal-quota" ? "Daily research limit reached" : "Daily provider budget reached" });
         return;
       }
       const body: JsonRecord = {

@@ -45,6 +45,9 @@ export function WatchlistImport({
   onApply(mode: ImportMode, symbols: string[]): Promise<WatchlistImportResult>;
 }) {
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const modalRef = useRef<HTMLElement>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
+  const previouslyFocusedRef = useRef<HTMLElement | null>(null);
   const uploadAbortRef = useRef<AbortController>();
   const uploadRequestIdRef = useRef(0);
   const loadingRef = useRef(false);
@@ -80,6 +83,19 @@ export function WatchlistImport({
     setCandidates([]);
     setSelected(new Set());
     if (fileInputRef.current) fileInputRef.current.value = "";
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    previouslyFocusedRef.current = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+    const focusFrame = requestAnimationFrame(() => closeButtonRef.current?.focus());
+    return () => {
+      cancelAnimationFrame(focusFrame);
+      previouslyFocusedRef.current?.focus({ preventScroll: true });
+      previouslyFocusedRef.current = null;
+    };
   }, [open]);
 
   useEffect(() => () => {
@@ -162,6 +178,27 @@ export function WatchlistImport({
     return { symbols, invalid };
   };
 
+  const handleModalKeyDown = (event: React.KeyboardEvent<HTMLElement>) => {
+    if (event.key !== "Tab") return;
+    const modal = modalRef.current;
+    if (!modal) return;
+    const focusable = [
+      ...modal.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), input:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+      ),
+    ];
+    const first = focusable[0];
+    const last = focusable.at(-1);
+    if (!first || !last) return;
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
+
   const apply = async (mode: ImportMode) => {
     if (loadingRef.current || applyingRef.current) return;
     const { symbols, invalid } = selectedSymbols();
@@ -205,11 +242,14 @@ export function WatchlistImport({
       {open && (
         <div className="watchlist-import-backdrop" role="presentation">
           <section
+            ref={modalRef}
             className="watchlist-import-modal"
-           role="dialog"
-           aria-modal="true"
-           aria-labelledby="watchlist-import-title"
-           aria-describedby="watchlist-import-intro"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="watchlist-import-title"
+            aria-describedby="watchlist-import-intro"
+            aria-busy={loading || applying}
+            onKeyDown={handleModalKeyDown}
           >
             <header className="watchlist-import-header">
               <div>
@@ -219,11 +259,12 @@ export function WatchlistImport({
               <button
                 type="button"
                 className="watchlist-import-close"
+                ref={closeButtonRef}
                 onClick={() => onOpenChange(false)}
                 aria-label="Close screenshot import"
                 disabled={applying}
               >
-                x
+                ×
               </button>
             </header>
 
@@ -236,6 +277,7 @@ export function WatchlistImport({
               className="watchlist-import-file-input"
               type="file"
               accept="image/png,image/jpeg,image/webp"
+              tabIndex={-1}
               onChange={handleFileChange}
               disabled={loading || applying}
             />
@@ -257,7 +299,7 @@ export function WatchlistImport({
               <div className="watchlist-import-review">
                 <div className="watchlist-import-review-heading">
                   <strong>REVIEW {candidates.length} SYMBOL{candidates.length === 1 ? "" : "S"}</strong>
-                  <span>Edit Yahoo symbols before applying.</span>
+                  <span>{selected.size}/{candidates.length} selected · Edit Yahoo symbols before applying.</span>
                 </div>
                 <div className="watchlist-import-candidates">
                   {candidates.map((candidate) => {

@@ -111,16 +111,28 @@ deployment fallback for a normal terminal release.
   application commit and the resulting GHCR manifest digest in the infra
   release; never point infra at a mutable tag or a locally built image.
 - Caddy owns authenticated-terminal route authorization and injects its terminal
-  proxy token. For public live, Caddy must strip and overwrite `X-Real-IP`; the
+  proxy token. The browser-owned route uses a dedicated forward-auth policy for
+  any approved signed-in UnchainedSky account; the legacy Pi singleton keeps its
+  separate administrator/allowlist policy. For public live, Caddy must strip and overwrite `X-Real-IP`; the
   gateway trusts that value only when Caddy also strips and overwrites
   `X-Fin-Terminal-Edge-Token` with `PUBLIC_EDGE_PROXY_TOKEN`, and enforces both
   visitor-IP and proxy-peer admission limits. Do not expose either terminal
   container port directly or bypass Caddy.
+- The browser-owned route persists per-account daily research/import reservations
+  and a global estimated provider-cost circuit breaker under its `/data` volume.
+  The human-readable JSON ledger is protected by a SQLite sidecar transaction
+  lock so overlapping broker processes cannot lose reservations.
+  Reservations are conservative attempts rather than post-hoc billing: cheap
+  input/configuration validation happens first, and a provider failure still
+  consumes the reserved allowance. This is intentional fail-closed behavior.
+  Keep the reviewed limits in the browser Compose overlay and retain a matching
+  provider-side spend cap; do not expose the browser route without both bounds.
 - Production research uses the Docker-internal `unbrowser-mcp` endpoint. Do
   not substitute the shared public development endpoint.
-- The terminal remains a singleton per process. Approved operators share the
-  persistent research archive and should coordinate ownership of the active
-  WebSocket session.
+- The legacy Pi terminal remains a singleton per process. Approved operators
+  share its persistent research archive and should coordinate ownership of the
+  active WebSocket session; the browser-owned service is account-scoped and
+  uses the durable provider budget described above.
 
 ## Research Cache Pre-Warming Configuration
 

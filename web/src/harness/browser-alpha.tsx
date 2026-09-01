@@ -1,7 +1,8 @@
 /**
- * Browser alpha — one private, ephemeral session backed by the canonical
- * market-terminal extension. The API key is retained only by the live runtime
- * and is never written to IndexedDB, the URL, or a session message.
+ * Browser-owned terminal harness backed by the canonical market-terminal
+ * extension. Personal BYOK sessions remain ephemeral; authenticated sessions
+ * use the server broker and account-scoped persistence. Provider credentials
+ * are never written to IndexedDB, the URL, or a session message.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { TerminalFrame } from "../TerminalFrame";
@@ -56,6 +57,7 @@ export function BrowserAlphaApp({ authenticated = false }: { authenticated?: boo
 	const [connected, setConnected] = useState(false);
 	const [connecting, setConnecting] = useState(false);
 	const [error, setError] = useState<string | null>(null);
+	const [notice, setNotice] = useState<string | null>(null);
 	const [panel, setPanel] = useState<Panel | null>(null);
 	const [panelWasOpened, setPanelWasOpened] = useState(false);
 	const [selectReq, setSelectReq] = useState<{ id: string; title: string; options: string[] } | null>(null);
@@ -64,6 +66,10 @@ export function BrowserAlphaApp({ authenticated = false }: { authenticated?: boo
 	const [evidenceOpen, setEvidenceOpen] = useState(false);
 	const [watchlistImportOpen, setWatchlistImportOpen] = useState(false);
 	const runtimeRef = useRef<BrowserRuntime | null>(null);
+	const connectInFlightRef = useRef<Promise<void> | null>(null);
+	const startupControllerRef = useRef<AbortController | null>(null);
+	const startupLeaseRef = useRef<BrowserRuntimeLease | null>(null);
+	const mountedRef = useRef(true);
 	const containerRef = useRef<HTMLDivElement>(null);
 	const rulerRef = useRef<HTMLSpanElement>(null);
 	const terminalFrameRef = useRef<HTMLDivElement>(null);
@@ -74,7 +80,15 @@ export function BrowserAlphaApp({ authenticated = false }: { authenticated?: boo
 
 	const dispose = useCallback(async () => {
 		const runtime = runtimeRef.current;
-		if (!runtime || runtime.disposed) return;
+		if (!runtime) {
+			startupControllerRef.current?.abort();
+			startupControllerRef.current = null;
+			const startupLease = startupLeaseRef.current;
+			startupLeaseRef.current = null;
+			if (startupLease) await startupLease.release();
+			return;
+		}
+		if (runtime.disposed) return;
 		runtime.disposed = true;
 		runtime.controller.abort();
 		runtime.sendInput = () => {};
@@ -94,15 +108,28 @@ export function BrowserAlphaApp({ authenticated = false }: { authenticated?: boo
 			setSelectReq(null);
 			setConnected(false);
 			setApiKey("");
+			setNotice(null);
 			setEvidenceOpen(false);
 			setWatchlistImportOpen(false);
 			await runtime.lease.release();
 		}
 	}, []);
 
-	useEffect(() => () => { void dispose(); }, [dispose]);
+ useEffect(() => {
+		mountedRef.current = true;
+		return () => {
+			mountedRef.current = false;
+			// React development StrictMode performs a synthetic cleanup followed by
+			// an immediate setup. Defer disposal one microtask so that replay does
+			// not abort the startup attempt that the second setup is about to reuse;
+			// a real unmount remains false when the microtask runs.
+			queueMicrotask(() => {
+				if (!mountedRef.current) void dispose();
+			});
+		};
+	}, [dispose]);
 
-	const connect = useCallback(async () => {
+	const connectInternal = useCallback(async () => {
 		if (connecting || runtimeRef.current) return;
 		const secret = apiKey.trim();
 		if (!authenticated && !secret) {
@@ -111,16 +138,24 @@ export function BrowserAlphaApp({ authenticated = false }: { authenticated?: boo
 		}
 		setConnecting(true);
 		setError(null);
+		setNotice(null);
+		const controller = new AbortController();
+		startupControllerRef.current = controller;
 		let lease: BrowserRuntimeLease | undefined;
 		let runtime: BrowserRuntime | undefined;
 		let resetExtension: (() => void) | undefined;
 		try {
 			lease = await acquireBrowserRuntimeLock();
-			const controller = new AbortController();
+			startupLeaseRef.current = lease;
+			if (!mountedRef.current) {
+				await lease.release();
+				return;
+			}
 			let sessionModel = model.trim() || DEFAULT_MODEL;
 			if (authenticated) {
 				const sessionResponse = await fetch(browserApiUrl("/api/browser/v1/session"), {
 					headers: { accept: "application/json" },
+					signal: controller.signal,
 				});
 				if (!sessionResponse.ok) throw new Error(`authenticated browser session returned HTTP ${sessionResponse.status}`);
 				const sessionConfig = await sessionResponse.json() as { model?: unknown };
@@ -128,16 +163,21 @@ export function BrowserAlphaApp({ authenticated = false }: { authenticated?: boo
 				sessionModel = sessionConfig.model.trim();
 				setModel(sessionModel);
 			}
+			if (!mountedRef.current || controller.signal.aborted) {
+				await lease.release();
+				return;
+			}
 			const mcpEndpoint = authenticated
 				? browserApiUrl("/api/browser/v1/mcp")
 				: import.meta.env.VITE_UNBROWSER_MCP_URL?.trim() || undefined;
 			const apiEndpoint = authenticated ? browserApiUrl("/api/browser/v1/chat/completions") : undefined;
 			const storage = authenticated ? createBrowserHttpStoragePort() : undefined;
 			const watchlistPath = storage?.resolveDataPath("market-watchlist.json", "/browser");
-			const savedWatchlist = storage && watchlistPath
-				? await storage.readJsonFile(watchlistPath)
-				: undefined;
-			const savedSymbols = savedWatchlist && typeof savedWatchlist === "object" && !Array.isArray(savedWatchlist)
+				const savedWatchlist = storage && watchlistPath
+					? await storage.readJsonFile(watchlistPath)
+					: undefined;
+				if (!mountedRef.current || controller.signal.aborted) return;
+				const savedSymbols = savedWatchlist && typeof savedWatchlist === "object" && !Array.isArray(savedWatchlist)
 				&& Array.isArray((savedWatchlist as { symbols?: unknown }).symbols)
 				? (savedWatchlist as { symbols: unknown[] }).symbols.filter((symbol): symbol is string => typeof symbol === "string")
 				: [];
@@ -164,7 +204,10 @@ export function BrowserAlphaApp({ authenticated = false }: { authenticated?: boo
 					setRenderVersion((version) => version + 1);
 				},
 				onRenderRequest: () => setRenderVersion((version) => version + 1),
-				onNotify: (message, level) => setError(`${level.toUpperCase()}: ${message}`),
+				onNotify: (message, level) => {
+					setNotice(null);
+					setError(`${level.toUpperCase()}: ${message}`);
+				},
 				onSelect: (id, title, options) => {
 					setSelectReq({ id, title, options });
 					return Promise.resolve(undefined as string | undefined);
@@ -197,8 +240,9 @@ export function BrowserAlphaApp({ authenticated = false }: { authenticated?: boo
 				storage,
 				events: { notify: (message, level) => setError(`${level.toUpperCase()}: ${message}`) },
 			});
-			const extensionModule = await import("../../../.pi/extensions/market-terminal.js");
-			const configure = extensionModule.configureMarketTerminalRuntime;
+				const extensionModule = await import("../../../.pi/extensions/market-terminal.js");
+				if (!mountedRef.current || controller.signal.aborted) return;
+				const configure = extensionModule.configureMarketTerminalRuntime;
 			resetExtension = extensionModule.resetMarketTerminalRuntime;
 			if (typeof configure !== "function" || typeof resetExtension !== "function") throw new Error("Browser runtime configuration seam is unavailable");
 			configure(ports, { browserSession: true });
@@ -219,9 +263,15 @@ export function BrowserAlphaApp({ authenticated = false }: { authenticated?: boo
 				setTerminalRows: (rows) => { ui.webTui.terminal.rows = rows; },
 				disposed: false,
 			};
-			runtimeRef.current = runtime;
-			await host.fireEventAsync({ type: "session_start", reason: "startup" }, ctx);
-			// The command remains pending while the terminal panel is open.
+				runtimeRef.current = runtime;
+				startupControllerRef.current = null;
+				startupLeaseRef.current = null;
+				await host.fireEventAsync({ type: "session_start", reason: "startup" }, ctx);
+				if (!mountedRef.current) {
+					await dispose();
+					return;
+				}
+				// The command remains pending while the terminal panel is open.
 			void Promise.resolve(command.handler("", ctx)).catch((commandError: unknown) => {
 				if (!runtime?.disposed) setError(commandError instanceof Error ? commandError.message : String(commandError));
 			});
@@ -236,20 +286,55 @@ export function BrowserAlphaApp({ authenticated = false }: { authenticated?: boo
 				resetExtension?.();
 				if (lease) await lease.release();
 			}
-			setApiKey("");
-			setPanel(null);
-			setPanelWasOpened(false);
-			setSelectReq(null);
-			setError(connectError instanceof Error ? connectError.message : String(connectError));
+			if (mountedRef.current) {
+				setApiKey("");
+				setPanel(null);
+				setPanelWasOpened(false);
+				setSelectReq(null);
+				setNotice(null);
+				setError(connectError instanceof Error ? connectError.message : String(connectError));
+			}
 		} finally {
-			setConnecting(false);
+			if (runtimeRef.current !== runtime) {
+				if (startupLeaseRef.current === lease) startupLeaseRef.current = null;
+				if (lease) await lease.release();
+			}
+			if (startupControllerRef.current === controller) startupControllerRef.current = null;
+			if (mountedRef.current) setConnecting(false);
 		}
 	}, [apiKey, authenticated, connecting, dispose, model]);
+
+	const connect = useCallback(async () => {
+		if (runtimeRef.current) return;
+		if (connectInFlightRef.current) return connectInFlightRef.current;
+		const attempt = connectInternal();
+		connectInFlightRef.current = attempt;
+		try {
+			await attempt;
+		} finally {
+			if (connectInFlightRef.current === attempt) connectInFlightRef.current = null;
+		}
+	}, [connectInternal]);
+
+	useEffect(() => {
+		if (authenticated) void connect();
+		// The in-flight guard makes this safe under StrictMode's effect replay.
+		// Retry is explicit after a startup failure rather than an infinite loop.
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [authenticated]);
+
+	const focusTerminal = useCallback(() => {
+		requestAnimationFrame(() => terminalFrameRef.current?.focus({ preventScroll: true }));
+	}, []);
 
 	const sendInput = useCallback((data: string) => {
 		const runtime = runtimeRef.current;
 		runtime?.sendInput(data);
-	}, []);
+		// Browser controls may retain focus after sending a terminal shortcut.
+		// Return focus to the terminal so the next key (for example G) is not
+		// treated as an inert keypress on the button that was just clicked.
+		focusTerminal();
+	}, [focusTerminal]);
 
 	const terminalState = (panel?.debugState?.() ?? undefined) as TerminalFrameState | undefined;
 	const researchStatus = researchActivityStatus(terminalState);
@@ -267,14 +352,14 @@ export function BrowserAlphaApp({ authenticated = false }: { authenticated?: boo
 		symbols: string[],
 	): Promise<WatchlistImportResult> => {
 		if (!panel?.applyWatchlist || evidenceOpen || selectReq) return { ok: false, error: "The browser market session is not ready to update the watchlist." };
-		panel.applyWatchlist(symbols, mode);
+		const update = panel.applyWatchlist(symbols, mode);
+		setError(null);
+		setNotice(mode === "replace"
+			? `WATCHLIST REPLACED · ${update.symbols.length} ON WATCH`
+			: `${update.added} SYMBOL${update.added === 1 ? "" : "S"} ADDED TO WATCHLIST`);
 		setRenderVersion((version) => version + 1);
 		return { ok: true };
 	}, [evidenceOpen, panel, selectReq]);
-
-	const focusTerminal = useCallback(() => {
-		requestAnimationFrame(() => terminalFrameRef.current?.focus({ preventScroll: true }));
-	}, []);
 
 	const handleWatchlistImportOpenChange = useCallback((open: boolean) => {
 		setWatchlistImportOpen(open);
@@ -296,7 +381,8 @@ export function BrowserAlphaApp({ authenticated = false }: { authenticated?: boo
 		void Promise.resolve(runtime.marketCommand.handler("", runtime.ctx)).catch((commandError: unknown) => {
 			if (!runtime.disposed) setError(commandError instanceof Error ? commandError.message : String(commandError));
 		});
-	}, []);
+		focusTerminal();
+	}, [focusTerminal]);
 
 	const isEditableTarget = (target: EventTarget | null): boolean => {
 		if (!(target instanceof HTMLElement)) return false;
@@ -371,10 +457,23 @@ export function BrowserAlphaApp({ authenticated = false }: { authenticated?: boo
 	}, [connected, evidenceOpen, focusTerminal, resolveSelect, selectReq, sendInput, watchlistImportOpen]);
 
 	if (!connected) {
+		if (authenticated) {
+			return (
+				<div className="terminal browser-alpha-connect-shell">
+					<div className="browser-alpha-connect browser-alpha-starting">
+						<div className="browser-alpha-eyebrow">AUTHENTICATED · SERVER BROKER · ACCOUNT WORKSPACE</div>
+						<h2>{error ? "Couldn’t open your market terminal" : "Opening your market terminal…"}</h2>
+						<p>{error ? "Your account session is signed in, but the browser terminal could not start." : "Loading your account-scoped watchlist, research broker, and market map."}</p>
+						{error && <div className="browser-alpha-error" role="alert">{error}</div>}
+						{error && <button type="button" onClick={() => void connect()} disabled={connecting}>Retry</button>}
+					</div>
+				</div>
+			);
+		}
 		return (
 			<div className="terminal browser-alpha-connect-shell">
 			<div className="browser-alpha-connect">
-				<div className="browser-alpha-eyebrow">{authenticated ? "AUTHENTICATED · SERVER BROKER · PRIVATE SESSION" : "BROWSER ALPHA · EPHEMERAL · BYOK IN MEMORY"}</div>
+				<div className="browser-alpha-eyebrow">{authenticated ? "AUTHENTICATED · SERVER BROKER · ACCOUNT WORKSPACE" : "BROWSER ALPHA · EPHEMERAL · BYOK IN MEMORY"}</div>
 				<h2>{authenticated ? "Open your market terminal" : "Connect your OpenRouter key"}</h2>
 				<p>{authenticated ? "Your account session owns the broker, research, feeds, and archive. No provider key is sent to this browser." : "Stored only in this tab’s memory. Reload or disconnect to clear it. One research worker; scout and pre-cache are disabled."}</p>
 				{!authenticated && <>
@@ -392,24 +491,27 @@ export function BrowserAlphaApp({ authenticated = false }: { authenticated?: boo
 		<div className="terminal browser-alpha-shell" ref={containerRef} data-render-version={renderVersion}>
 			<span ref={rulerRef} className="term-row ruler" aria-hidden="true">M</span>
 			<div className="browser-alpha-banner">
-				<span className="browser-alpha-session-label">
-					{authenticated ? "AUTHENTICATED · SERVER BROKER · PRIVATE SESSION" : "BROWSER ALPHA · EPHEMERAL · BYOK IN MEMORY"}
+					<span className="browser-alpha-session-label">
+						{authenticated ? "AUTHENTICATED · SERVER BROKER · ACCOUNT WORKSPACE" : "BROWSER ALPHA · EPHEMERAL · BYOK IN MEMORY"}
 				</span>
 				<div className="browser-alpha-actions">
 					{!evidenceOpen && (
 						<button
 							type="button"
 							className="watchlist-import-trigger"
-							onClick={() => setWatchlistImportOpen(true)}
+							onClick={() => {
+								setNotice(null);
+								setWatchlistImportOpen(true);
+							}}
 							disabled={!panel || evidenceOpen || Boolean(selectReq)}
 							title="Import a watchlist from a screenshot"
 						>
 							<span aria-hidden="true">+</span> IMPORTER
 						</button>
 					)}
-					<button type="button" className="browser-alpha-disconnect" onClick={() => void dispose()}>
-						{authenticated ? "Disconnect session" : "Disconnect &amp; clear key"}
-					</button>
+					{!authenticated && <button type="button" className="browser-alpha-disconnect" onClick={() => void dispose()}>
+						Disconnect &amp; clear key
+					</button>}
 				</div>
 			</div>
 			<TerminalFrame
@@ -434,6 +536,7 @@ export function BrowserAlphaApp({ authenticated = false }: { authenticated?: boo
 				state={terminalState}
 				disabled={!panel || evidenceOpen || Boolean(selectReq)}
 				onAction={handleWebAction}
+				onInput={sendInput}
 				onReturnToTerminal={focusTerminal}
 			/>
 			<MobileControls
@@ -479,8 +582,9 @@ export function BrowserAlphaApp({ authenticated = false }: { authenticated?: boo
 					</div>
 				</div>
 			)}
-			{evidenceOpen && dossier && <EvidenceInspector dossier={dossier} onClose={() => setEvidenceOpen(false)} />}
-			{error && <div className="browser-alpha-toast">{error}</div>}
+			{evidenceOpen && dossier && <EvidenceInspector dossier={dossier} onClose={() => { setEvidenceOpen(false); focusTerminal(); }} />}
+			{notice && <div className="browser-alpha-notice" role="status">{notice}</div>}
+			{error && <div className="browser-alpha-toast" role="alert">{error}</div>}
 		</div>
 	);
 }

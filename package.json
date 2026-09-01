@@ -18,6 +18,8 @@
     "test": "tsx --test tests/*.test.ts",
     "test:nemo": "tsx scripts/test-nemo.ts",
     "test:e2e": "playwright test",
+    "test:e2e:browser": "playwright test --config=playwright.browser-terminal.config.ts",
+    "test:e2e:browser:dev": "playwright test --config=playwright.browser-terminal.dev.config.ts",
     "capture:trace": "tsx scripts/capture-pi-trace.ts",
     "replay:trace": "tsx scripts/replay-pi-trace.ts"
   },

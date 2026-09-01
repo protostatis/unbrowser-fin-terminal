@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { mkdtemp, rm } from "node:fs/promises";
+import { spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { AddressInfo } from "node:net";
 import { createBrowserTerminalApp } from "../server/browser-terminal.js";
+import { createPersistentProviderBudget } from "../server/provider-budget.js";
+import type { ProviderBudgetConfig } from "../server/provider-budget.js";
 
 const PROXY_TOKEN = "test-proxy-token";
 
@@ -20,6 +24,7 @@ async function withServer<T>(
 	fetchImpl: typeof fetch,
 	fn: (base: string, calls: Array<{ url: string; init?: RequestInit }>) => Promise<T>,
 	now: () => number = Date.now,
+	appOptions: { providerBudget?: Partial<ProviderBudgetConfig> } = {},
 ): Promise<T> {
 	const root = await mkdtemp(path.join(os.tmpdir(), "browser-terminal-test-"));
 	const calls: Array<{ url: string; init?: RequestInit }> = [];
@@ -36,6 +41,7 @@ async function withServer<T>(
 		webDist: "",
 		proxyToken: PROXY_TOKEN,
 		now,
+		...appOptions,
 	});
 	const server = app.listen(0, "127.0.0.1");
 	try {
@@ -117,6 +123,130 @@ test("authenticated browser broker serves screenshot watchlist import", async ()
     assert.deepEqual((await response.json()).candidates.map((candidate: { symbol: string }) => candidate.symbol), ["AAPL", "BTC-USD"]);
     assert.equal(visionBody?.model, "vision/model");
   });
+});
+
+test("invalid screenshot input is rejected before it reserves provider budget", async () => {
+  const fakeFetch: typeof fetch = async () => {
+    throw new Error("provider must not be called");
+  };
+  await withServer(fakeFetch, async (base) => {
+    const response = await fetch(`${base}/api/watchlist/import`, {
+      method: "POST",
+      headers: { ...headers(), "content-type": "image/png" },
+      body: Buffer.from("not-an-image"),
+    });
+    assert.equal(response.status, 415);
+
+    const valid = await fetch(`${base}/api/watchlist/import`, {
+      method: "POST",
+      headers: { ...headers(), "content-type": "image/png" },
+      body: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    });
+    // The provider is deliberately unavailable, but the valid request reaches
+    // the provider path instead of being rejected by the budget reservation.
+    assert.equal(valid.status, 502);
+  }, Date.now, { providerBudget: { principalDailyImportRequests: 1 } });
+});
+
+test("authenticated provider budget caps a principal and survives a restart", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "browser-budget-test-"));
+	try {
+		const config = {
+			principalDailyResearchRequests: 1,
+			principalDailyImportRequests: 1,
+			globalDailyBudgetUsd: 1,
+			inputUsdPerMillionTokens: 1,
+			outputUsdPerMillionTokens: 1,
+			importEstimateUsd: 0.1,
+		};
+		const first = createPersistentProviderBudget({ filePath: path.join(root, "provider-budget.json"), config });
+		assert.equal((await first.consume("account:alice", "research", 0.5)).allowed, true);
+
+		const restarted = createPersistentProviderBudget({ filePath: path.join(root, "provider-budget.json"), config });
+		assert.equal((await restarted.consume("account:alice", "research", 0.5)).reason, "principal-quota");
+		assert.equal((await restarted.consume("account:bob", "research", 0.5)).allowed, true);
+		assert.equal((await restarted.consume("account:carol", "research", 0.5)).reason, "global-budget");
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("provider budget reservations remain atomic across instances", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "browser-budget-lock-test-"));
+  try {
+    const filePath = path.join(root, "provider-budget.json");
+    const config = {
+      principalDailyResearchRequests: 2,
+      principalDailyImportRequests: 1,
+      globalDailyBudgetUsd: 1,
+      inputUsdPerMillionTokens: 1,
+      outputUsdPerMillionTokens: 1,
+      importEstimateUsd: 0.1,
+    };
+    const first = createPersistentProviderBudget({ filePath, config });
+    const second = createPersistentProviderBudget({ filePath, config });
+    const decisions = await Promise.all([
+      first.consume("account:alice", "research", 0.5),
+      second.consume("account:bob", "research", 0.5),
+    ]);
+    assert.deepEqual(decisions.map((decision) => decision.allowed).sort(), [true, true]);
+
+    const restarted = createPersistentProviderBudget({ filePath, config });
+    assert.equal((await restarted.consume("account:carol", "research", 0.5)).reason, "global-budget");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("provider budget reservations remain atomic across child processes", async () => {
+	const root = await mkdtemp(path.join(os.tmpdir(), "browser-budget-process-test-"));
+	try {
+		const filePath = path.join(root, "provider-budget.json");
+		const worker = fileURLToPath(new URL("./provider-budget-worker.ts", import.meta.url));
+		const run = (principal: string): Promise<boolean> => new Promise((resolve, reject) => {
+			const child = spawn(process.execPath, ["--import", "tsx", worker, filePath, principal], {
+				cwd: process.cwd(),
+				stdio: ["ignore", "pipe", "pipe"],
+			});
+			let output = "";
+			let error = "";
+			child.stdout.on("data", (chunk) => { output += String(chunk); });
+			child.stderr.on("data", (chunk) => { error += String(chunk); });
+			child.once("error", reject);
+			child.once("close", (code) => {
+				if (code !== 0) {
+					reject(new Error(`budget worker failed: ${error}`));
+					return;
+				}
+				resolve(JSON.parse(output).allowed === true);
+			});
+		});
+		assert.deepEqual((await Promise.all([run("account:alice"), run("account:bob")])).sort(), [true, true]);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("authenticated chat requests are bounded by the durable provider budget", async () => {
+	const fakeFetch: typeof fetch = async (input) => {
+		if (String(input) !== "https://openrouter.ai/api/v1/chat/completions") throw new Error(`unexpected upstream ${String(input)}`);
+		return new Response(JSON.stringify({ choices: [{ message: { role: "assistant", content: "done" }, finish_reason: "stop" }] }), {
+			status: 200,
+			headers: { "content-type": "application/json" },
+		});
+	};
+
+	await withServer(fakeFetch, async (base) => {
+		const request = () => fetch(`${base}/api/browser/v1/chat/completions`, {
+			method: "POST",
+			headers: headers(),
+			body: JSON.stringify({ messages: [{ role: "user", content: "hello" }] }),
+		});
+		assert.equal((await request()).status, 200);
+		const limited = await request();
+		assert.equal(limited.status, 429);
+		assert.match(await limited.text(), /Daily research limit reached/);
+	}, Date.now, { providerBudget: { principalDailyResearchRequests: 1 } });
 });
 
 test("authenticated broker requires the forwarded origin scheme to match", async () => {

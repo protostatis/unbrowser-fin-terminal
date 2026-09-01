@@ -13,10 +13,13 @@ on:
 
 permissions:
   contents: read
+  checks: read
   packages: write
 
 concurrency:
-  group: browser-terminal-image-${{ github.ref }}
+  # Tag-triggered and manually dispatched releases must serialize together;
+  # checking GHCR for an existing tag is otherwise subject to a TOCTOU race.
+  group: browser-terminal-image-publish
   cancel-in-progress: false
 
 jobs:
@@ -45,6 +48,24 @@ jobs:
           fi
           echo "image_tag=$image_tag" >> "$GITHUB_OUTPUT"
 
+      - name: Require successful CI for this source revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          if [[ "$GITHUB_REF_TYPE" != "tag" && "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::browser images may only be published from a release tag or main"
+            exit 1
+          fi
+          ci_count="$(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?per_page=100" \
+            --jq '[.check_runs[] | select(.name == "test-and-build" and .head_sha == env.GITHUB_SHA and .conclusion == "success")] | length' \
+            | awk '{ total += $1 } END { print total + 0 }')"
+          if [[ "$ci_count" -lt 1 ]]; then
+            echo "::error::successful test-and-build CI was not found for $GITHUB_SHA"
+            exit 1
+          fi
+
       - name: Log in to GHCR
         env:
           CR_PAT: ${{ secrets.GITHUB_TOKEN }}
@@ -58,6 +79,10 @@ jobs:
         run: |
           set -eu
           image="ghcr.io/protostatis/unbrowser-fin-terminal-browser:${IMAGE_TAG}"
+          if docker buildx imagetools inspect "$image" >/dev/null 2>&1; then
+            echo "::error::release tag already exists in GHCR; refusing to overwrite an immutable artifact"
+            exit 1
+          fi
           docker buildx build \
            --platform linux/arm64 \
             --file Dockerfile.browser-terminal \
