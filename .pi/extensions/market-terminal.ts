@@ -6189,8 +6189,16 @@ class MarketHub {
 		const unrankedRows = pulse.unranked;
 		// Fill the pane vertically like MOVERS: capacity tracks available rows
 		// after the head block and the window-status line.
-		const boardReserve = board.length > Math.max(1, bodyRows - head.length - 2) ? 1 : 0;
-		const windowCapacity = Math.max(2, Math.min(board.length, bodyRows - head.length - 2 - boardReserve));
+		const wideCrypto = width >= 84 && terminalRows(this.tui) >= 24;
+		// Compact screens reserve a bounded chart budget before sizing the board.
+		// The previous layout let the board, unranked row, and movers strip consume
+		// the viewport before the selected chart could be reached.
+		const compactChartReserve = Math.min(8, Math.max(4, bodyRows - head.length - 6));
+		const boardReserve = board.length > Math.max(1, bodyRows - head.length - (wideCrypto ? 2 : compactChartReserve)) ? 1 : 0;
+		const windowCapacity = Math.max(2, Math.min(
+			board.length,
+			bodyRows - head.length - (wideCrypto ? 2 : compactChartReserve) - boardReserve,
+		));
 		const window = selectionWindow(board, this.cryptoSelected, windowCapacity);
 		const boardBlock = [
 			fit(`${th.bold(th.fg("success", "HOTTEST"))}•${th.bold(th.fg("error", "COLDEST"))} · RELATIVE 24H`),
@@ -6251,8 +6259,11 @@ class MarketHub {
 				const deltaBase = chartQuote.chartScope === "day" ? chartQuote.previousClose ?? null : chartQuote.points[0] ?? null;
 				chartBlock.push(fit(`${th.bold(th.fg("accent", "PRICE CHART"))}  ${th.bold(th.fg("text", chartQuote.symbol))} ${th.bold(th.fg(direction, `${dollars(chartQuote.price, chartQuote.currency)} ${percent(chartQuote.changePercent)}`))}`));
 				chartBlock.push(fit(th.fg("dim", `  ${CHART_SCOPE_CONFIGS[this.chartScope].label} · ${chartQuote.chartScope === "day" ? `${chartQuote.interval} · PRE/REG/POST` : chartQuote.interval} · J open · K why · E watch`)));
-				const chartHeight = Math.max(2, Math.min(20, bodyRows - 4, chartQuote.points.length));
-				for (const row of chartLines(chartQuote.points, Math.floor(width * 0.39), (text) => th.fg("success", text), (text) => th.fg("dim", text), chartQuote.chartScope === "day" ? chartQuote.previousClose : undefined, chartHeight, chartQuote.pointTimes, chartQuote.pointSessions, chartQuote.timezone, chartQuote.interval, (value) => dollars(value, chartQuote.currency), undefined, undefined, chartQuote.chartScope, "candles", undefined, (text) => th.fg("error", text), chartQuote.pointVolumes, deltaBase, chartQuote.pointOpens, chartQuote.pointHighs, chartQuote.pointLows)) chartBlock.push(fit(row));
+				const chartHeight = wideCrypto
+					? Math.max(2, Math.min(20, bodyRows - 4, chartQuote.points.length))
+					: Math.max(2, Math.min(8, bodyRows - head.length - 6, chartQuote.points.length));
+				const chartWidth = wideCrypto ? Math.floor(width * 0.39) : width;
+				for (const row of chartLines(chartQuote.points, chartWidth, (text) => th.fg("success", text), (text) => th.fg("dim", text), chartQuote.chartScope === "day" ? chartQuote.previousClose : undefined, chartHeight, chartQuote.pointTimes, chartQuote.pointSessions, chartQuote.timezone, chartQuote.interval, (value) => dollars(value, chartQuote.currency), undefined, undefined, chartQuote.chartScope, "candles", undefined, (text) => th.fg("error", text), chartQuote.pointVolumes, deltaBase, chartQuote.pointOpens, chartQuote.pointHighs, chartQuote.pointLows)) chartBlock.push(fit(row));
 				if (chartQuote.dayLow !== null || chartQuote.dayHigh !== null || chartQuote.volume !== null) {
 					chartBlock.push(fit(th.fg("dim", `  Range ${dollars(chartQuote.dayLow, chartQuote.currency)} – ${dollars(chartQuote.dayHigh, chartQuote.currency)} · Vol ${compactNumber(chartQuote.volume)}`)));
 				}
@@ -6262,14 +6273,18 @@ class MarketHub {
 			chartBlock.push(fit(th.fg("dim", "  Select a mover to see its chart here.")));
 		}
 
-		if (width >= 84 && terminalRows(this.tui) >= 24) {
+		if (wideCrypto) {
 			// Natural-height two-column board: the left list fills its capacity,
 			// the right chart renders to the pane; the full-width strip sits
 			// right under them. twoColumn pads the shorter column with blanks.
 			lines.push(...twoColumn([...head, ...boardBlock], [...chartBlock, ""], width, 0));
 			lines.push(...stripBlock);
 		} else {
-			lines.push(...stretchBlocks([head, boardBlock, unrankedBlock, chartBlock, stripBlock], bodyRows, "", 1));
+			// On compact screens the selected chart is part of the primary flow.
+			// Unranked assets and the display-only movers strip remain available on
+			// desktop, but are intentionally suppressed here to keep the chart
+			// visible without inventing a second mobile view mode.
+			lines.push(...stretchBlocks([head, boardBlock, chartBlock], bodyRows, "", 1));
 		}
 	}
 
@@ -8907,7 +8922,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		const canvas = storeCanvas({
 			symbol: job.symbol,
-			title: `${job.symbol} discovery in progress`,
+			title: `${job.symbol} discovery snapshot`,
 			content: evidenceBlocker ? `Source discovery was limited: ${evidenceBlocker}` : "",
 			blocks,
 			updatedAt: Date.now(),

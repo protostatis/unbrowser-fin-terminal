@@ -94,6 +94,14 @@ export function contextHudChips(
   } else {
     // MARKET / MOVERS / WATCH: quote rows are tight on a phone, so expose a
     // reliable Open (Enter) for the selected ticker alongside Refresh.
+    if (state?.mode === "market" && screen === "MARKET") {
+      chips.push({
+        id: "crypto",
+        label: state.marketView === "crypto" ? "Global" : "Crypto",
+        input: "g",
+        tone: "accent",
+      });
+    }
     chips.push({ id: "open", label: "Open", input: TERMINAL_INPUTS.enter, tone: "accent" });
     chips.push({ id: "refresh", label: "⟳ Refresh", input: "r" });
   }

@@ -22,6 +22,7 @@ import {
   type TerminalWebAction,
 } from "./InteractionOverlay";
 import { WatchlistImport } from "./WatchlistImport";
+import { SelectDialog } from "./SelectDialog";
 import { keyToData } from "./keyboard";
 import { PUBLIC_DEMO, PUBLIC_LIVE_DEMO, REPLAY_DEMO } from "./demo-mode";
 import {
@@ -383,6 +384,16 @@ export function App({
         return;
       }
 
+      if (e.key === "Tab") {
+        const state = frameStateRef.current;
+        const screen = state?.screen?.toUpperCase();
+        const tabMeaningful =
+          (state?.mode === "market" && (screen === "SIGNALS" || screen === "EVENTS")) ||
+          (state?.mode === "ticker" && state?.tickerSplitAvailable);
+        if (!tabMeaningful) {
+          return;
+        }
+      }
       const data = keyToData(e);
       if (data !== null) {
         e.preventDefault();
@@ -633,32 +644,12 @@ export function App({
 
       {/* Select modal */}
       {selectReq && (
-        <div
-          className="select-overlay"
-          onClick={handleSelectCancel}
-          role="dialog"
-          aria-modal="true"
-          aria-label={selectReq.title}
-        >
-          <div className="select-modal" onClick={(e) => e.stopPropagation()}>
-            <div className="select-title">{selectReq.title}</div>
-            <div className="select-options">
-              {selectReq.options.map((opt, i) => (
-                <button
-                  key={i}
-                  className="select-option"
-                  onClick={() => handleSelectOption(opt)}
-                  autoFocus={i === 0}
-                >
-                  {opt}
-                </button>
-              ))}
-            </div>
-            <button className="select-cancel" onClick={handleSelectCancel}>
-              Cancel (Esc)
-            </button>
-          </div>
-        </div>
+        <SelectDialog
+          title={selectReq.title}
+          options={selectReq.options}
+          onSelect={handleSelectOption}
+          onCancel={handleSelectCancel}
+        />
       )}
 
       {/* Evidence locker — the research dossier inspector */}

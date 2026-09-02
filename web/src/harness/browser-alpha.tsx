@@ -12,6 +12,7 @@ import { EvidenceControl, EvidenceInspector } from "../EvidenceInspector";
 import { InteractionOverlay, type TerminalWebAction } from "../InteractionOverlay";
 import { MobileControls } from "../MobileControls";
 import { WatchlistImport } from "../WatchlistImport";
+import { SelectDialog } from "../SelectDialog";
 import { researchActivityStatus, type TerminalFrameState } from "../mobile-controls";
 import type { WatchlistImportResult } from "../socket";
 import { createWebUi, type Panel } from "../../../server/web-ui.js";
@@ -447,6 +448,13 @@ export function BrowserAlphaApp({ authenticated = false }: { authenticated?: boo
 				return;
 			}
 			if (isEditableTarget(event.target)) return;
+			if (event.key === "Tab") {
+				const screen = terminalState?.screen?.toUpperCase();
+				const tabMeaningful =
+					(terminalState?.mode === "market" && (screen === "SIGNALS" || screen === "EVENTS")) ||
+					(terminalState?.mode === "ticker" && terminalState?.tickerSplitAvailable);
+				if (!tabMeaningful) return;
+			}
 			const data = keyToData(event);
 			if (data === null) return;
 			event.preventDefault();
@@ -568,19 +576,12 @@ export function BrowserAlphaApp({ authenticated = false }: { authenticated?: boo
 				</div>
 			)}
 			{selectReq && (
-				<div className="select-overlay" onClick={() => resolveSelect(undefined, true)} role="dialog" aria-modal="true" aria-label={selectReq.title}>
-					<div className="select-modal" onClick={(event) => event.stopPropagation()}>
-						<div className="select-title">{selectReq.title}</div>
-						<div className="select-options">
-							{selectReq.options.map((option, index) => (
-								<button type="button" className="select-option" key={`${selectReq.id}-${index}`} onClick={() => resolveSelect(option)} autoFocus={index === 0}>
-									{option}
-								</button>
-							))}
-						</div>
-						<button type="button" className="select-cancel" onClick={() => resolveSelect(undefined, true)}>Cancel (Esc)</button>
-					</div>
-				</div>
+				<SelectDialog
+					title={selectReq.title}
+					options={selectReq.options}
+					onSelect={(option) => resolveSelect(option)}
+					onCancel={() => resolveSelect(undefined, true)}
+				/>
 			)}
 			{evidenceOpen && dossier && <EvidenceInspector dossier={dossier} onClose={() => { setEvidenceOpen(false); focusTerminal(); }} />}
 			{notice && <div className="browser-alpha-notice" role="status">{notice}</div>}

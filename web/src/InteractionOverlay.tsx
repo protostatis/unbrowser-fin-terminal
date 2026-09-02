@@ -34,9 +34,6 @@ export function InteractionOverlay({
   onReturnToTerminal,
 }: InteractionOverlayProps) {
   const [open, setOpen] = useState(false);
-  /* Once dismissed, the corner toggle stays hidden until the page reloads —
-   * the contextual HUD now covers everything this panel offered on touch. */
-  const [dismissed, setDismissed] = useState(false);
 
   /* Close the overlay when the terminal becomes fully disabled (e.g. panel
    * was closed remotely), so the toggle starts collapsed for the next session. */
@@ -85,11 +82,21 @@ export function InteractionOverlay({
 
   const toggleOpen = useCallback(() => {
     setOpen((v) => !v);
-    // The overlay is a mouse/touch aid, not a second terminal focus model.
-    // Keep the terminal hot after opening or closing it so normal shortcuts
-    // such as G continue to work immediately.
     setTimeout(() => onReturnToTerminal?.(), 0);
   }, [onReturnToTerminal]);
+
+  useEffect(() => {
+    if (!open) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setOpen(false);
+        onReturnToTerminal?.();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [open, onReturnToTerminal]);
 
   const emitInput = useCallback(
     (input: string) => {
@@ -99,8 +106,6 @@ export function InteractionOverlay({
     },
     [cacheLocked, disabled, onInput, onReturnToTerminal, searching, state],
   );
-
-  if (dismissed) return null;
 
   /* ── Render ────────────────────────────────────────────────────────── */
 
@@ -335,18 +340,6 @@ export function InteractionOverlay({
             </button>
           )}
 
-          {/* ── Dismiss the corner toggle entirely ─────────────────────── */}
-          <button
-            type="button"
-            className="interaction-dismiss-btn"
-            onClick={() => {
-              setDismissed(true);
-              setOpen(false);
-              setTimeout(() => onReturnToTerminal?.(), 0);
-            }}
-          >
-            Hide controls
-          </button>
         </div>
       )}
     </section>
