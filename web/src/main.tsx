@@ -573,8 +573,8 @@ export function App({
         </div>
       )}
 
-      {/* Importer trigger — top-right corner of the terminal chrome. */}
-      {!PUBLIC_LIVE_DEMO && (
+      {/* Importer trigger — top-right corner, only on WATCH where the watchlist is managed. */}
+      {!PUBLIC_LIVE_DEMO && frameStateRef.current?.mode === "market" && frameStateRef.current?.screen?.toUpperCase() === "WATCH" && (
         <button
           type="button"
           className="watchlist-import-trigger"
