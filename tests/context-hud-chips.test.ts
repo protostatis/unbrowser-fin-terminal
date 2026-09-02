@@ -89,9 +89,15 @@ test("research and wide ticker split expose archive navigation", () => {
 });
 
 test("MARKET / MOVERS / WATCH expose Open + Refresh", () => {
-  for (const screen of ["MARKET", "MOVERS", "WATCH"]) {
+  for (const screen of ["MOVERS", "WATCH"]) {
     assert.deepEqual(ids({ mode: "market", screen }), ["open", "refresh"]);
   }
+  assert.deepEqual(ids({ mode: "market", screen: "MARKET" }), ["crypto", "open", "refresh"]);
+  assert.deepEqual(ids({ mode: "market", screen: "MARKET", marketView: "crypto" }), ["crypto", "open", "refresh"]);
+  const cryptoChip = contextHudChips({ mode: "market", screen: "MARKET" }).find((chip) => chip.id === "crypto");
+  assert.equal(cryptoChip?.input, "g");
+  assert.equal(cryptoChip?.label, "Crypto");
+  assert.equal(contextHudChips({ mode: "market", screen: "MARKET", marketView: "crypto" }).find((chip) => chip.id === "crypto")?.label, "Global");
 });
 
 test("SIGNALS and EVENTS expose a pane toggle plus relevant research actions", () => {

@@ -2297,9 +2297,10 @@ strong {
  *
  * A companion overlay for the browser projection of market actions. It is
  * positioned absolutely over .terminal so it never shifts cell measurement.
- * On wide screens it anchors as a compact edge panel. On narrow/coarse
- * screens the compact trigger stays above the mobile command deck, while the
- * expanded sheet intentionally overlays the canvas instead of shrinking it.
+ * On wide screens it anchors as a compact edge panel. Coarse-pointer screens
+ * use the terminal rows and ContextHud directly; the semantic surface remains
+ * available to keyboard and assistive-technology users without adding a
+ * second visible touch control cluster.
  */
 
 .interaction-overlay {
@@ -2603,34 +2604,6 @@ strong {
   cursor: default;
 }
 
-/* Dismiss the corner toggle entirely. Subdued full-width footer button so it
-   reads as a low-priority "get this out of my way" action. */
-.interaction-dismiss-btn {
-  appearance: none;
-  display: block;
-  width: 100%;
-  margin-top: 8px;
-  padding: 7px 10px;
-  border-radius: 6px;
-  border: 1px solid #30363d;
-  background: transparent;
-  color: #8b949e;
-  font: inherit;
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  cursor: pointer;
-}
-.interaction-dismiss-btn:hover {
-  color: #c9d1d9;
-  border-color: #6e2b2b;
-}
-.interaction-dismiss-btn:focus-visible {
-  outline: 2px solid #58a6ff;
-  outline-offset: 1px;
-}
-
 .interaction-btn-key {
   color: inherit;
   opacity: 0.6;
@@ -2870,42 +2843,37 @@ strong {
 }
 
 @media (hover: none) and (pointer: coarse) {
-  /* Float the controls toggle at bottom-left, mirroring the search FAB at
-     bottom-right (same 52px size, same baseline) so the two corner buttons
-     read as an aligned pair. The overlay is pulled out of flow so a closed
-     toggle consumes no content row. */
+  /* Touch owns the visible interaction layer: terminal rows, ContextHud, and
+     the search FAB. Keep the semantic overlay in the accessibility tree, but
+     visually suppress it until keyboard/AT focus or an explicit open state
+     makes it relevant. */
   .interaction-overlay {
     position: absolute;
-    right: 0;
     left: 0;
+    right: auto;
     bottom: 0;
-    max-width: none;
-    width: 100%;
-    z-index: 59;
+    width: 1px;
+    max-width: 1px;
+    height: 1px;
+    overflow: visible;
+    clip-path: inset(50%);
+    pointer-events: none;
+    z-index: 1;
   }
 
+  .interaction-overlay:focus-within,
   .interaction-overlay[data-overlay-open] {
+    width: 100%;
+    max-width: none;
+    height: auto;
+    clip-path: none;
+    pointer-events: auto;
     z-index: 60;
   }
 
   .interaction-toggle {
-    position: absolute;
-    left: max(12px, env(safe-area-inset-left));
-    bottom: max(14px, env(safe-area-inset-bottom));
-    margin: 0;
-    width: 52px;
-    height: 52px;
-    border-radius: 50%;
-    padding: 0;
-    font-size: 13px;
-  }
-
-  .interaction-toggle-label {
-    display: none;
-  }
-
-  .interaction-toggle-chevron {
-    font-size: 11px;
+    position: relative;
+    margin: 0 0 4px 8px;
   }
 
   .interaction-panel {
