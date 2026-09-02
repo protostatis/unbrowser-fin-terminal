@@ -503,7 +503,7 @@ export function BrowserAlphaApp({ authenticated = false }: { authenticated?: boo
 						{authenticated ? "AUTHENTICATED · SERVER BROKER · ACCOUNT WORKSPACE" : "BROWSER ALPHA · EPHEMERAL · BYOK IN MEMORY"}
 				</span>
 				<div className="browser-alpha-actions">
-					{!evidenceOpen && (
+					{!evidenceOpen && terminalState?.mode === "market" && terminalState?.screen?.toUpperCase() === "WATCH" && (
 						<button
 							type="button"
 							className="watchlist-import-trigger"
