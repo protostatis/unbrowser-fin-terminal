@@ -12,6 +12,7 @@ import { TerminalFrame } from "./TerminalFrame";
 import { MobileControls } from "./MobileControls";
 import { ContextHud } from "./ContextHud";
 import {
+  isWatchImportContext,
   recentResearchStatuses,
   researchActivityStatus,
   type ResearchActivityStatus,
@@ -23,7 +24,7 @@ import {
 } from "./InteractionOverlay";
 import { WatchlistImport } from "./WatchlistImport";
 import { SelectDialog } from "./SelectDialog";
-import { keyToData } from "./keyboard";
+import { isTerminalControl, keyToData } from "./keyboard";
 import { PUBLIC_DEMO, PUBLIC_LIVE_DEMO, REPLAY_DEMO } from "./demo-mode";
 import {
   DEMO_BUSY_CLOSE_CODE,
@@ -318,11 +319,11 @@ export function App({
       const gridW = frame.clientWidth - padL - padR;
 
       const rows = Math.max(12, Math.floor(gridH / charH));
-      const cols = Math.max(54, Math.floor(gridW / charW));
+      const cols = Math.max(48, Math.floor(gridW / charW));
 
-      if (cols < 54 || rows < 12) {
+      if (cols < 48 || rows < 12) {
         console.warn(
-          `Terminal viewport very small: ${cols}×${rows}; minimum is 54×12`,
+          `Terminal viewport very small: ${cols}×${rows}; minimum is 48×12`,
         );
       }
 
@@ -384,7 +385,12 @@ export function App({
         return;
       }
 
-      if (e.key === "Tab") {
+      // Let the interaction overlay handle Escape when open.
+      if (e.key === "Escape" && document.querySelector(".interaction-overlay[data-overlay-open]")) {
+        return;
+      }
+
+      if (e.key === "Tab" && !isTerminalControl(e.target)) {
         const state = frameStateRef.current;
         const screen = state?.screen?.toUpperCase();
         const tabMeaningful =
@@ -393,6 +399,13 @@ export function App({
         if (!tabMeaningful) {
           return;
         }
+        // When the overlay is open, Tab should traverse its controls, not
+        // switch panes. The overlay buttons are isTerminalControl, but the
+        // terminal frame itself is not — allow Tab to escape to the overlay.
+        const overlayOpen = document.querySelector(".interaction-overlay[data-overlay-open]") !== null;
+        if (overlayOpen) return;
+      } else if (e.key === "Tab" && isTerminalControl(e.target)) {
+        return;
       }
       const data = keyToData(e);
       if (data !== null) {
@@ -491,6 +504,17 @@ export function App({
     if (!dossier && evidenceOpen) setEvidenceOpen(false);
   }, [dossier, evidenceOpen]);
 
+  const showImporter = !PUBLIC_LIVE_DEMO && isWatchImportContext(frameStateRef.current);
+  const wasImporterFocusedRef = useRef(false);
+  useEffect(() => {
+    if (showImporter) {
+      wasImporterFocusedRef.current = (document.activeElement as HTMLElement | null)?.closest(".watchlist-import-trigger") !== null;
+    } else if (wasImporterFocusedRef.current) {
+      focusTerminal();
+      wasImporterFocusedRef.current = false;
+    }
+  }, [showImporter]);
+
   const emptyTitle =
     cs === "connected"
       ? "Preparing market map"
@@ -574,7 +598,7 @@ export function App({
       )}
 
       {/* Importer trigger — top-right corner, only on WATCH where the watchlist is managed. */}
-      {!PUBLIC_LIVE_DEMO && frameStateRef.current?.mode === "market" && frameStateRef.current?.screen?.toUpperCase() === "WATCH" && (
+      {showImporter && (
         <button
           type="button"
           className="watchlist-import-trigger"

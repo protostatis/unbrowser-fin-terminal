@@ -88,11 +88,13 @@ export function InteractionOverlay({
   useEffect(() => {
     if (!open) return;
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        setOpen(false);
-        onReturnToTerminal?.();
-      }
+      if (event.key !== "Escape" || event.defaultPrevented) return;
+      // Don't close the overlay if a modal (select/evidence/import) is handling Escape.
+      const activeModal = document.querySelector(".select-overlay, .watchlist-import-backdrop, .evidence-inspector");
+      if (activeModal) return;
+      event.preventDefault();
+      setOpen(false);
+      onReturnToTerminal?.();
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);

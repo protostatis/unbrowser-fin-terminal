@@ -91,10 +91,10 @@ export function contextHudChips(
       if (state?.archive) chips.push({ id: "newer", label: "Newer", input: "]" });
     }
     chips.push({ id: "refresh", label: "⟳ Refresh", input: "r" });
-  } else {
+  } else if (state?.mode === "market") {
     // MARKET / MOVERS / WATCH: quote rows are tight on a phone, so expose a
     // reliable Open (Enter) for the selected ticker alongside Refresh.
-    if (state?.mode === "market" && screen === "MARKET") {
+    if (screen === "MARKET") {
       chips.push({
         id: "crypto",
         label: state.marketView === "crypto" ? "Global" : "Crypto",

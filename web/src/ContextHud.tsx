@@ -37,7 +37,7 @@ export function ContextHud({ state, researchStatus, disabled, onInput }: Context
 
   useEffect(() => {
     const onPointerDown = (event: PointerEvent) => {
-      if (event.pointerType !== "touch") return;
+      if (event.pointerType === "mouse") return;
       setVisible(true);
       armHide();
     };

@@ -317,3 +317,19 @@ test("isIdentityPrecacheCooled applies a bounded cooldown after repeated infrast
   assert.equal(isIdentityPrecacheCooled([blocked(now - 3_600_000), blocked(now - 86_400_000)], { now, cooldownMs: -5 }), false);
   assert.equal(isIdentityPrecacheCooled([blocked(now - 3_600_000), blocked(now - 86_400_000)], { now, codes: [] }), false);
 });
+
+test("news as evidence still requires a sourced read", () => {
+  const newsOnly = quality(canvas({
+    blocks: [{ id: "news", kind: "news", items: [{ headline: "Market news", source: "src", url: "https://example.com/n", sourceIds: ["S1"] }], dossierHint: "evidence" }],
+  }));
+  assert.equal(newsOnly.usable, false, "news alone without a read is not usable");
+  assert.match(newsOnly.reasons.join(","), /read/);
+
+  const readPlusNews = quality(canvas({
+    blocks: [
+      { id: "read", kind: "text", text: "sourced summary", sourceIds: ["S1"], dossierHint: "read" },
+      { id: "news", kind: "news", items: [{ headline: "Market news", source: "src", url: "https://example.com/n", sourceIds: ["S1"] }], dossierHint: "evidence" },
+    ],
+  }));
+  assert.equal(readPlusNews.usable, true, "read + news evidence is usable");
+});

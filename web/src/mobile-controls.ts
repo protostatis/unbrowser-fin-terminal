@@ -132,6 +132,10 @@ export function canRestoreTickerSplit(state?: TerminalFrameState): boolean {
     && (state.tickerLayout === "quote" || state.tickerLayout === "research");
 }
 
+export function isWatchImportContext(state?: TerminalFrameState): boolean {
+  return state?.mode === "market" && state?.screen?.toUpperCase() === "WATCH";
+}
+
 export const SCOPE_ACTIONS: ReadonlyArray<{
   scope: ChartScope;
   label: string;
