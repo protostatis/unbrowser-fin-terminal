@@ -385,6 +385,11 @@ export function App({
         return;
       }
 
+      // Let the interaction overlay handle Escape when open.
+      if (e.key === "Escape" && document.querySelector(".interaction-overlay[data-overlay-open]")) {
+        return;
+      }
+
       if (e.key === "Tab" && !isTerminalControl(e.target)) {
         const state = frameStateRef.current;
         const screen = state?.screen?.toUpperCase();
@@ -500,15 +505,14 @@ export function App({
   }, [dossier, evidenceOpen]);
 
   const showImporter = !PUBLIC_LIVE_DEMO && isWatchImportContext(frameStateRef.current);
-  const prevShowImporterRef = useRef(showImporter);
+  const wasImporterFocusedRef = useRef(false);
   useEffect(() => {
-    if (prevShowImporterRef.current && !showImporter) {
-      const active = document.activeElement as HTMLElement | null;
-      if (active?.closest(".watchlist-import-trigger")) {
-        focusTerminal();
-      }
+    if (showImporter) {
+      wasImporterFocusedRef.current = (document.activeElement as HTMLElement | null)?.closest(".watchlist-import-trigger") !== null;
+    } else if (wasImporterFocusedRef.current) {
+      focusTerminal();
+      wasImporterFocusedRef.current = false;
     }
-    prevShowImporterRef.current = showImporter;
   }, [showImporter]);
 
   const emptyTitle =

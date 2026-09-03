@@ -7227,7 +7227,7 @@ function testComponentState(component: UITestComponent) {
 
 function testScreen(component: UITestComponent, width: number, height?: number): string[] {
 	if (uiTest) uiTest.tui.terminal.rows = Math.max(18, Math.min(80, height ?? 35));
-	return component.render(Math.max(54, Math.min(160, width)));
+	return component.render(Math.max(48, Math.min(160, width)));
 }
 
 function createMarketTestHarness(
@@ -9256,7 +9256,7 @@ export default function (pi: ExtensionAPI) {
 				index: Type.Optional(Type.Integer({ minimum: 0, maximum: 99 })),
 			}, { description: "Optional MOVERS/WATCH list context for ticker-cycle regression testing." })),
 			background: Type.Optional(Type.Boolean({ description: "For open_market/open_ticker, enable deterministic in-place background research simulation" })),
-			width: Type.Optional(Type.Integer({ minimum: 54, maximum: 160, description: "Virtual terminal width, defaults to 120" })),
+			width: Type.Optional(Type.Integer({ minimum: 48, maximum: 160, description: "Virtual terminal width, defaults to 120" })),
 			height: Type.Optional(Type.Integer({ minimum: 18, maximum: 80, description: "Virtual terminal height, defaults to 35" })),
 		}),
 		async execute(_id, params) {
