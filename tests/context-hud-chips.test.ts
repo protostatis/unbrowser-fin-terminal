@@ -162,3 +162,9 @@ test("the cache decision suppresses Back even in a ticker", () => {
 test("symbol search exposes no chips (the search sheet owns the keyboard)", () => {
   assert.deepEqual(ids({ mode: "market", screen: "MARKET", searching: true }), []);
 });
+
+test("undefined or incomplete state exposes no startup clutter", () => {
+  assert.deepEqual(ids(undefined), []);
+  assert.deepEqual(ids({} as TerminalFrameState), []);
+  assert.deepEqual(ids({ mode: "market", screen: "MARKET", searching: false }), ["crypto", "open", "refresh"]);
+});

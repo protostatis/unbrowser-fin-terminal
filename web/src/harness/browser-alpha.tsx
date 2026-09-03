@@ -6,14 +6,14 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { TerminalFrame } from "../TerminalFrame";
-import { keyToData } from "../keyboard";
+import { isTerminalControl, keyToData } from "../keyboard";
 import { ContextHud } from "../ContextHud";
 import { EvidenceControl, EvidenceInspector } from "../EvidenceInspector";
 import { InteractionOverlay, type TerminalWebAction } from "../InteractionOverlay";
 import { MobileControls } from "../MobileControls";
 import { WatchlistImport } from "../WatchlistImport";
 import { SelectDialog } from "../SelectDialog";
-import { researchActivityStatus, type TerminalFrameState } from "../mobile-controls";
+import { isWatchImportContext, researchActivityStatus, type TerminalFrameState } from "../mobile-controls";
 import type { WatchlistImportResult } from "../socket";
 import { createWebUi, type Panel } from "../../../server/web-ui.js";
 import { resolveWebAction } from "../../../server/web-actions.js";
@@ -66,6 +66,7 @@ export function BrowserAlphaApp({ authenticated = false }: { authenticated?: boo
 	const [terminalSize, setTerminalSize] = useState({ columns: 120, rows: 35 });
 	const [evidenceOpen, setEvidenceOpen] = useState(false);
 	const [watchlistImportOpen, setWatchlistImportOpen] = useState(false);
+	const watchlistImportApplyingRef = useRef(false);
 	const runtimeRef = useRef<BrowserRuntime | null>(null);
 	const connectInFlightRef = useRef<Promise<void> | null>(null);
 	const startupControllerRef = useRef<AbortController | null>(null);
@@ -353,13 +354,18 @@ export function BrowserAlphaApp({ authenticated = false }: { authenticated?: boo
 		symbols: string[],
 	): Promise<WatchlistImportResult> => {
 		if (!panel?.applyWatchlist || evidenceOpen || selectReq) return { ok: false, error: "The browser market session is not ready to update the watchlist." };
-		const update = panel.applyWatchlist(symbols, mode);
-		setError(null);
-		setNotice(mode === "replace"
-			? `WATCHLIST REPLACED · ${update.symbols.length} ON WATCH`
-			: `${update.added} SYMBOL${update.added === 1 ? "" : "S"} ADDED TO WATCHLIST`);
-		setRenderVersion((version) => version + 1);
-		return { ok: true };
+		watchlistImportApplyingRef.current = true;
+		try {
+			const update = panel.applyWatchlist(symbols, mode);
+			setError(null);
+			setNotice(mode === "replace"
+				? `WATCHLIST REPLACED · ${update.symbols.length} ON WATCH`
+				: `${update.added} SYMBOL${update.added === 1 ? "" : "S"} ADDED TO WATCHLIST`);
+			setRenderVersion((version) => version + 1);
+			return { ok: true };
+		} finally {
+			watchlistImportApplyingRef.current = false;
+		}
 	}, [evidenceOpen, panel, selectReq]);
 
 	const handleWatchlistImportOpenChange = useCallback((open: boolean) => {
@@ -404,7 +410,7 @@ export function BrowserAlphaApp({ authenticated = false }: { authenticated?: boo
 			const horizontalPadding = (parseFloat(style.paddingLeft) || 0) + (parseFloat(style.paddingRight) || 0);
 			const verticalPadding = (parseFloat(style.paddingTop) || 0) + (parseFloat(style.paddingBottom) || 0);
 			const next = {
-				columns: Math.max(54, Math.floor((frame.clientWidth - horizontalPadding) / charRect.width)),
+				columns: Math.max(48, Math.floor((frame.clientWidth - horizontalPadding) / charRect.width)),
 				rows: Math.max(12, Math.floor((frame.clientHeight - verticalPadding) / charRect.height)),
 			};
 			runtimeRef.current?.setTerminalRows(next.rows);
@@ -421,6 +427,18 @@ export function BrowserAlphaApp({ authenticated = false }: { authenticated?: boo
 		focusTerminal();
 	}, [connected, focusTerminal]);
 
+	const showImporter = !evidenceOpen && isWatchImportContext(terminalState);
+	const prevShowImporterRef = useRef(showImporter);
+	useEffect(() => {
+		if (prevShowImporterRef.current && !showImporter) {
+			const active = document.activeElement as HTMLElement | null;
+			if (active?.closest(".watchlist-import-trigger")) {
+				focusTerminal();
+			}
+		}
+		prevShowImporterRef.current = showImporter;
+	}, [showImporter, focusTerminal]);
+
 	useEffect(() => {
 		if (!connected) return;
 		const handler = (event: KeyboardEvent) => {
@@ -432,7 +450,7 @@ export function BrowserAlphaApp({ authenticated = false }: { authenticated?: boo
 				return;
 			}
 			if (watchlistImportOpen) {
-				if (event.key === "Escape") {
+				if (event.key === "Escape" && !watchlistImportApplyingRef.current) {
 					event.preventDefault();
 					setWatchlistImportOpen(false);
 					focusTerminal();
@@ -447,13 +465,15 @@ export function BrowserAlphaApp({ authenticated = false }: { authenticated?: boo
 				}
 				return;
 			}
-			if (isEditableTarget(event.target)) return;
+			if (isEditableTarget(event.target) || isTerminalControl(event.target)) return;
 			if (event.key === "Tab") {
 				const screen = terminalState?.screen?.toUpperCase();
 				const tabMeaningful =
 					(terminalState?.mode === "market" && (screen === "SIGNALS" || screen === "EVENTS")) ||
 					(terminalState?.mode === "ticker" && terminalState?.tickerSplitAvailable);
 				if (!tabMeaningful) return;
+				const overlayOpen = document.querySelector(".interaction-overlay[data-overlay-open]") !== null;
+				if (overlayOpen) return;
 			}
 			const data = keyToData(event);
 			if (data === null) return;
@@ -503,7 +523,7 @@ export function BrowserAlphaApp({ authenticated = false }: { authenticated?: boo
 						{authenticated ? "AUTHENTICATED · SERVER BROKER · ACCOUNT WORKSPACE" : "BROWSER ALPHA · EPHEMERAL · BYOK IN MEMORY"}
 				</span>
 				<div className="browser-alpha-actions">
-					{!evidenceOpen && terminalState?.mode === "market" && terminalState?.screen?.toUpperCase() === "WATCH" && (
+					{showImporter && (
 						<button
 							type="button"
 							className="watchlist-import-trigger"

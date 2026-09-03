@@ -2510,6 +2510,7 @@ function classifyDossierHint(block: CanvasBlock): DossierHint | undefined {
 	const title = (block.title ?? "").toLowerCase();
 	if (block.kind === "sources") return "sources";
 	if (block.kind === "chart") return "technical";
+	if (block.kind === "news") return "evidence";
 	// Exact legacy ids and word-boundary title matches avoid false positives
 	// like "Market Breadth" (which contains the substring "read").
 	if (id === "read" || id === "summary" || id === "synthesis" || id === "tldr" || /\bread\b/.test(title)) return "read";
@@ -4247,10 +4248,10 @@ class MarketTerminal {
 			expanded: this.helpExpanded,
 		};
 		// Narrow warning: still a full-height composed screen, not a one-liner.
-		if (width < 54) {
+		if (width < 48) {
 			const header: string[] = [];
 			const body = [
-				fit(th.fg("warning", "Market terminal needs at least 54 columns.")),
+				fit(th.fg("warning", "Market terminal needs at least 48 columns.")),
 			];
 			const footer: string[] = [];
 			footer.push(fit(th.fg("borderMuted", "─".repeat(width))));
@@ -6028,8 +6029,8 @@ class MarketHub {
 		const controllerLines = (this.searching || this.cacheDecision || this.helpExpanded) ? 2 : 1;
 		const footerRows = 2 + controllerLines;
 		const bodyRows = Math.max(1, totalRows - header.length - footerRows);
-		if (width < 54) {
-			body.push(fit(th.fg("warning", "Market Map needs at least 54 columns.")));
+		if (width < 48) {
+			body.push(fit(th.fg("warning", "Market Map needs at least 48 columns.")));
 		} else {
 			if (this.screen === MARKET_SCREEN.market) this.renderMarket(body, width, th, fit, bodyRows);
 			else if (this.screen === MARKET_SCREEN.signals) this.renderSignals(body, width, th, fit, bodyRows);
@@ -6186,7 +6187,6 @@ class MarketHub {
 		// first) as one windowed sequence, exactly like MOVERS. Selection index
 		// references the merged sequence (unranked stays display-only).
 		const board = rows.map((entry) => entry.row);
-		const unrankedRows = pulse.unranked;
 		// Fill the pane vertically like MOVERS: capacity tracks available rows
 		// after the head block and the window-status line.
 		const wideCrypto = width >= 84 && terminalRows(this.tui) >= 24;
@@ -6206,12 +6206,7 @@ class MarketHub {
 		];
 		if (window.items.length < board.length) boardBlock.push(fit(th.fg("dim", `CRYPTO ${window.start + 1}–${window.start + window.items.length} / ${board.length} · W/S SCROLL`)));
 
-		// Display-only surfaces: UNRANKED assets and the TOP-20 MOVERS strip.
-		// Neither participates in W/S selection or J/K/E.
-		const unrankedBlock: string[] = [];
-		if (unrankedRows.length > 0) {
-			unrankedBlock.push(fit(`${th.fg("dim", "UNRANKED · NO QUOTE")}  ${unrankedRows.map((row) => row.symbol).join(" ")}`));
-		}
+		// Display-only: TOP-20 MOVERS strip (neither participates in W/S).
 		const stripBlock: string[] = [];
 		if (pulse.movers) {
 			const tone = (row: CryptoScoreboardRow) => (row.change24h >= 0 ? "success" : "error");
@@ -6281,9 +6276,8 @@ class MarketHub {
 			lines.push(...stripBlock);
 		} else {
 			// On compact screens the selected chart is part of the primary flow.
-			// Unranked assets and the display-only movers strip remain available on
-			// desktop, but are intentionally suppressed here to keep the chart
-			// visible without inventing a second mobile view mode.
+			// The display-only movers strip remains available on desktop, but is
+			// intentionally suppressed here to keep the chart visible.
 			lines.push(...stretchBlocks([head, boardBlock, chartBlock], bodyRows, "", 1));
 		}
 	}
