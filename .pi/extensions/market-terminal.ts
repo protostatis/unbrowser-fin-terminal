@@ -6308,7 +6308,23 @@ class MarketHub {
 			// On compact screens the selected chart is part of the primary flow.
 			// The display-only movers strip remains available on desktop, but is
 			// intentionally suppressed here to keep the chart visible.
-			lines.push(...stretchBlocks([head, boardBlock, chartBlock], bodyRows, "", 1));
+			// Never slice the chart tail: shrink the board window first so
+			// PRICE CHART + axes + range always survive on phones.
+			let fittedRows = [...boardRows];
+			let includeBoardStatus = boardStatus !== undefined;
+			const gaps = 2;
+			while (head.length + 1 + fittedRows.length + (includeBoardStatus ? 1 : 0) + chartBlock.length + gaps > bodyRows && fittedRows.length > 1) {
+				// Drop the status line first, then the farthest non-selected row.
+				if (includeBoardStatus) {
+					includeBoardStatus = false;
+					continue;
+				}
+				const removeIndex = [...fittedRows].reverse().findIndex((row) => row.index !== this.cryptoSelected);
+				if (removeIndex < 0) break;
+				fittedRows.splice(fittedRows.length - 1 - removeIndex, 1);
+			}
+			const fittedBoard = [boardHeading, ...fittedRows.map((row) => row.line), ...(includeBoardStatus && boardStatus ? [boardStatus] : [])];
+			lines.push(...stretchBlocks([head, fittedBoard, chartBlock], bodyRows, "", 1));
 		}
 	}
 

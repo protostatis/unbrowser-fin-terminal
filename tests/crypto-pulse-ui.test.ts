@@ -209,26 +209,31 @@ test("Crypto Pulse renders the mood strip and HOT/COLD scoreboard in char cells"
   assert.ok(narrowLines.some((line: string) => line.includes("COLDEST")), "stacked board header should mention COLDEST");
 });
 
-test("compact Crypto Pulse guarantees a full-width chart at 48x24 and 80x30", async () => {
-  setCryptoPulseFetchImplForTest(cryptoPulseFixtureFetch);
+test("compact Crypto Pulse keeps the complete chart tail at mobile heights", async () => {
+	setCryptoPulseFetchImplForTest(cryptoPulseFixtureFetch);
+	setCryptoPulseChartFetchImplForTest(cryptoPulseFixtureFetch);
   const uiTest = registeredTools().get("market_ui_test");
   assert.ok(uiTest);
 
   await uiTest.execute("reset", { action: "reset" });
-  await uiTest.execute("open_market", { action: "open_market" });
-  await uiTest.execute("press", { action: "press", button: "button_g" });
-  await waitForState(uiTest, (state: any) => state.cryptoPulse?.state === "ready");
+	await uiTest.execute("open_market", { action: "open_market" });
+	await uiTest.execute("press", { action: "press", button: "button_g" });
+	await waitForState(uiTest, (state: any) => state.cryptoPulse?.state === "ready");
+	for (let index = 0; index < 5; index++) await uiTest.execute("press", { action: "press", button: "dpad_down" });
+	await waitForScreen(uiTest, (lines) => lines.some((line) => line.includes("CANDLE")));
 
-  const small = await uiTest.execute("state", { action: "state", width: 48, height: 24 });
-  const smallLines: string[] = small.details.screen;
-  assert.ok(smallLines.some((line: string) => line.includes("PRICE CHART")), "48x24 compact must show PRICE CHART");
-  assert.ok(!smallLines.some((line: string) => line.includes("TOP-20")), "48x24 compact must suppress TOP-20 display-only strip");
-  assert.ok(!smallLines.some((line: string) => line.includes("UNRANKED")), "48x24 compact must suppress UNRANKED");
-
-  const mid = await uiTest.execute("state", { action: "state", width: 80, height: 30 });
-  const midLines: string[] = mid.details.screen;
-  assert.ok(midLines.some((line: string) => line.includes("PRICE CHART")), "80x30 compact must show PRICE CHART");
-  assert.ok(!midLines.some((line: string) => line.includes("TOP-20")), "80x30 compact must suppress TOP-20");
+	for (const [width, height] of [[48, 20], [60, 22], [48, 24], [80, 30]] as const) {
+		const rendered = await uiTest.execute("state", { action: "state", width, height });
+		const lines: string[] = rendered.details.screen;
+		assert.ok(lines.some((line: string) => line.includes("PRICE CHART")), `${width}x${height} compact must show PRICE CHART`);
+		assert.ok(lines.some((line: string) => line.includes("CANDLE")), `${width}x${height} chart legend must survive`);
+		assert.ok(lines.some((line: string) => line.includes("VOL")), `${width}x${height} chart volume row must survive`);
+		assert.ok(lines.some((line: string) => line.includes("UTC")), `${width}x${height} chart time axis must survive`);
+		assert.ok(lines.some((line: string) => line.includes("Range")), `${width}x${height} chart range must survive`);
+		assert.ok(lines.some((line: string) => line.includes("►")), `${width}x${height} selected board row must survive chart fitting`);
+		assert.ok(!lines.some((line: string) => line.includes("TOP-20")), `${width}x${height} compact must suppress TOP-20 display-only strip`);
+		assert.ok(!lines.some((line: string) => line.includes("UNRANKED")), `${width}x${height} compact must suppress UNRANKED`);
+	}
 });
 
 test("leaving the MARKET screen resets the crypto subview to GLOBAL", async () => {
