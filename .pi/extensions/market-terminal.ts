@@ -27,6 +27,7 @@ import {
 	CryptoPulseCache,
 	isCryptoPulseUsable,
 	fetchCryptoPulse,
+	resolveYahooPair,
 	type CryptoPulseSnapshot,
 	type CryptoScoreboardRow,
 	type FetchLike,
@@ -122,6 +123,7 @@ import {
 import { sourceIdForUrl } from "../../shared/kernel/hash.js";
 import {
 	createNodeKernelPorts,
+	createNodeTransportPort,
 	QUOTE_FETCH_CONCURRENCY,
 	QUOTE_REQUEST_TIMEOUT_MS,
 	type KernelPorts,
@@ -679,10 +681,17 @@ const MARKET_SCREEN = {
 
 /** Test seam: override the crypto pulse fetch with deterministic fixtures. */
 let cryptoPulseFetchImpl: FetchLike | undefined;
+let cryptoPulseChartFetchImpl: FetchLike | undefined;
 export function setCryptoPulseFetchImplForTest(fetchImpl: FetchLike | undefined): void {
 	cryptoPulseFetchImpl = fetchImpl;
+	// Keep the original single-seam reset behavior: each pulse fixture starts
+	// with the chart transport on the real/default path unless explicitly set.
+	cryptoPulseChartFetchImpl = undefined;
 	// Reset the shared snapshot cache so tests never reuse another fixture's data.
 	state.CRYPTO_PULSE_CACHE.clear();
+}
+export function setCryptoPulseChartFetchImplForTest(fetchImpl: FetchLike | undefined): void {
+	cryptoPulseChartFetchImpl = fetchImpl;
 }
 
 
@@ -5444,7 +5453,12 @@ class MarketHub {
 		const symbolKey = `${scope}:${cmcSymbol}`;
 		let resolved: string | null;
 		try {
-			resolved = await this.resolveCryptoPair(cmcSymbol);
+			// The pulse fixture also owns Yahoo responses in UI tests. Keep the
+			// production/browser transport untouched while making chart rendering
+			// deterministic and network-free under the same test seam.
+			resolved = cryptoPulseChartFetchImpl
+				? await resolveYahooPair(cmcSymbol, cryptoPulseChartFetchImpl)
+				: await this.resolveCryptoPair(cmcSymbol);
 		} catch {
 			// Pair discovery is upstream I/O. A transient 429/timeout must leave
 			// the row retryable instead of turning it into a permanent no-chart row.
@@ -5476,7 +5490,9 @@ class MarketHub {
 		this.cryptoQuoteLoading = true;
 		this.cryptoQuoteAttempted.add(cacheKey);
 		try {
-			const quote = await fetchQuote(resolved, scope);
+			const quote = cryptoPulseChartFetchImpl
+				? await createNodeTransportPort({ fetchImpl: ((input, init) => cryptoPulseChartFetchImpl!(String(input), init)) as typeof fetch }).fetchQuote(resolved, scope)
+				: await fetchQuote(resolved, scope);
 			this.cryptoQuotes.set(cacheKey, quote);
 			if (quote.points.length < 2) this.cryptoNoChart.add(cmcSymbol);
 			else this.cryptoNoChart.delete(cmcSymbol);
@@ -6153,6 +6169,7 @@ class MarketHub {
 			return;
 		}
 
+		const wideCrypto = width >= 84 && terminalRows(this.tui) >= 24;
 		const head: string[] = [fit(th.bold(th.fg("accent", "CRYPTO PULSE")))];
 		if (mood) {
 			const bar = "█".repeat(mood.barFill) + "░".repeat(Math.max(0, 10 - mood.barFill));
@@ -6174,7 +6191,11 @@ class MarketHub {
 			head.push(fit(th.fg("dim", "MOOD UNAVAILABLE · CMC F&G OFFLINE")));
 		}
 		const synced = pulse.fetchedAt > 0 ? quoteTimestampLabel(pulse.fetchedAt, "UTC") : "UNKNOWN";
-		head.push(fit(th.fg("dim", `SYNCED ${synced} · [G] global · [R] sync · [W/S] select · [J] open`)));
+		// The footer already carries freshness and controls. On the smallest
+		// phone width, reclaim this duplicate row for the chart itself.
+		if (wideCrypto || width >= 60) {
+			head.push(fit(th.fg("dim", `SYNCED ${synced} · [G] global · [R] sync · [W/S] select · [J] open`)));
+		}
 
 		const rowLine = (row: CryptoScoreboardRow, selected: boolean) => {
 			const glyph = selected ? th.fg("accent", "►") : th.fg("dim", "·");
@@ -6189,25 +6210,27 @@ class MarketHub {
 		const board = rows.map((entry) => entry.row);
 		// Fill the pane vertically like MOVERS: capacity tracks available rows
 		// after the head block and the window-status line.
-		const wideCrypto = width >= 84 && terminalRows(this.tui) >= 24;
 		// Compact: chart is guaranteed. Size the board from the remainder
 		// after head + chart + gaps, so stretchBlocks never slices the chart tail.
 		// Wide keeps the previous fill behavior.
-		const compactMinBoard = 3; // header + 2 rows (status line folded in when needed)
+		const compactMinBoard = 2; // board heading + selected row
 		const compactChartBudget = wideCrypto
 			? 2
-			: Math.max(4, Math.min(11, bodyRows - head.length - compactMinBoard - 2));
+			: Math.max(0, bodyRows - head.length - compactMinBoard - 2);
 		const boardReserve = board.length > Math.max(1, bodyRows - head.length - (wideCrypto ? 2 : compactChartBudget)) ? 1 : 0;
 		const windowCapacity = Math.max(2, Math.min(
 			board.length,
 			bodyRows - head.length - (wideCrypto ? 2 : compactChartBudget) - boardReserve,
 		));
 		const window = selectionWindow(board, this.cryptoSelected, windowCapacity);
-		const boardBlock = [
-			fit(`${th.bold(th.fg("success", "HOTTEST"))}•${th.bold(th.fg("error", "COLDEST"))} · RELATIVE 24H`),
-			...window.items.map((row, offset) => rowLine(row, this.cryptoSelected === window.start + offset)),
-		];
-		if (window.items.length < board.length) boardBlock.push(fit(th.fg("dim", `CRYPTO ${window.start + 1}–${window.start + window.items.length} / ${board.length} · W/S SCROLL`)));
+		const boardHeading = fit(`${th.bold(th.fg("success", "HOTTEST"))}•${th.bold(th.fg("error", "COLDEST"))} · RELATIVE 24H`);
+		const boardRows = window.items.map((row, offset) => ({
+			index: window.start + offset,
+			line: rowLine(row, this.cryptoSelected === window.start + offset),
+		}));
+		const boardStatus = window.items.length < board.length
+			? fit(th.fg("dim", `CRYPTO ${window.start + 1}–${window.start + window.items.length} / ${board.length} · W/S SCROLL`))
+			: undefined;
 
 		// Display-only: TOP-20 MOVERS strip (neither participates in W/S).
 		const stripBlock: string[] = [];
@@ -6257,18 +6280,17 @@ class MarketHub {
 				const deltaBase = chartQuote.chartScope === "day" ? chartQuote.previousClose ?? null : chartQuote.points[0] ?? null;
 				chartBlock.push(fit(`${th.bold(th.fg("accent", "PRICE CHART"))}  ${th.bold(th.fg("text", chartQuote.symbol))} ${th.bold(th.fg(direction, `${dollars(chartQuote.price, chartQuote.currency)} ${percent(chartQuote.changePercent)}`))}`));
 				chartBlock.push(fit(th.fg("dim", `  ${CHART_SCOPE_CONFIGS[this.chartScope].label} · ${chartQuote.chartScope === "day" ? `${chartQuote.interval} · PRE/REG/POST` : chartQuote.interval} · J open · K why · E watch`)));
-				// Compact chart height is bounded by the reserved budget:
-				// 2 header lines + chart + optional range line must fit in budget.
-				// This keeps the tail (axes + range) from being sliced on phones.
-				const compactChartHeightCap = Math.max(2, Math.min(6, compactChartBudget - 3));
-				const chartHeight = wideCrypto
-					? Math.max(2, Math.min(20, bodyRows - 4, chartQuote.points.length))
-					: Math.max(2, Math.min(compactChartHeightCap, chartQuote.points.length));
 				const chartWidth = wideCrypto ? Math.floor(width * 0.39) : width;
-				for (const row of chartLines(chartQuote.points, chartWidth, (text) => th.fg("success", text), (text) => th.fg("dim", text), chartQuote.chartScope === "day" ? chartQuote.previousClose : undefined, chartHeight, chartQuote.pointTimes, chartQuote.pointSessions, chartQuote.timezone, chartQuote.interval, (value) => dollars(value, chartQuote.currency), undefined, undefined, chartQuote.chartScope, "candles", undefined, (text) => th.fg("error", text), chartQuote.pointVolumes, deltaBase, chartQuote.pointOpens, chartQuote.pointHighs, chartQuote.pointLows)) chartBlock.push(fit(row));
-				if (chartQuote.dayLow !== null || chartQuote.dayHigh !== null || chartQuote.volume !== null) {
-					chartBlock.push(fit(th.fg("dim", `  Range ${dollars(chartQuote.dayLow, chartQuote.currency)} – ${dollars(chartQuote.dayHigh, chartQuote.currency)} · Vol ${compactNumber(chartQuote.volume)}`)));
-				}
+				const buildChartRows = (height: number) => chartLines(chartQuote.points, chartWidth, (text) => th.fg("success", text), (text) => th.fg("dim", text), chartQuote.chartScope === "day" ? chartQuote.previousClose : undefined, height, chartQuote.pointTimes, chartQuote.pointSessions, chartQuote.timezone, chartQuote.interval, (value) => dollars(value, chartQuote.currency), undefined, undefined, chartQuote.chartScope, "candles", undefined, (text) => th.fg("error", text), chartQuote.pointVolumes, deltaBase, chartQuote.pointOpens, chartQuote.pointHighs, chartQuote.pointLows);
+				const chartLineMinimum = buildChartRows(2);
+				const chartLineOverhead = chartLineMinimum.length - 2;
+				const rangeLine = chartQuote.dayLow !== null || chartQuote.dayHigh !== null || chartQuote.volume !== null;
+				const chartHeightBudget = wideCrypto
+					? bodyRows - 2 - chartLineOverhead - (rangeLine ? 1 : 0)
+					: compactChartBudget - 2 - chartLineOverhead - (rangeLine ? 1 : 0);
+				const chartHeight = Math.max(2, Math.min(10, chartHeightBudget, chartQuote.points.length));
+				for (const row of buildChartRows(chartHeight)) chartBlock.push(fit(row));
+				if (rangeLine) chartBlock.push(fit(th.fg("dim", `  Range ${dollars(chartQuote.dayLow, chartQuote.currency)} – ${dollars(chartQuote.dayHigh, chartQuote.currency)} · Vol ${compactNumber(chartQuote.volume)}`)));
 			}
 		} else {
 			chartBlock.push(fit(th.bold(th.fg("accent", "PRICE CHART"))));
@@ -6279,6 +6301,7 @@ class MarketHub {
 			// Natural-height two-column board: the left list fills its capacity,
 			// the right chart renders to the pane; the full-width strip sits
 			// right under them. twoColumn pads the shorter column with blanks.
+			const boardBlock = [boardHeading, ...boardRows.map((row) => row.line), ...(boardStatus ? [boardStatus] : [])];
 			lines.push(...twoColumn([...head, ...boardBlock], [...chartBlock, ""], width, 0));
 			lines.push(...stripBlock);
 		} else {
@@ -6287,18 +6310,20 @@ class MarketHub {
 			// intentionally suppressed here to keep the chart visible.
 			// Never slice the chart tail: shrink the board window first so
 			// PRICE CHART + axes + range always survive on phones.
-			let fittedBoard = [...boardBlock];
+			let fittedRows = [...boardRows];
+			let includeBoardStatus = boardStatus !== undefined;
 			const gaps = 2;
-			while (head.length + fittedBoard.length + chartBlock.length + gaps > bodyRows && fittedBoard.length > 3) {
+			while (head.length + 1 + fittedRows.length + (includeBoardStatus ? 1 : 0) + chartBlock.length + gaps > bodyRows && fittedRows.length > 1) {
 				// Drop the status line first, then the farthest non-selected row.
-				const statusIdx = fittedBoard.findIndex((line) => line.includes("W/S SCROLL"));
-				if (statusIdx >= 0) {
-					fittedBoard.splice(statusIdx, 1);
+				if (includeBoardStatus) {
+					includeBoardStatus = false;
 					continue;
 				}
-				// Keep header (0) + selected row + nearest neighbors; drop the tail.
-				fittedBoard.splice(fittedBoard.length - 1, 1);
+				const removeIndex = [...fittedRows].reverse().findIndex((row) => row.index !== this.cryptoSelected);
+				if (removeIndex < 0) break;
+				fittedRows.splice(fittedRows.length - 1 - removeIndex, 1);
 			}
+			const fittedBoard = [boardHeading, ...fittedRows.map((row) => row.line), ...(includeBoardStatus && boardStatus ? [boardStatus] : [])];
 			lines.push(...stretchBlocks([head, fittedBoard, chartBlock], bodyRows, "", 1));
 		}
 	}
