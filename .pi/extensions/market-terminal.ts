@@ -6190,14 +6190,17 @@ class MarketHub {
 		// Fill the pane vertically like MOVERS: capacity tracks available rows
 		// after the head block and the window-status line.
 		const wideCrypto = width >= 84 && terminalRows(this.tui) >= 24;
-		// Compact screens reserve a bounded chart budget before sizing the board.
-		// The previous layout let the board, unranked row, and movers strip consume
-		// the viewport before the selected chart could be reached.
-		const compactChartReserve = Math.min(8, Math.max(4, bodyRows - head.length - 6));
-		const boardReserve = board.length > Math.max(1, bodyRows - head.length - (wideCrypto ? 2 : compactChartReserve)) ? 1 : 0;
+		// Compact: chart is guaranteed. Size the board from the remainder
+		// after head + chart + gaps, so stretchBlocks never slices the chart tail.
+		// Wide keeps the previous fill behavior.
+		const compactMinBoard = 3; // header + 2 rows (status line folded in when needed)
+		const compactChartBudget = wideCrypto
+			? 2
+			: Math.max(4, Math.min(11, bodyRows - head.length - compactMinBoard - 2));
+		const boardReserve = board.length > Math.max(1, bodyRows - head.length - (wideCrypto ? 2 : compactChartBudget)) ? 1 : 0;
 		const windowCapacity = Math.max(2, Math.min(
 			board.length,
-			bodyRows - head.length - (wideCrypto ? 2 : compactChartReserve) - boardReserve,
+			bodyRows - head.length - (wideCrypto ? 2 : compactChartBudget) - boardReserve,
 		));
 		const window = selectionWindow(board, this.cryptoSelected, windowCapacity);
 		const boardBlock = [
@@ -6254,9 +6257,13 @@ class MarketHub {
 				const deltaBase = chartQuote.chartScope === "day" ? chartQuote.previousClose ?? null : chartQuote.points[0] ?? null;
 				chartBlock.push(fit(`${th.bold(th.fg("accent", "PRICE CHART"))}  ${th.bold(th.fg("text", chartQuote.symbol))} ${th.bold(th.fg(direction, `${dollars(chartQuote.price, chartQuote.currency)} ${percent(chartQuote.changePercent)}`))}`));
 				chartBlock.push(fit(th.fg("dim", `  ${CHART_SCOPE_CONFIGS[this.chartScope].label} · ${chartQuote.chartScope === "day" ? `${chartQuote.interval} · PRE/REG/POST` : chartQuote.interval} · J open · K why · E watch`)));
+				// Compact chart height is bounded by the reserved budget:
+				// 2 header lines + chart + optional range line must fit in budget.
+				// This keeps the tail (axes + range) from being sliced on phones.
+				const compactChartHeightCap = Math.max(2, Math.min(6, compactChartBudget - 3));
 				const chartHeight = wideCrypto
 					? Math.max(2, Math.min(20, bodyRows - 4, chartQuote.points.length))
-					: Math.max(2, Math.min(8, bodyRows - head.length - 6, chartQuote.points.length));
+					: Math.max(2, Math.min(compactChartHeightCap, chartQuote.points.length));
 				const chartWidth = wideCrypto ? Math.floor(width * 0.39) : width;
 				for (const row of chartLines(chartQuote.points, chartWidth, (text) => th.fg("success", text), (text) => th.fg("dim", text), chartQuote.chartScope === "day" ? chartQuote.previousClose : undefined, chartHeight, chartQuote.pointTimes, chartQuote.pointSessions, chartQuote.timezone, chartQuote.interval, (value) => dollars(value, chartQuote.currency), undefined, undefined, chartQuote.chartScope, "candles", undefined, (text) => th.fg("error", text), chartQuote.pointVolumes, deltaBase, chartQuote.pointOpens, chartQuote.pointHighs, chartQuote.pointLows)) chartBlock.push(fit(row));
 				if (chartQuote.dayLow !== null || chartQuote.dayHigh !== null || chartQuote.volume !== null) {
@@ -6278,7 +6285,21 @@ class MarketHub {
 			// On compact screens the selected chart is part of the primary flow.
 			// The display-only movers strip remains available on desktop, but is
 			// intentionally suppressed here to keep the chart visible.
-			lines.push(...stretchBlocks([head, boardBlock, chartBlock], bodyRows, "", 1));
+			// Never slice the chart tail: shrink the board window first so
+			// PRICE CHART + axes + range always survive on phones.
+			let fittedBoard = [...boardBlock];
+			const gaps = 2;
+			while (head.length + fittedBoard.length + chartBlock.length + gaps > bodyRows && fittedBoard.length > 3) {
+				// Drop the status line first, then the farthest non-selected row.
+				const statusIdx = fittedBoard.findIndex((line) => line.includes("W/S SCROLL"));
+				if (statusIdx >= 0) {
+					fittedBoard.splice(statusIdx, 1);
+					continue;
+				}
+				// Keep header (0) + selected row + nearest neighbors; drop the tail.
+				fittedBoard.splice(fittedBoard.length - 1, 1);
+			}
+			lines.push(...stretchBlocks([head, fittedBoard, chartBlock], bodyRows, "", 1));
 		}
 	}
 
@@ -6690,15 +6711,36 @@ class MarketHub {
 			return;
 		}
 
-		const capacity = bodyRows >= 18 ? Math.min(MOVER_LIMIT, Math.max(3, Math.floor(bodyRows * 0.42))) : Math.max(2, bodyRows - 7);
+		// Compact: guarantee the selected (second) chart. Size the list from
+		// the remainder after reserving detail, then shrink list first so the
+		// chart tail (axes) is never sliced on phones.
+		const detailReserve = Math.max(6, Math.min(14, bodyRows - 5));
+		const compactCapacity = Math.max(2, Math.min(
+			MOVER_LIMIT,
+			bodyRows - detailReserve - 2,
+		));
+		const capacity = bodyRows >= 18
+			? Math.min(MOVER_LIMIT, Math.max(3, Math.floor(bodyRows * 0.42)))
+			: compactCapacity;
 		const window = selectionWindow(movers, this.selected, capacity);
 		const listBlock = [fit(heading), ...window.items.map((mover, offset) => fit(moverRow(mover, window.start + offset)))];
 		if (window.items.length < movers.length) listBlock.push(fit(th.fg("dim", `MOVERS ${window.start + 1}–${window.start + window.items.length} / ${movers.length}`)));
 		const detailBlock = [fit(selectedSummary), fit(selectedMetrics)];
-		if (bodyRows >= 18) {
+		// Render the chart even on short phones (previously gated at 18 rows,
+		// leaving small viewports with no chart at all).
+		if (bodyRows >= 14) {
 			for (const row of chartLines(selectedQuote.points, width, (text) => th.fg("success", text), (text) => th.fg("dim", text), selectedQuote.chartScope === "day" ? selectedQuote.previousClose : undefined, Math.max(2, Math.min(10, bodyRows - listBlock.length - 6)), selectedQuote.pointTimes, selectedQuote.pointSessions, selectedQuote.timezone, selectedQuote.interval, (value) => dollars(value, selectedQuote.currency), undefined, undefined, selectedQuote.chartScope, "candles", undefined, (text) => th.fg("error", text), selectedQuote.pointVolumes, selectedQuote.chartScope === "day" ? selectedQuote.previousClose ?? null : selectedQuote.points[0] ?? null, selectedQuote.pointOpens, selectedQuote.pointHighs, selectedQuote.pointLows)) detailBlock.push(fit(row));
 		}
-		lines.push(...stretchBlocks([listBlock, detailBlock], bodyRows, th.fg("borderMuted", "  │"), 1));
+		let fittedList = [...listBlock];
+		while (fittedList.length + detailBlock.length + 1 > bodyRows && fittedList.length > 3) {
+			const statusIdx = fittedList.findIndex((line) => line.includes("MOVERS ") && line.includes("/"));
+			if (statusIdx >= 0) {
+				fittedList.splice(statusIdx, 1);
+				continue;
+			}
+			fittedList.splice(fittedList.length - 1, 1);
+		}
+		lines.push(...stretchBlocks([fittedList, detailBlock], bodyRows, th.fg("borderMuted", "  │"), 1));
 	}
 
 	debugState() {
@@ -6848,7 +6890,14 @@ class MarketHub {
 			lines.push(...twoColumn(left, right, width, bodyRows));
 			return;
 		}
-		const capacity = bodyRows >= 18 ? Math.max(3, Math.floor(bodyRows * 0.42)) : Math.max(2, bodyRows - 7);
+		// Compact: guarantee the selected (second) chart. Reserve detail
+		// budget first so the list never pushes the chart tail off phones.
+		const watchDetailReserve = Math.max(7, Math.min(15, bodyRows - 5));
+		const compactWatchCapacity = Math.max(2, Math.min(
+			entries.length,
+			bodyRows - watchDetailReserve - 3,
+		));
+		const capacity = bodyRows >= 18 ? Math.max(3, Math.floor(bodyRows * 0.42)) : compactWatchCapacity;
 		const window = selectionWindow(entries, this.selected, capacity);
 		const listBlock: string[] = [fit(heading), fit(th.fg("dim", "Session watch · J opens · K explains · E removes"))];
 		for (const [offset, entry] of window.items.entries()) {
@@ -6861,7 +6910,6 @@ class MarketHub {
 		const selected = entries[this.selected];
 		if (selected?.type === "quote") {
 			const direction = (selected.quote.change ?? 0) >= 0 ? "success" : "error";
-			const chartDirection = selected.quote.points.length >= 2 ? selected.quote.points.at(-1)! >= selected.quote.points[0]! ? "success" : "error" : direction;
 			const detailBlock: string[] = [fit(`${th.bold(th.fg("text", selected.quote.symbol))} ${th.bold(th.fg("text", dollars(selected.quote.price, selected.quote.currency)))} ${th.fg(direction, percent(selected.quote.changePercent))}`)];
 			for (const row of chartLines(selected.quote.points, width, (text) => th.fg("success", text), (text) => th.fg("dim", text), selected.quote.chartScope === "day" ? selected.quote.previousClose : undefined, Math.max(2, Math.min(18, bodyRows - listBlock.length - 7)), selected.quote.pointTimes, selected.quote.pointSessions, selected.quote.timezone, selected.quote.interval, (value) => dollars(value, selected.quote.currency), undefined, undefined, selected.quote.chartScope, "candles", undefined, (text) => th.fg("error", text), selected.quote.pointVolumes, selected.quote.chartScope === "day" ? selected.quote.previousClose ?? null : selected.quote.points[0] ?? null, selected.quote.pointOpens, selected.quote.pointHighs, selected.quote.pointLows)) detailBlock.push(fit(row));
 			if (selected.quote.dayLow !== null || selected.quote.dayHigh !== null || selected.quote.volume !== null) {
@@ -6869,7 +6917,22 @@ class MarketHub {
 			}
 			blocks.push(detailBlock);
 		}
-		lines.push(...stretchBlocks(blocks, bodyRows, th.fg("borderMuted", "  │"), 1));
+		// Never slice the detail chart tail: shrink the list first.
+		let fittedWatchList = [...blocks[0]!];
+		const watchDetail = blocks[1];
+		if (watchDetail) {
+			while (fittedWatchList.length + watchDetail.length + 1 > bodyRows && fittedWatchList.length > 4) {
+				const statusIdx = fittedWatchList.findIndex((line) => line.includes("WATCH ") && line.includes("/"));
+				if (statusIdx >= 0) {
+					fittedWatchList.splice(statusIdx, 1);
+					continue;
+				}
+				fittedWatchList.splice(fittedWatchList.length - 1, 1);
+			}
+			lines.push(...stretchBlocks([fittedWatchList, watchDetail], bodyRows, th.fg("borderMuted", "  │"), 1));
+		} else {
+			lines.push(...stretchBlocks(blocks, bodyRows, th.fg("borderMuted", "  │"), 1));
+		}
 	}
 
 	getLayoutMetrics(): LayoutMetrics | undefined {
