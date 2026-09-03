@@ -517,13 +517,73 @@ strong {
   white-space: nowrap;
 }
 
+.watchlist-import-steps {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 14px;
+  color: #8b949e;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.watchlist-import-step {
+  padding: 4px 8px;
+  border: 1px solid #21262d;
+  border-radius: 999px;
+  background: #0b0e14;
+}
+
+.watchlist-import-step.is-active {
+  color: #79c0ff;
+  border-color: #1f6feb;
+  background: #101826;
+}
+
+.watchlist-import-step-sep {
+  color: #484f58;
+}
+
+.watchlist-import-live-status {
+  min-height: 14px;
+  margin-top: 8px;
+  color: #79c0ff;
+  font-size: 10px;
+  letter-spacing: 0.05em;
+}
+
+.watchlist-import-live-status:focus {
+  outline: 0;
+}
+
+.watchlist-import-dropzone {
+  margin-top: 12px;
+  padding: 14px;
+  border: 1px dashed #58a6ff88;
+  border-radius: 6px;
+  background: #0b0e14;
+  transition: border-color 0.15s ease, background 0.15s ease, transform 0.15s ease;
+}
+
+.watchlist-import-dropzone.is-dragging {
+  border-style: solid;
+  border-color: #79c0ff;
+  background: #101826;
+  transform: scale(1.01);
+}
+
+.watchlist-import-dropzone.is-loading {
+  border-style: solid;
+}
+
 .watchlist-import-file-button {
   width: 100%;
-  margin-top: 16px;
   padding: 13px 16px;
   color: #c9d1d9;
   background: #101826;
-  border: 1px dashed #58a6ff88;
+  border: 1px solid #30363d;
   border-radius: 3px;
   font: inherit;
   font-size: 12px;
@@ -537,12 +597,142 @@ strong {
 .watchlist-import-file-button:hover:not(:disabled) {
   color: #f0f6fc;
   background: #142033;
-  border-style: solid;
+  border-color: #58a6ff;
 }
 
 .watchlist-import-file-button:disabled {
   color: #8b949e;
   cursor: wait;
+}
+
+.watchlist-import-preview {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 12px;
+  padding: 8px;
+  background: #010409;
+  border: 1px solid #21262d;
+  border-radius: 4px;
+  color: #8b949e;
+  font-size: 11px;
+}
+
+.watchlist-import-preview img {
+  width: 72px;
+  height: 48px;
+  object-fit: cover;
+  border-radius: 3px;
+  border: 1px solid #30363d;
+  flex-shrink: 0;
+}
+
+.watchlist-import-shimmer {
+  margin-top: 12px;
+  height: 6px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #1c2128 25%, #30363d 50%, #1c2128 75%);
+  background-size: 200% 100%;
+  animation: watchlist-shimmer 1.2s linear infinite;
+}
+
+@keyframes watchlist-shimmer {
+  from { background-position: 200% 0; }
+  to { background-position: -200% 0; }
+}
+
+.watchlist-import-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 0 8px;
+}
+
+.watchlist-import-tool {
+  padding: 6px 10px;
+  color: #8b949e;
+  background: transparent;
+  border: 1px solid #30363d;
+  border-radius: 999px;
+  font: inherit;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.watchlist-import-tool:hover:not(:disabled) {
+  color: #f0f6fc;
+  border-color: #58a6ff;
+}
+
+.watchlist-import-tool:disabled,
+.watchlist-import-filter:disabled {
+  opacity: 0.58;
+  cursor: wait;
+}
+
+.watchlist-import-filter {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 10px;
+  color: #f0f6fc;
+  background: #010409;
+  border: 1px solid #30363d;
+  border-radius: 999px;
+  font: inherit;
+  font-size: 11px;
+}
+
+.watchlist-import-candidate.is-selected {
+  background: #101826;
+  border-left: 2px solid #1f6feb;
+}
+
+.watchlist-import-candidate.is-invalid {
+  background: #2d1010;
+}
+
+.watchlist-import-asset {
+  color: #58a6ff;
+  font-weight: 700;
+}
+
+.watchlist-import-candidate-sub {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.watchlist-import-confidence {
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid #30363d;
+  font-size: 9px;
+  font-weight: 700;
+}
+
+.watchlist-import-confidence.is-high {
+  color: #7ee787;
+  border-color: #2ea043;
+}
+
+.watchlist-import-confidence.is-mid {
+  color: #d29922;
+  border-color: #9e6a03;
+}
+
+.watchlist-import-confidence.is-low {
+  color: #ff7b72;
+  border-color: #f85149;
+}
+
+.watchlist-import-empty {
+  padding: 16px 12px;
+  color: #8b949e;
+  font-size: 11px;
+  text-align: center;
 }
 
 .watchlist-import-error {
@@ -726,6 +916,24 @@ strong {
   .watchlist-import-actions {
     display: grid;
     grid-template-columns: 1fr;
+  }
+
+  .watchlist-import-toolbar {
+    flex-wrap: wrap;
+  }
+
+  .watchlist-import-filter {
+    flex-basis: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .watchlist-import-dropzone {
+    transition: none;
+  }
+
+  .watchlist-import-shimmer {
+    animation: none;
   }
 }
 

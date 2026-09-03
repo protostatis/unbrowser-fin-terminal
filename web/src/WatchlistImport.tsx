@@ -47,18 +47,38 @@ export function WatchlistImport({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const modalRef = useRef<HTMLElement>(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
+  const progressStatusRef = useRef<HTMLDivElement>(null);
   const previouslyFocusedRef = useRef<HTMLElement | null>(null);
   const uploadAbortRef = useRef<AbortController>();
   const uploadRequestIdRef = useRef(0);
   const loadingRef = useRef(false);
   const applyRequestIdRef = useRef(0);
   const applyingRef = useRef(false);
+  const previewUrlRef = useRef<string>();
   const [loading, setLoading] = useState(false);
   const [applying, setApplying] = useState(false);
   const [error, setError] = useState<string>();
   const [rejected, setRejected] = useState(0);
   const [candidates, setCandidates] = useState<ReviewCandidate[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [dragActive, setDragActive] = useState(false);
+  const [previewUrl, setPreviewUrl] = useState<string>();
+  const [filter, setFilter] = useState("");
+  const step: 1 | 2 = candidates.length > 0 ? 2 : 1;
+  const visibleCandidates = candidates.filter((candidate) => {
+    const query = filter.trim().toLowerCase();
+    return !query
+      || candidate.symbol.toLowerCase().includes(query)
+      || candidate.rawSymbol.toLowerCase().includes(query)
+      || (candidate.name || "").toLowerCase().includes(query);
+  });
+
+  const releasePreview = () => {
+    if (!previewUrlRef.current) return;
+    URL.revokeObjectURL(previewUrlRef.current);
+    previewUrlRef.current = undefined;
+    setPreviewUrl(undefined);
+  };
 
   const cancelUpload = () => {
     uploadRequestIdRef.current++;
@@ -82,6 +102,9 @@ export function WatchlistImport({
     setRejected(0);
     setCandidates([]);
     setSelected(new Set());
+    setDragActive(false);
+    setFilter("");
+    releasePreview();
     if (fileInputRef.current) fileInputRef.current.value = "";
   }, [open]);
 
@@ -98,9 +121,16 @@ export function WatchlistImport({
     };
   }, [open]);
 
+  useEffect(() => {
+    if (!applying) return;
+    const focusFrame = requestAnimationFrame(() => progressStatusRef.current?.focus());
+    return () => cancelAnimationFrame(focusFrame);
+  }, [applying]);
+
   useEffect(() => () => {
     cancelUpload();
     cancelApply();
+    if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
   }, []);
 
   const loadScreenshot = async (file: File) => {
@@ -109,6 +139,11 @@ export function WatchlistImport({
       setError("Choose a PNG, JPEG, or WebP screenshot smaller than 6 MiB.");
       return;
     }
+    releasePreview();
+    const nextPreviewUrl = URL.createObjectURL(file);
+    previewUrlRef.current = nextPreviewUrl;
+    setPreviewUrl(nextPreviewUrl);
+    setDragActive(false);
     const requestId = ++uploadRequestIdRef.current;
     const controller = new AbortController();
     uploadAbortRef.current = controller;
@@ -189,7 +224,13 @@ export function WatchlistImport({
     ];
     const first = focusable[0];
     const last = focusable.at(-1);
-    if (!first || !last) return;
+    if (!first || !last) {
+      // During APPLYING every action is disabled. Keep Tab inside the dialog
+      // rather than allowing focus to fall through to the app behind it.
+      event.preventDefault();
+      progressStatusRef.current?.focus();
+      return;
+    }
     if (event.shiftKey && document.activeElement === first) {
       event.preventDefault();
       last.focus();
@@ -237,6 +278,9 @@ export function WatchlistImport({
     }
   };
 
+  const selection = selectedSymbols();
+  const canApply = !loading && !applying && selection.symbols.length > 0 && selection.invalid.length === 0;
+
   return (
     <>
       {open && (
@@ -272,6 +316,15 @@ export function WatchlistImport({
               The scanner extracts visible instruments and maps crypto tickers to Yahoo pairs, such as BTC to BTC-USD. It never imports balances, prices, or transactions.
             </p>
 
+            <div className="watchlist-import-steps" aria-hidden="true">
+              <span className={`watchlist-import-step${step >= 1 ? " is-active" : ""}`}>1 · Choose</span>
+              <span className="watchlist-import-step-sep">→</span>
+              <span className={`watchlist-import-step${step >= 2 ? " is-active" : ""}`}>2 · Review & apply</span>
+            </div>
+            <div ref={progressStatusRef} className="watchlist-import-live-status" role="status" aria-live="polite" tabIndex={-1}>
+              {loading ? "Scanning screenshot…" : applying ? "Applying selected symbols…" : candidates.length > 0 ? `${selection.symbols.length} valid symbol${selection.symbols.length === 1 ? "" : "s"} ready` : ""}
+            </div>
+
             <input
               ref={fileInputRef}
               className="watchlist-import-file-input"
@@ -281,17 +334,40 @@ export function WatchlistImport({
               onChange={handleFileChange}
               disabled={loading || applying}
             />
-            <button
-              type="button"
-              className="watchlist-import-file-button"
-              onClick={() => fileInputRef.current?.click()}
-              disabled={loading || applying}
+            <div
+              className={`watchlist-import-dropzone${dragActive ? " is-dragging" : ""}${loading ? " is-loading" : ""}`}
+              onDragOver={(event) => {
+                event.preventDefault();
+                if (!loading && !applying) setDragActive(true);
+              }}
+              onDragLeave={() => setDragActive(false)}
+              onDrop={(event) => {
+                event.preventDefault();
+                setDragActive(false);
+                const file = event.dataTransfer.files?.[0];
+                if (file) void loadScreenshot(file);
+              }}
             >
-              {loading ? "READING SCREENSHOT..." : applying ? "APPLYING WATCHLIST..." : "CHOOSE SCREENSHOT"}
-            </button>
-            <p className="watchlist-import-note">
-              PNG, JPEG, or WebP up to 6 MiB. The image is processed in memory and sent only to your configured vision provider.
-            </p>
+              <button
+                type="button"
+                className="watchlist-import-file-button"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={loading || applying}
+              >
+                {loading ? "READING SCREENSHOT…" : applying ? "APPLYING WATCHLIST…" : previewUrl ? "CHOOSE ANOTHER SCREENSHOT" : "CHOOSE OR DROP SCREENSHOT"}
+              </button>
+              {previewUrl ? (
+                <div className="watchlist-import-preview">
+                  <img src={previewUrl} alt="Screenshot preview" />
+                  <span>{loading ? "Scanning symbols…" : `${candidates.length} symbol${candidates.length === 1 ? "" : "s"} found`}</span>
+                </div>
+              ) : (
+                <p className="watchlist-import-note">
+                  PNG, JPEG, or WebP up to 6 MiB · drag & drop or tap to browse. Processed in memory, sent only to your vision provider.
+                </p>
+              )}
+              {loading && <div className="watchlist-import-shimmer" aria-hidden="true" />}
+            </div>
 
             {error && <div className="watchlist-import-error" role="alert">{error}</div>}
 
@@ -301,12 +377,45 @@ export function WatchlistImport({
                   <strong>REVIEW {candidates.length} SYMBOL{candidates.length === 1 ? "" : "S"}</strong>
                   <span>{selected.size}/{candidates.length} selected · Edit Yahoo symbols before applying.</span>
                 </div>
+                <div className="watchlist-import-toolbar">
+                  <button
+                    type="button"
+                    className="watchlist-import-tool"
+                    disabled={applying}
+                    onClick={() => setSelected((current) => new Set([...current, ...visibleCandidates.map((candidate) => candidate.id)]))}
+                  >
+                    {filter.trim() ? "Select visible" : "Select all"}
+                  </button>
+                  <button
+                    type="button"
+                    className="watchlist-import-tool"
+                    disabled={applying}
+                    onClick={() => setSelected((current) => {
+                      const next = new Set(current);
+                      for (const candidate of visibleCandidates) next.delete(candidate.id);
+                      return next;
+                    })}
+                  >
+                    {filter.trim() ? "Clear visible" : "Clear"}
+                  </button>
+                  <input
+                    className="watchlist-import-filter"
+                    placeholder="Filter symbols…"
+                    aria-label="Filter symbols"
+                    value={filter}
+                    disabled={applying}
+                    onChange={(event) => setFilter(event.target.value)}
+                  />
+                </div>
                 <div className="watchlist-import-candidates">
-                  {candidates.map((candidate) => {
-                    const symbolInvalid = selected.has(candidate.id)
-                      && !normalizeWatchlistSymbol(candidate.symbol);
+                  {visibleCandidates.length === 0 ? (
+                    <div className="watchlist-import-empty">No symbols match “{filter}”.</div>
+                  ) : visibleCandidates.map((candidate) => {
+                    const symbolInvalid = !normalizeWatchlistSymbol(candidate.symbol);
+                    const confidence = candidate.confidence === undefined ? null : Math.round(candidate.confidence * 100);
+                    const assetIcon = candidate.assetType === "crypto" ? "₿" : candidate.assetType === "index" ? "◧" : candidate.assetType === "etf" || candidate.assetType === "fund" ? "▦" : "●";
                     return (
-                      <div className="watchlist-import-candidate" key={candidate.id}>
+                      <div className={`watchlist-import-candidate${selected.has(candidate.id) ? " is-selected" : ""}${symbolInvalid ? " is-invalid" : ""}`} key={candidate.id}>
                         <input
                           type="checkbox"
                           aria-label={`Include ${candidate.name || candidate.rawSymbol}`}
@@ -323,8 +432,13 @@ export function WatchlistImport({
                           }}
                         />
                         <span className="watchlist-import-candidate-meta">
-                          <span className="watchlist-import-candidate-name">{candidate.name || candidate.rawSymbol}</span>
-                          <span>{readableAssetType(candidate.assetType)}{candidate.confidence === undefined ? "" : ` · ${Math.round(candidate.confidence * 100)}% read`}</span>
+                          <span className="watchlist-import-candidate-name"><span aria-hidden="true" className="watchlist-import-asset">{assetIcon}</span> {candidate.name || candidate.rawSymbol}</span>
+                          <span className="watchlist-import-candidate-sub">
+                            {readableAssetType(candidate.assetType)}
+                            {confidence !== null && (
+                              <span className={`watchlist-import-confidence${confidence >= 80 ? " is-high" : confidence >= 50 ? " is-mid" : " is-low"}`}> · {confidence}%</span>
+                            )}
+                          </span>
                         </span>
                         <input
                           className="watchlist-import-symbol"
@@ -348,10 +462,10 @@ export function WatchlistImport({
                   <p className="watchlist-import-rejected">{rejected} unreadable or duplicate row{rejected === 1 ? " was" : "s were"} left out.</p>
                 )}
                 <div className="watchlist-import-actions">
-                  <button type="button" className="watchlist-import-add" disabled={loading || applying} onClick={() => void apply("merge")}>
+                  <button type="button" className="watchlist-import-add" disabled={!canApply} onClick={() => void apply("merge")}>
                     {applying ? "APPLYING..." : "ADD SELECTED"}
                   </button>
-                  <button type="button" className="watchlist-import-replace" disabled={loading || applying} onClick={() => void apply("replace")}>
+                  <button type="button" className="watchlist-import-replace" disabled={!canApply} onClick={() => void apply("replace")}>
                     {applying ? "APPLYING..." : "REPLACE WATCHLIST"}
                   </button>
                 </div>

@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import registerMarketExtension, {
-  setCryptoPulseFetchImplForTest,
+	setCryptoPulseChartFetchImplForTest,
+	setCryptoPulseFetchImplForTest,
 } from "../.pi/extensions/market-terminal.js";
 
 type TestTool = {
@@ -31,7 +32,28 @@ function jsonResponse(body: unknown): Response {
 
 /** Deterministic crypto pulse fixture so the UI test never touches the network. */
 function cryptoPulseFixtureFetch(url: string): Response {
-  if (url.includes("/global-metrics/")) {
+	if (url.includes("/v8/finance/chart/")) {
+		const timestamps = Array.from({ length: 12 }, (_, index) => 1_756_000_000 + index * 300);
+		const closes = [0.100, 0.102, 0.101, 0.104, 0.106, 0.105, 0.108, 0.109, 0.107, 0.110, 0.111, 0.112];
+		const opens = closes.map((close, index) => index === 0 ? close - 0.001 : closes[index - 1]!);
+		const highs = closes.map((close, index) => Math.max(close, opens[index]!) + 0.001);
+		const lows = closes.map((close, index) => Math.min(close, opens[index]!) - 0.001);
+		return jsonResponse({ chart: { result: [{
+			meta: {
+				currency: "USD", symbol: "DOGE-USD", shortName: "Dogecoin",
+				regularMarketPrice: 0.112, previousClose: 0.100, chartPreviousClose: 0.100,
+				regularMarketDayLow: 0.099, regularMarketDayHigh: 0.113, regularMarketVolume: 12_000_000,
+				regularMarketTime: timestamps.at(-1), exchangeTimezoneName: "UTC", dataGranularity: "5m",
+				currentTradingPeriod: { regular: { start: timestamps[0], end: timestamps.at(-1)! + 300 } },
+			},
+			timestamp: timestamps,
+			indicators: { quote: [{ close: closes, open: opens, high: highs, low: lows, volume: timestamps.map((_, index) => 100 + index * 10) }] },
+		}] } });
+	}
+	if (url.includes("/v1/finance/search")) {
+		return jsonResponse({ quotes: [{ symbol: "DOGE-USD", quoteType: "CRYPTOCURRENCY" }] });
+	}
+	if (url.includes("/global-metrics/")) {
     return jsonResponse({ data: { quote: { USD: {
       total_market_cap: 2607236260883.6235,
       total_volume_24h: 167449014414.27,
@@ -114,7 +136,8 @@ function fixtureFetch(mode: FixtureMode): (url: string) => Response {
 }
 
 test.after(() => {
-  setCryptoPulseFetchImplForTest(undefined);
+	setCryptoPulseChartFetchImplForTest(undefined);
+	setCryptoPulseFetchImplForTest(undefined);
 });
 
 test("G toggles the MARKET screen between GLOBAL and CRYPTO PULSE subviews", async () => {
@@ -186,26 +209,31 @@ test("Crypto Pulse renders the mood strip and HOT/COLD scoreboard in char cells"
   assert.ok(narrowLines.some((line: string) => line.includes("COLDEST")), "stacked board header should mention COLDEST");
 });
 
-test("compact Crypto Pulse guarantees a full-width chart at 48x24 and 80x30", async () => {
-  setCryptoPulseFetchImplForTest(cryptoPulseFixtureFetch);
+test("compact Crypto Pulse keeps the complete chart tail at mobile heights", async () => {
+	setCryptoPulseFetchImplForTest(cryptoPulseFixtureFetch);
+	setCryptoPulseChartFetchImplForTest(cryptoPulseFixtureFetch);
   const uiTest = registeredTools().get("market_ui_test");
   assert.ok(uiTest);
 
   await uiTest.execute("reset", { action: "reset" });
-  await uiTest.execute("open_market", { action: "open_market" });
-  await uiTest.execute("press", { action: "press", button: "button_g" });
-  await waitForState(uiTest, (state: any) => state.cryptoPulse?.state === "ready");
+	await uiTest.execute("open_market", { action: "open_market" });
+	await uiTest.execute("press", { action: "press", button: "button_g" });
+	await waitForState(uiTest, (state: any) => state.cryptoPulse?.state === "ready");
+	for (let index = 0; index < 5; index++) await uiTest.execute("press", { action: "press", button: "dpad_down" });
+	await waitForScreen(uiTest, (lines) => lines.some((line) => line.includes("CANDLE")));
 
-  const small = await uiTest.execute("state", { action: "state", width: 48, height: 24 });
-  const smallLines: string[] = small.details.screen;
-  assert.ok(smallLines.some((line: string) => line.includes("PRICE CHART")), "48x24 compact must show PRICE CHART");
-  assert.ok(!smallLines.some((line: string) => line.includes("TOP-20")), "48x24 compact must suppress TOP-20 display-only strip");
-  assert.ok(!smallLines.some((line: string) => line.includes("UNRANKED")), "48x24 compact must suppress UNRANKED");
-
-  const mid = await uiTest.execute("state", { action: "state", width: 80, height: 30 });
-  const midLines: string[] = mid.details.screen;
-  assert.ok(midLines.some((line: string) => line.includes("PRICE CHART")), "80x30 compact must show PRICE CHART");
-  assert.ok(!midLines.some((line: string) => line.includes("TOP-20")), "80x30 compact must suppress TOP-20");
+	for (const [width, height] of [[48, 20], [60, 22], [48, 24], [80, 30]] as const) {
+		const rendered = await uiTest.execute("state", { action: "state", width, height });
+		const lines: string[] = rendered.details.screen;
+		assert.ok(lines.some((line: string) => line.includes("PRICE CHART")), `${width}x${height} compact must show PRICE CHART`);
+		assert.ok(lines.some((line: string) => line.includes("CANDLE")), `${width}x${height} chart legend must survive`);
+		assert.ok(lines.some((line: string) => line.includes("VOL")), `${width}x${height} chart volume row must survive`);
+		assert.ok(lines.some((line: string) => line.includes("UTC")), `${width}x${height} chart time axis must survive`);
+		assert.ok(lines.some((line: string) => line.includes("Range")), `${width}x${height} chart range must survive`);
+		assert.ok(lines.some((line: string) => line.includes("►")), `${width}x${height} selected board row must survive chart fitting`);
+		assert.ok(!lines.some((line: string) => line.includes("TOP-20")), `${width}x${height} compact must suppress TOP-20 display-only strip`);
+		assert.ok(!lines.some((line: string) => line.includes("UNRANKED")), `${width}x${height} compact must suppress UNRANKED`);
+	}
 });
 
 test("leaving the MARKET screen resets the crypto subview to GLOBAL", async () => {
