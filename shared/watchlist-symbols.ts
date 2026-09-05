@@ -16,6 +16,9 @@ export type WatchlistUpdate = {
 /** Accept the Yahoo Finance symbol formats the terminal can fetch. */
 export function normalizeWatchlistSymbol(value: string): string | undefined {
   const symbol = value.trim().toUpperCase();
+  // `=` covers index futures (ES=F, NQ=F, YM=F) used as the US-board proxy
+  // feed in extended sessions — indices report hasPrePostMarketData=false and
+  // their DAY chart is otherwise the prior regular session (stale).
   return /^(\^?[A-Z][A-Z0-9.\-=]{0,31}|[0-9]{6}\.(SS|SZ))$/.test(symbol)
     ? symbol
     : undefined;
