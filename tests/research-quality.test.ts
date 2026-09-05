@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   assessCanvasQuality,
+  buildDiscoveryLeadBlock,
   cacheEvidenceSuffix,
   canvasQualityTelemetry,
   coalesceSourceBlocks,
@@ -332,4 +333,16 @@ test("news as evidence still requires a sourced read", () => {
     ],
   }));
   assert.equal(readPlusNews.usable, true, "read + news evidence is usable");
+});
+
+test("discovery publishes an explicitly unverified story preview before extraction", () => {
+  const block = buildDiscoveryLeadBlock([
+    { id: "S-1", title: "Oracle announces a new cloud partnership", url: "https://example.com/oracle", source: "example.com", status: "search-only" },
+  ]);
+  assert.ok(block);
+  assert.equal(block.id, "discovery-leads");
+  assert.equal(block.kind, "news");
+  assert.equal(block.dossierHint, "sources");
+  assert.equal(block.items[0]?.sourceIds?.[0], "S-1");
+  assert.match(block.items[0]?.note ?? "", /Search-only lead/);
 });

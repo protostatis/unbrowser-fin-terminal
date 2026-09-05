@@ -281,6 +281,12 @@ test("differential: browser worker core settles complete with the conformance sc
 		// ── Canvas evidence (at least one; the final one is stage=complete) ──
 		const canvases = events.filter((e) => e.type === "canvas");
 		assert.ok(canvases.length >= 1, "expected at least one canvas event");
+		const partialWithDiscovery = canvases.find((event) => {
+			const canvas = event.canvas as { stage?: string; blocks?: Array<{ id?: string }> } | undefined;
+			return canvas?.stage === "partial" && canvas.blocks?.some((block) => block.id === "discovery-leads");
+		});
+		assert.ok(partialWithDiscovery,
+			"partial discovery publishes visible, explicitly unverified story leads");
 		const finalCanvas = canvases.at(-1)!.canvas as {
 			stage?: string;
 			blocks?: Array<{ id: string; sourceIds?: string[]; dossierHint?: string }>;
@@ -288,6 +294,8 @@ test("differential: browser worker core settles complete with the conformance sc
 		};
 		assert.equal(finalCanvas.stage, "complete");
 		assert.equal(finalCanvas.symbol, "AAPL");
+		assert.ok(!finalCanvas.blocks?.some((block) => block.id === "discovery-leads"),
+			"transient discovery leads do not survive into the completed canvas");
 		const readBlock = finalCanvas.blocks?.find((block) => block.dossierHint === "read");
 		assert.ok(readBlock, "complete canvas carries a read block");
 		const sourceIds = readBlock?.sourceIds ?? [];
