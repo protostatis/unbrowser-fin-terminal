@@ -166,6 +166,8 @@ export type { CanvasQualityCode, CanvasQualityTelemetry, PrecacheResearchRequest
 type TickerLayout = "quote" | "research" | "split";
 
 const LEGACY_RESEARCH_KEY = "legacy";
+/** Temporary, explicitly unverified story leads shown while extraction runs. */
+const DISCOVERY_LEADS_BLOCK_ID = "discovery-leads";
 
 function normalizeResearchKey(value: unknown): string {
 	const key = typeof value === "string" ? value.trim().toLowerCase() : "";
@@ -259,6 +261,42 @@ export type DiscoveryCandidate = {
 	status: "search-only";
 	candidateId?: string;
 };
+
+/**
+ * Turn search candidates into an honest incremental canvas preview. These are
+ * discovery labels, not evidence: the final agent canvas replaces them after
+ * extraction, and the explicit note prevents search snippets from being read
+ * as verified facts while a worker is still running.
+ */
+export function buildDiscoveryLeadBlock(
+	candidates: readonly DiscoveryCandidate[],
+): Extract<CanvasBlock, { kind: "news" }> | undefined {
+	const items: CanvasNewsItem[] = [];
+	for (const candidate of candidates.slice(0, 12)) {
+		const headline = cleanText(candidate.title).slice(0, 4000).trim();
+		const url = sanitizePublicUrl(candidate.url);
+		if (!headline || !url) continue;
+		let source = cleanText(candidate.source).slice(0, 160).trim();
+		if (!source) {
+			try { source = new URL(url).hostname.replace(/^www\./, ""); } catch { source = "web"; }
+		}
+		items.push({
+			headline,
+			source: source || "web",
+			url,
+			note: "Search-only lead · awaiting source extraction and verification.",
+			sourceIds: [candidate.id],
+		});
+	}
+	if (items.length === 0) return undefined;
+	return {
+		id: DISCOVERY_LEADS_BLOCK_ID,
+		kind: "news",
+		title: "DISCOVERY LEADS · UNVERIFIED",
+		items,
+		dossierHint: "sources",
+	};
+}
 type ResearchActionResponse = { accepted: boolean; status: string; job?: ResearchJob };
 type ResearchActions = {
 	start: (request: ResearchRequest) => ResearchActionResponse;
@@ -2690,6 +2728,10 @@ function classifyDossierHint(block: CanvasBlock): DossierHint | undefined {
 
 function sortBlocksByDossier(blocks: CanvasBlock[]): CanvasBlock[] {
 	return [...blocks].sort((a, b) => {
+		// Make the honest discovery preview visible before the tall deterministic
+		// TA charts. It is transient and is removed from complete canvases below.
+		if (a.id === DISCOVERY_LEADS_BLOCK_ID && b.id !== DISCOVERY_LEADS_BLOCK_ID) return -1;
+		if (b.id === DISCOVERY_LEADS_BLOCK_ID && a.id !== DISCOVERY_LEADS_BLOCK_ID) return 1;
 		const aHint = classifyDossierHint(a);
 		const bHint = classifyDossierHint(b);
 		if (aHint === undefined && bHint === undefined) return 0;
@@ -3334,6 +3376,19 @@ function dropTransientDiscoverySourceBlock(merged: CanvasBlock[], incoming: Canv
 	return merged;
 }
 
+function dropTransientDiscoveryBlocks(
+	merged: CanvasBlock[],
+	incoming: CanvasBlock[],
+	stage: CanvasStage | undefined,
+): CanvasBlock[] {
+	// Search-only story leads are useful during a partial run, but must never
+	// survive into a completed source-verified canvas as if they were evidence.
+	const withoutLeads = stage === "complete"
+		? merged.filter((block) => block.id !== DISCOVERY_LEADS_BLOCK_ID)
+		: merged;
+	return dropTransientDiscoverySourceBlock(withoutLeads, incoming);
+}
+
 function canvasHasRenderableContent(canvas: Canvas): boolean {
 	return cleanText(canvas.content).trim().length > 0 || normalizeCanvasBlocks(canvas.blocks).length > 0;
 }
@@ -3647,7 +3702,7 @@ function storeCanvas(canvas: Canvas, merge: boolean, allowTechnicalOverwrite = f
 		? coalesceSourceBlocks(mergeCanvasBlocks(previous?.blocks, canvas.blocks, allowTechnicalOverwrite))
 		: incomingBlocks;
 	const blocks = merge && sameResearch
-		? dropTransientDiscoverySourceBlock(mergedBlocks, incomingBlocks)
+		? dropTransientDiscoveryBlocks(mergedBlocks, incomingBlocks, canvas.stage)
 		: mergedBlocks;
 	if (blocks.length > 12) throw new Error(`Canvas block limit exceeded (${blocks.length}/12). Consolidate non-technical research blocks; deterministic ta-* blocks are reserved.`);
 	const content = merge && sameResearch && !canvas.content.trim()
@@ -9169,7 +9224,7 @@ export default function (pi: ExtensionAPI) {
 
 	const publishDiscoverySeed = (
 		job: ResearchJob | undefined,
-		candidates: Array<{ id: string; title: string; url: string; status: "search-only" }>,
+		candidates: Array<{ id: string; title: string; url: string; source?: string; status: "search-only" }>,
 		challenge?: string,
 	): Canvas | undefined => {
 		if (!job || (candidates.length === 0 && !challenge)) return undefined;
@@ -9184,6 +9239,12 @@ export default function (pi: ExtensionAPI) {
 				title: "Sources",
 				items: candidates.map((candidate) => ({ id: candidate.id, label: candidate.title, url: candidate.url, status: candidate.status })),
 			});
+			const discoveryLeads = buildDiscoveryLeadBlock(candidates.map((candidate) => ({
+				...candidate,
+				source: candidate.source ?? "",
+				status: "search-only" as const,
+			})));
+			if (discoveryLeads) blocks.push(discoveryLeads);
 		}
 		const canvas = storeCanvas({
 			symbol: job.symbol,
