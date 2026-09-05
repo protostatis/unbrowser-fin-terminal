@@ -16,7 +16,7 @@ export type WatchlistUpdate = {
 /** Accept the Yahoo Finance symbol formats the terminal can fetch. */
 export function normalizeWatchlistSymbol(value: string): string | undefined {
   const symbol = value.trim().toUpperCase();
-  return /^(\^?[A-Z][A-Z0-9.\-]{0,9}|[0-9]{6}\.(SS|SZ))$/.test(symbol)
+  return /^(\^?[A-Z][A-Z0-9.\-=]{0,31}|[0-9]{6}\.(SS|SZ))$/.test(symbol)
     ? symbol
     : undefined;
 }

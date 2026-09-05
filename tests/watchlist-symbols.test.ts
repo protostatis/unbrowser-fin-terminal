@@ -8,6 +8,7 @@ import {
 
 test("normalizes the Yahoo symbol formats used by the terminal", () => {
   assert.equal(normalizeWatchlistSymbol(" btc-usd "), "BTC-USD");
+  assert.equal(normalizeWatchlistSymbol("sui20947-usd"), "SUI20947-USD");
   assert.equal(normalizeWatchlistSymbol("^gspc"), "^GSPC");
   assert.equal(normalizeWatchlistSymbol("000001.ss"), "000001.SS");
   assert.equal(normalizeWatchlistSymbol("BTC/USD"), undefined);

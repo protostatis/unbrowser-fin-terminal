@@ -9,6 +9,7 @@ import {
   WATCHLIST_MAX_SYMBOLS,
   normalizeWatchlistSymbol,
 } from "../shared/watchlist-symbols.js";
+import { yahooPairForSymbol } from "../shared/crypto-pulse.js";
 
 export const WATCHLIST_SCREENSHOT_MAX_BYTES = 6 * 1024 * 1024;
 export const WATCHLIST_SCREENSHOT_MAX_CANDIDATES = WATCHLIST_MAX_SYMBOLS;
@@ -78,15 +79,18 @@ function normalizedAssetType(value: unknown): WatchlistScreenshotCandidate["asse
   return "other";
 }
 
-function yahooSymbol(value: string, assetType: WatchlistScreenshotCandidate["assetType"]): string | undefined {
+function yahooSymbol(value: string, assetType: WatchlistScreenshotCandidate["assetType"], rawValue?: string): string | undefined {
   const compact = value.trim().toUpperCase();
+  const rawCompact = rawValue?.trim().toUpperCase() ?? compact;
   if (/\s/.test(compact)) return undefined;
   // Exchange UIs usually render a crypto base ticker (BTC), while Yahoo uses
-  // the quote pair (BTC-USD). Never apply this conversion to equities.
-  const symbol = assetType === "crypto" && /^[A-Z0-9]{2,10}$/.test(compact)
-    ? `${compact}-USD`
+  // the quote pair (BTC-USD). Never apply this conversion to equities. The raw
+  // base ticker is authoritative even when the model also supplies a
+  // yahooSymbol, so a stale SUI-USD cannot bypass the verified override.
+  const symbol = assetType === "crypto" && /^[A-Z0-9]{2,10}$/.test(rawCompact)
+    ? yahooPairForSymbol(rawCompact) ?? undefined
     : compact;
-  return normalizeWatchlistSymbol(symbol);
+  return symbol ? normalizeWatchlistSymbol(symbol) : undefined;
 }
 
 function parseJsonContent(content: string): Record<string, unknown> {
@@ -130,7 +134,7 @@ export function parseWatchlistScreenshotResponse(content: string): WatchlistScre
     const rawSymbol = boundedText(instrument.symbol ?? instrument.ticker, 32);
     const assetType = normalizedAssetType(instrument.assetType);
     const mappedSymbol = boundedText(instrument.yahooSymbol, 32);
-    const symbol = yahooSymbol(mappedSymbol ?? rawSymbol ?? "", assetType);
+    const symbol = yahooSymbol(mappedSymbol ?? rawSymbol ?? "", assetType, rawSymbol);
     if (!rawSymbol || !symbol || seen.has(symbol)) {
       rejected++;
       continue;
