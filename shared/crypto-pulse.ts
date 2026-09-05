@@ -45,7 +45,8 @@ const MAX_RESPONSE_BYTES = 512 * 1024;
  * every rebrand and new listing. The top-100 by market cap is fetched live,
  * stablecoins excluded, and every row maps to a Yahoo pair via the
  * `<SYMBOL>-USD` convention (with a small override registry for known
- * collisions). Rows are selectable and openable like MOVERS.
+ * collisions and Yahoo's numeric-suffix pairs). Rows are selectable and
+ * openable like MOVERS.
  */
 const MAX_LISTINGS = 100;
 /** Stablecoins are excluded from the HOT/COLD scoreboard. */
@@ -59,7 +60,9 @@ const STABLECOIN_SYMBOLS = new Set([
  * in automatically. Yahoo pairs are derived as `<SYMBOL>-USD`, which matches
  * Yahoo's crypto convention for the vast majority of liquid assets; a small
  * override registry fixes documented collisions and an exclusion set drops
- * assets Yahoo has never hosted (verified live 2026-08-22).
+ * assets with no known direct Yahoo pair (verified live 2026-09-05).
+ * `resolveYahooPair` still searches excluded symbols so this is not a
+ * permanent negative cache entry.
  *
  * `null` returns mean "no reliable Yahoo pair — keep the row display-only";
  * the UI marks such rows as `DISPLAY-ONLY` instead of opening a broken
@@ -74,11 +77,25 @@ export type YahooPairResolution = string | null;
 /** Overrides for assets whose Yahoo pair differs from `<SYMBOL>-USD`. */
 const YAHOO_SYMBOL_OVERRIDES: Readonly<Record<string, string>> = Object.freeze({
   POL: "MATIC-USD", // Polygon rebrand: Yahoo quotes Polygon as MATIC-USD; POL-USD is Proof Of Liquidity
+  HYPE: "HYPE32196-USD",
+  USDE: "USDE29470-USD",
+  USD1: "USD136148-USD",
+  UNI: "UNI7083-USD",
+  SUI: "SUI20947-USD",
+  TAO: "TAO22974-USD",
+  ASTER: "ASTER36341-USD",
+  PUMP: "PUMP36507-USD",
+  PEPE: "PEPE24478-USD",
+  MORPHO: "MORPHO34104-USD",
+  TRUMP: "TRUMP35336-USD",
+  PENGU: "PENGU34466-USD",
+  STX: "STX4847-USD",
+  ZRO: "ZRO26997-USD",
 });
 
-/** Symbols Yahoo has never charted as a crypto pair; rows stay display-only. */
+/** Symbols with no known direct Yahoo pair; search may still discover one. */
 const YAHOO_SYMBOL_EXCLUSIONS = new Set([
-  "PEPE", "SUI", "UNI", "APT", "VVV", "PANG", "BB", "SUP", "INK", "WOL", "OQ", "ECL", // verified 2026-08-22: no pair
+  "APT", "VVV", "PANG", "BB", "SUP", "INK", "WOL", "OQ", "ECL", // verified 2026-09-05: no known pair
 ]);
 
 export function yahooPairForSymbol(symbol: string): YahooPairResolution {
@@ -100,8 +117,10 @@ export const YAHOO_SEARCH_URL = "https://query1.finance.yahoo.com/v1/finance/sea
  *
  * `<SYMBOL>-USD` covers most liquid assets; when that comes back empty the
  * Yahoo search endpoint reveals numeric-suffix pairs (e.g. TRUMP35336-USD)
- * or confirms the asset is never charted (returns null). The result is cached
- * by the caller; this function is pure and does no caching of its own.
+ * or confirms the asset is never charted (returns null). Search candidates are
+ * bar-verified before they are returned, so a fuzzy search result cannot turn
+ * into a broken watchlist/chart link. The result is cached by the caller; this
+ * function is pure and does no caching of its own.
  */
 export async function resolveYahooPair(
   symbol: string,
@@ -112,21 +131,15 @@ export async function resolveYahooPair(
 ): Promise<YahooPairResolution> {
   const canonical = symbol.trim().toUpperCase();
   const direct = yahooPairForSymbol(canonical);
-  if (!direct) return null;
-  // Probe the direct pair first.
-  try {
-    const chart = await fetchJson(
-      `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(direct)}?range=1mo&interval=1d`,
-      fetchImpl,
-      timeoutMs,
-      maxResponseBytes,
-      signal,
-    );
-    const bars = (chart as { chart?: { result?: Array<{ timestamp?: unknown[] }> } })?.chart?.result?.[0]?.timestamp?.length ?? 0;
-    if (bars > 0) return direct;
-  } catch (error) {
-    if (signal?.aborted || isRetryablePairResolutionError(error)) throw error;
-    // Fall through to search if the direct pair fails to parse.
+  // Probe the direct pair first when one is known. An excluded symbol still
+  // reaches search below; exclusions are not permanent negative cache entries.
+  if (direct) {
+    try {
+      if (await yahooPairHasBars(direct, fetchImpl, timeoutMs, maxResponseBytes, signal)) return direct;
+    } catch (error) {
+      if (signal?.aborted || isRetryablePairResolutionError(error)) throw error;
+      // Fall through to search if the direct pair fails to parse.
+    }
   }
   // Search for the real crypto pair (numeric suffix or renamed ticker).
   try {
@@ -138,20 +151,49 @@ export async function resolveYahooPair(
       signal,
     );
     const quotes = (search as { quotes?: Array<{ symbol?: unknown; quoteType?: unknown }> })?.quotes ?? [];
-    const cryptoPair = quotes.find((quote) => {
+    const candidates = quotes.map((quote) => {
       if (quote.quoteType !== "CRYPTOCURRENCY" || typeof quote.symbol !== "string" || !/-USD$/.test(quote.symbol)) return false;
       // Yahoo search is fuzzy: a query for LIT can return the unrelated
       // Litecoin pair LTC-USD. Accept only the exact ticker or the numeric
       // suffix form used by Yahoo for renamed/duplicate crypto listings.
       const pairBase = quote.symbol.slice(0, -4).toUpperCase();
       const suffix = pairBase.startsWith(canonical) ? pairBase.slice(canonical.length) : "";
-      return pairBase === canonical || (suffix.length > 0 && /^\d+$/.test(suffix));
-    })?.symbol;
-    return typeof cryptoPair === "string" ? cryptoPair : null;
+      return pairBase === canonical || (suffix.length > 0 && /^\d+$/.test(suffix))
+        ? quote.symbol
+        : false;
+    }).filter((candidate): candidate is string => typeof candidate === "string");
+    for (const candidate of candidates) {
+      try {
+        if (await yahooPairHasBars(candidate, fetchImpl, timeoutMs, maxResponseBytes, signal)) return candidate;
+      } catch (error) {
+        if (signal?.aborted || isRetryablePairResolutionError(error)) throw error;
+        // A search result is not considered usable until its chart endpoint
+        // has bars; try the next exact/numeric-suffix candidate.
+      }
+    }
+    return null;
   } catch (error) {
     if (signal?.aborted || isRetryablePairResolutionError(error)) throw error;
     return null;
   }
+}
+
+async function yahooPairHasBars(
+  pair: string,
+  fetchImpl: FetchLike,
+  timeoutMs: number,
+  maxResponseBytes: number,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const chart = await fetchJson(
+    `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(pair)}?range=1mo&interval=1d`,
+    fetchImpl,
+    timeoutMs,
+    maxResponseBytes,
+    signal,
+  );
+  const bars = (chart as { chart?: { result?: Array<{ timestamp?: unknown[] }> } })?.chart?.result?.[0]?.timestamp?.length ?? 0;
+  return bars > 0;
 }
 
 function isRetryablePairResolutionError(error: unknown): boolean {

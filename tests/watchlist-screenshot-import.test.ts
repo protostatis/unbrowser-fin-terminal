@@ -43,6 +43,29 @@ test("screenshot responses map crypto base tickers to Yahoo USD pairs", () => {
   ]);
 });
 
+test("screenshot responses use verified Yahoo pairs for crypto rebrands", () => {
+  const result = parseWatchlistScreenshotResponse(JSON.stringify({
+    instruments: [
+      { symbol: "SUI", assetType: "crypto", confidence: 0.99 },
+      { symbol: "TRUMP", assetType: "crypto", confidence: 0.99 },
+    ],
+  }));
+
+  assert.deepEqual(result.candidates.map((candidate) => candidate.symbol), ["SUI20947-USD", "TRUMP35336-USD"]);
+});
+
+test("screenshot responses cannot bypass crypto pair overrides or exclusions", () => {
+  const result = parseWatchlistScreenshotResponse(JSON.stringify({
+    instruments: [
+      { symbol: "SUI", yahooSymbol: "SUI-USD", assetType: "crypto" },
+      { symbol: "APT", yahooSymbol: "APT-USD", assetType: "crypto" },
+    ],
+  }));
+
+  assert.deepEqual(result.candidates.map((candidate) => candidate.symbol), ["SUI20947-USD"]);
+  assert.equal(result.rejected, 1);
+});
+
 test("screenshot responses exclude malformed and duplicate symbols", () => {
   const result = parseWatchlistScreenshotResponse(JSON.stringify({
     instruments: [

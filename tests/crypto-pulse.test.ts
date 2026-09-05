@@ -88,7 +88,7 @@ const CMC_LISTINGS = {
       id: 1839, symbol: "BNB", name: "BNB", slug: "bnb", cmc_rank: 6,
       quote: [{ symbol: "USD", price: 691, volume_24h: 1.5e9, market_cap: 1.0e11, market_cap_dominance: 3.8, percent_change_24h: 2.61, percent_change_7d: 5.0 }],
     }),
-    // PEPE: Yahoo never hosts it — row must resolve to a null pair (display-only).
+    // PEPE: Yahoo hosts it under its CMC-ID suffix pair.
     CMC_LISTING({
       id: 24478, symbol: "PEPE", name: "Pepe", slug: "pepe", cmc_rank: 25,
       quote: [{ symbol: "USD", price: 0.00001, volume_24h: 5e8, market_cap: 4e9, market_cap_dominance: 0.2, percent_change_24h: 18.0, percent_change_7d: 40.0 }],
@@ -179,7 +179,7 @@ test("fetches a normalized crypto pulse snapshot from all providers", async () =
   assert.equal(snapshot.fearGreed.label, "GREED");
   assert.equal(snapshot.listings.length, 8);
   // Ranked board = non-stable listings with finite 24h change; PEPE is ranked
-  // but resolves display-only (no Yahoo pair).
+  // and resolves to a verified Yahoo pair.
   assert.ok(snapshot.hot.length + snapshot.cold.length >= 4);
   assert.equal(snapshot.unranked.length, 0);
   assert.ok(snapshot.movers);
@@ -273,14 +273,31 @@ test("dynamic scoreboard ranks all finite-change listings into HOT/COLD halves",
   assert.equal(seen.size, SCOREBOARD_LISTINGS.length);
 });
 
-test("dynamic Yahoo pair derivation: -USD convention with overrides and exclusions", () => {
+test("dynamic Yahoo pair derivation: -USD convention with verified pairs and exclusions", () => {
   assert.equal(yahooPairForSymbol("BTC"), "BTC-USD");
   assert.equal(yahooPairForSymbol("btc"), "BTC-USD");
   assert.equal(yahooPairForSymbol("POL"), "MATIC-USD"); // Polygon rebrand override
-  assert.equal(yahooPairForSymbol("PEPE"), null); // Yahoo never hosts it
-  assert.equal(yahooPairForSymbol("SUI"), null);
-  assert.equal(yahooPairForSymbol("UNI"), null);
+  assert.equal(yahooPairForSymbol("PEPE"), "PEPE24478-USD");
+  assert.equal(yahooPairForSymbol("SUI"), "SUI20947-USD");
+  assert.equal(yahooPairForSymbol("UNI"), "UNI7083-USD");
   assert.equal(yahooPairForSymbol("APT"), null);
+
+  const verifiedPairs: Record<string, string> = {
+    HYPE: "HYPE32196-USD",
+    USDE: "USDE29470-USD",
+    USD1: "USD136148-USD",
+    TAO: "TAO22974-USD",
+    ASTER: "ASTER36341-USD",
+    PUMP: "PUMP36507-USD",
+    MORPHO: "MORPHO34104-USD",
+    TRUMP: "TRUMP35336-USD",
+    PENGU: "PENGU34466-USD",
+    STX: "STX4847-USD",
+    ZRO: "ZRO26997-USD",
+  };
+  for (const [symbol, pair] of Object.entries(verifiedPairs)) {
+    assert.equal(yahooPairForSymbol(symbol), pair, `${symbol} should use its verified Yahoo pair`);
+  }
 });
 
 test("Yahoo pair search rejects fuzzy matches for unrelated tickers", async () => {
@@ -299,14 +316,45 @@ test("Yahoo pair search rejects fuzzy matches for unrelated tickers", async () =
 test("Yahoo pair search accepts numeric-suffix crypto pairs", async () => {
   const fetchImpl = async (input: string | URL): Promise<Response> => {
     const url = String(input);
-    if (url.includes("/chart/TRUMP-USD")) return new Response("not found", { status: 404 });
-    if (url.includes("/v1/finance/search?q=TRUMP")) {
-      return jsonResponse({ quotes: [{ symbol: "TRUMP35336-USD", quoteType: "CRYPTOCURRENCY" }] });
+    if (url.includes("/chart/FLOKI-USD")) return new Response("not found", { status: 404 });
+    if (url.includes("/chart/FLOKI12345-USD")) return jsonResponse({ chart: { result: [{ timestamp: [1, 2] }] } });
+    if (url.includes("/v1/finance/search?q=FLOKI")) {
+      return jsonResponse({ quotes: [{ symbol: "FLOKI12345-USD", quoteType: "CRYPTOCURRENCY" }] });
     }
     return new Response("not found", { status: 404 });
   };
 
-  assert.equal(await resolveYahooPair("TRUMP", fetchImpl), "TRUMP35336-USD");
+  assert.equal(await resolveYahooPair("FLOKI", fetchImpl), "FLOKI12345-USD");
+});
+
+test("Yahoo pair search bar-verifies candidates and still searches excluded symbols", async () => {
+  const fetchImpl = async (input: string | URL): Promise<Response> => {
+    const url = String(input);
+    if (url.includes("/v1/finance/search?q=APT")) {
+      return jsonResponse({ quotes: [
+        { symbol: "APT21794-USD", quoteType: "CRYPTOCURRENCY" },
+        { symbol: "APT-USD", quoteType: "CRYPTOCURRENCY" },
+      ] });
+    }
+    if (url.includes("/chart/APT21794-USD")) return jsonResponse({ chart: { result: [{ timestamp: [1, 2] }] } });
+    if (url.includes("/chart/APT-USD")) return new Response("not found", { status: 404 });
+    return new Response("not found", { status: 404 });
+  };
+
+  assert.equal(await resolveYahooPair("APT", fetchImpl), "APT21794-USD");
+});
+
+test("Yahoo pair search rejects an exact-looking candidate with no bars", async () => {
+  const fetchImpl = async (input: string | URL): Promise<Response> => {
+    const url = String(input);
+    if (url.includes("/v1/finance/search?q=VVV")) {
+      return jsonResponse({ quotes: [{ symbol: "VVV-USD", quoteType: "CRYPTOCURRENCY" }] });
+    }
+    if (url.includes("/chart/VVV-USD")) return jsonResponse({ chart: { result: [] } });
+    return new Response("not found", { status: 404 });
+  };
+
+  assert.equal(await resolveYahooPair("VVV", fetchImpl), null);
 });
 
 test("Yahoo pair resolution propagates transient provider failures", async () => {
@@ -346,7 +394,7 @@ test("missing-change listings land in unranked and stay mapped", () => {
   assert.equal(cold.length, 6);
   assert.equal(unranked.length, 2);
   assert.equal(unranked[0]!.symbol, "PEPE");
-  assert.equal(unranked[0]!.yahooSymbol, null);
+  assert.equal(unranked[0]!.yahooSymbol, "PEPE24478-USD");
 });
 
 test("movers strip excludes stablecoins, reports breadth, and is display-only", () => {
