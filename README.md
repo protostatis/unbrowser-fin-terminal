@@ -102,6 +102,12 @@ and TLS; `ALLOWED_ORIGINS` alone is not authentication.
 
 ### Container deployment
 
+The generic authenticated image below is the legacy Pi-backed singleton. It is
+kept for rollback and maintenance only. The new production target is the
+authenticated browser-owned terminal at
+`https://unbrowser.unchainedsky.com/fin-terminal-browser/`; new production
+releases must use the browser-terminal image described below.
+
 The included multi-stage image accepts `PUBLIC_BASE_PATH` at build time. For a
 subpath deployment, build with a trailing slash:
 
@@ -146,11 +152,12 @@ For the production release workflow, including the immutable source-SHA handoff
 to `unchained-infra` and GitHub Actions production approval, see
 [`docs/deployment.md`](docs/deployment.md).
 
-### Authenticated browser terminal (no Pi)
+### Authenticated browser terminal (primary production target; no Pi)
 
-The production browser-owned variant uses a separate backend entrypoint with no
-Pi session or WebSocket. Build it with the browser image and provide the broker
-credentials only to the server:
+The browser-owned variant is the primary production terminal and uses a
+separate backend entrypoint with no Pi session or WebSocket. It is served at
+`https://unbrowser.unchainedsky.com/fin-terminal-browser/`. Build it with the
+browser image and provide the broker credentials only to the server:
 
 ```bash
 docker build -f Dockerfile.browser-terminal \
@@ -164,6 +171,12 @@ Docker-internal `UNBROWSER_MCP_URL`. Caddy must strip client identity/auth
 headers, run `forward_auth`, copy `X-Fin-Terminal-User`, and inject the proxy
 token before forwarding to this container. Mount `/data` for the principal-
 scoped archive and watchlist records. The browser sends no provider key.
+
+Release this image from a merged application revision with the
+`Publish authenticated browser-terminal image` workflow. The resulting
+immutable digest is then pinned by `unchained-infra`. The legacy
+`/fin-terminal/` Pi route is deprecated and should not receive new production
+features.
 
 ### Public live-session pilot
 

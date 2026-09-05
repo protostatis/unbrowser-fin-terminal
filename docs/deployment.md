@@ -1,10 +1,12 @@
 # Production Deployment
 
-The production terminal is served at
-`https://unchainedsky.com/unbrowser/fin-terminal/`. This repository does not
-deploy directly from a branch. Releases are pinned to an immutable source commit
-in the [`unchained-infra`](https://github.com/protostatis/unchained-infra)
-Compose manifest and deployed through that repository's GitHub Actions workflow.
+The primary production terminal is served at
+`https://unbrowser.unchainedsky.com/fin-terminal-browser/`. The former
+Pi-backed singleton at `/fin-terminal/` is a deprecated legacy route retained
+for rollback and maintenance only. This repository does not deploy directly
+from a branch. Releases are pinned to immutable application commits and image
+digests in the [`unchained-infra`](https://github.com/protostatis/unchained-infra)
+Compose manifests and deployed through that repository's GitHub Actions workflows.
 
 Use the GitHub Actions path for production releases. Do not use the manual SSH
 deployment fallback for a normal terminal release.
@@ -29,13 +31,18 @@ deployment fallback for a normal terminal release.
      refs/heads/feature/signal-dossier
    ```
 
-3. In `unchained-infra`, create a release branch from current `main`. Replace
-   the authenticated terminal and public-terminal image refs with that exact
-   40-character SHA. Never use a mutable branch ref such as
-   `#feature/signal-dossier`.
+3. For the primary browser-owned terminal, publish the authenticated
+   browser-terminal image from the merged application revision using the
+   `Publish authenticated browser-terminal image` workflow. In
+   `unchained-infra`, create a release branch from current `main` and replace
+   `FIN_TERMINAL_BROWSER_IMAGE` with the resulting immutable GHCR digest. Never
+   use a mutable tag or branch ref.
 
-4. Update both matching SHA assertions in `unchained/test_fin_terminal.py`,
-   then run the infrastructure checks:
+   The legacy Pi route has a separate release path and should only be updated
+   for rollback or maintenance work.
+
+4. Update the matching browser-image assertion in
+   `unchained/test_fin_terminal.py`, then run the infrastructure checks:
 
    ```bash
    python deploy/test_fin_terminal_secrets.py
