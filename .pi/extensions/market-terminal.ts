@@ -6210,13 +6210,16 @@ class MarketHub {
 		const board = rows.map((entry) => entry.row);
 		// Fill the pane vertically like MOVERS: capacity tracks available rows
 		// after the head block and the window-status line.
-		// Compact: chart is guaranteed. Size the board from the remainder
-		// after head + chart + gaps, so stretchBlocks never slices the chart tail.
+		// Compact: the board gets the majority of rows and the chart takes a
+		// small fixed budget, so phones show ~8-16 tickers instead of a fixed
+		// ~3 (the old remainder formula gave the chart everything left over,
+		// pinning the board to 3 rows at any height). stretchBlocks + the fit
+		// loop below still guarantee the chart tail survives on tiny screens.
 		// Wide keeps the previous fill behavior.
 		const compactMinBoard = 2; // board heading + selected row
 		const compactChartBudget = wideCrypto
 			? 2
-			: Math.max(0, bodyRows - head.length - compactMinBoard - 2);
+			: Math.min(9, Math.max(5, Math.floor(bodyRows * 0.35)));
 		const boardReserve = board.length > Math.max(1, bodyRows - head.length - (wideCrypto ? 2 : compactChartBudget)) ? 1 : 0;
 		const windowCapacity = Math.max(2, Math.min(
 			board.length,
