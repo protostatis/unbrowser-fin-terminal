@@ -21,6 +21,13 @@ export type Quote = {
 	volume: number | null;
 	preMarketVolume: number | null;
 	postMarketVolume: number | null;
+	/**
+	 * Yahoo meta.hasPrePostMarketData. Indices (^GSPC, ^N225, …) report false:
+	 * they never emit pre/post bars, so in extended sessions their DAY chart
+	 * is the prior regular session (stale) and the board needs a proxy feed
+	 * (index futures). Absent (older fixtures) means unknown → treat as false.
+	 */
+	hasPrePostMarketData?: boolean;
 	marketState: string;
 	updatedAt: number | null;
 	points: number[];
@@ -195,6 +202,7 @@ export function parseChartPayloadToQuote(
 		name: typeof meta.longName === "string" ? meta.longName : typeof meta.shortName === "string" ? meta.shortName : symbol,
 		exchange: typeof meta.fullExchangeName === "string" ? meta.fullExchangeName : "--",
 		currency: typeof meta.currency === "string" && meta.currency.trim() ? meta.currency.trim().toUpperCase() : "XXX",
+		hasPrePostMarketData: meta.hasPrePostMarketData === true,
 		price,
 		change,
 		changePercent: change === null || scopeBaseline === null || scopeBaseline === 0 ? null : (change / scopeBaseline) * 100,

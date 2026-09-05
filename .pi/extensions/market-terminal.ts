@@ -666,6 +666,135 @@ const MARKET_BOARDS = [
 	{ label: "SOLANA", symbol: "SOL-USD", group: "CRYPTO" },
 ] as const;
 
+/**
+ * Extended-session proxy feed for the US board.
+ *
+ * Yahoo index symbols report hasPrePostMarketData=false: they never emit
+ * pre/post bars, so in PRE/POST their DAY chart is the prior regular session
+ * (stale) and the board would print a flat ~0.00% as if live. Index futures
+ * trade near-24h (verified: ES=F/NQ=F/YM=F return ~287 bars spanning the
+ * overnight session), so in extended sessions the US rows resolve to the
+ * futures quote and are tagged FUT. Futures never enter the mover universe
+ * (eligibleMoverQuotes is MOVER_UNIVERSE-gated) and are only fetched on the
+ * DAY scope when the universe is actually in PRE/POST, so regular-session
+ * refreshes pay no extra requests.
+ */
+export const US_INDEX_FUTURES_PROXY: Record<string, string> = {
+	"^GSPC": "ES=F",
+	"^IXIC": "NQ=F",
+	"^DJI": "YM=F",
+};
+
+/**
+ * Reverse index for action boundaries: a proxied row displays the futures
+ * feed, but watch/research actions taken from the board belong to the index.
+ */
+export const FUTURES_BOARD_SYMBOL: Record<string, string> = Object.fromEntries(
+	Object.entries(US_INDEX_FUTURES_PROXY).map(([board, proxy]) => [proxy, board]),
+);
+
+export type UniverseSession = "PRE" | "POST" | "REGULAR";
+
+/**
+ * Universe-level session for board decisions. Each quote derives its own
+ * marketState from its own last bar, so stale index bars can never vote PRE —
+ * the vote is restricted to non-board quotes (movers + watchlist stocks/ETFs
+ * that carry a real extended feed). Futures proxies are excluded as well
+ * (their trading periods are degenerate, deriving REGULAR around the clock).
+ *
+ * A lone straggler must not flip the universe: an extended session needs at
+ * least two corroborating quotes and at least half the voters. PRE/POST ties
+ * break toward POST (the later session).
+ */
+export function deriveUniverseSession(quotes: readonly Quote[]): UniverseSession {
+	const boardSymbols = new Set<string>([...MARKET_BOARDS.map((item) => item.symbol), ...Object.values(US_INDEX_FUTURES_PROXY)]);
+	let voters = 0;
+	let pre = 0;
+	let post = 0;
+	const count = (quote: Quote): void => {
+		const state = (quote.marketState || "").toUpperCase();
+		if (state.startsWith("PRE")) pre++;
+		else if (state.startsWith("POST")) post++;
+	};
+	for (const quote of quotes) {
+		if (boardSymbols.has(quote.symbol)) continue;
+		voters++;
+		count(quote);
+	}
+	if (voters === 0) {
+		for (const quote of quotes) count(quote);
+		voters = quotes.length;
+	}
+	if (pre >= 2 && pre > post && pre * 2 >= voters) return "PRE";
+	if (post >= 2 && post >= pre && post * 2 >= voters) return "POST";
+	return "REGULAR";
+}
+
+export type BoardQuoteResolution = { quote: Quote | undefined; proxied: boolean; proxyMissing: boolean };
+
+/**
+ * Resolve the quote a US board row displays. In PRE/POST the index quote is
+ * the prior regular session, so it yields to its futures proxy when one was
+ * fetched — unless the index itself carries an extended feed
+ * (hasPrePostMarketData), in which case it stays authoritative. When the
+ * session calls for a proxy but none was fetched (upstream failure),
+ * proxyMissing is set so the row renders STALE instead of passing Friday's
+ * bars off as live.
+ */
+export function resolveBoardQuote(boardSymbol: string, quotes: readonly Quote[], session: UniverseSession): BoardQuoteResolution {
+	const direct = quotes.find((quote) => quote.symbol === boardSymbol);
+	const proxySymbol = US_INDEX_FUTURES_PROXY[boardSymbol];
+	if ((session === "PRE" || session === "POST") && proxySymbol && direct?.hasPrePostMarketData !== true) {
+		const proxy = quotes.find((quote) => quote.symbol === proxySymbol);
+		if (proxy) return { quote: proxy, proxied: true, proxyMissing: false };
+		return { quote: direct, proxied: false, proxyMissing: true };
+	}
+	return { quote: direct, proxied: false, proxyMissing: false };
+}
+
+/**
+ * TA-basis resolution for market_technicals (P1-5).
+ *
+ * DAY-scope index quotes never carry pre/post bars, so TA scored on ^GSPC in
+ * PRE/POST would grade Friday's session. Resolve to the overnight futures
+ * contract when the index has no extended feed and the proxy has a chartable
+ * series (≥2 points); identity stays on the requested symbol and the proxy
+ * basis is labeled in the canvas title/summary. Feed-capable indices,
+ * non-day scopes, and non-index symbols are untouched (single fetch).
+ */
+export async function fetchTechnicalQuote(symbol: string, scope: ChartScope, signal?: AbortSignal): Promise<{ quote: Quote; taProxySymbol?: string }> {
+	const proxy = scope === "day" ? US_INDEX_FUTURES_PROXY[symbol] : undefined;
+	if (!proxy) return { quote: await fetchQuote(symbol, scope, signal) };
+	const [indexResult, proxyResult] = await Promise.allSettled([
+		fetchQuote(symbol, scope, signal),
+		fetchQuote(proxy, scope, signal),
+	]);
+	const index = indexResult.status === "fulfilled" ? indexResult.value : undefined;
+	const future = proxyResult.status === "fulfilled" ? proxyResult.value : undefined;
+	if (index?.hasPrePostMarketData === true) return { quote: index };
+	if (future && future.points.length >= 2) return { quote: future, taProxySymbol: proxy };
+	if (index) return { quote: index };
+	throw new Error(`quote request failed for ${symbol}`);
+}
+
+/**
+ * One-line scoreboard shared by the TUI board and the model-facing
+ * market_brief / market_discover tools, so MCP consumers see the same
+ * futures-proxy numbers as the screen in extended sessions. Proxied rows are
+ * labeled `(ES=F fut)` with the futures percent (overnight move vs prior
+ * settlement); rows with a missing proxy are marked `(stale)`.
+ */
+export function boardScoreboard(quotes: readonly Quote[], session?: UniverseSession): string {
+	const resolved = session ?? deriveUniverseSession(quotes);
+	return MARKET_BOARDS.map((item) => {
+		const { quote, proxied, proxyMissing } = resolveBoardQuote(item.symbol, quotes, resolved);
+		if (!quote) return `${item.label}: n/a`;
+		if (proxied) return `${item.label} (${quote.symbol} fut): ${percent(quote.changePercent)}`;
+		if (proxyMissing) return `${item.label} (stale): ${percent(quote.changePercent)}`;
+		return `${item.label}: ${percent(quote.changePercent)}`;
+	}).join(" | ");
+}
+
 const SNAPSHOT_STALE_AFTER_MS = 5 * 60_000;
 const MAX_SETTLED_RESEARCH_JOBS = 50;
 const MARKET_SCREEN_NAMES = ["MARKET", "SIGNALS", "EVENTS", "MOVERS", "WATCH"] as const;
@@ -2043,7 +2172,7 @@ export async function fetchQuotes(
 	return results.filter((quote): quote is Quote => Boolean(quote));
 }
 
-async function fetchMarketSnapshot(pi: ExtensionAPI, scope: ChartScope = DEFAULT_CHART_SCOPE, signal?: AbortSignal, headlineQuery = "US stock market latest news earnings macro rates"): Promise<MarketSnapshot> {
+export async function fetchMarketSnapshot(pi: ExtensionAPI, scope: ChartScope = DEFAULT_CHART_SCOPE, signal?: AbortSignal, headlineQuery = "US stock market latest news earnings macro rates"): Promise<MarketSnapshot> {
 	const allSymbols = [...new Set([...MARKET_BOARDS.map((item) => item.symbol), ...MOVER_UNIVERSE, ...state.watchlist])];
 	const [quotes, news] = await Promise.all([
 		fetchQuotes(allSymbols, scope, signal),
@@ -2055,11 +2184,34 @@ async function fetchMarketSnapshot(pi: ExtensionAPI, scope: ChartScope = DEFAULT
 				blockedSourceCount: 0,
 			})),
 	]);
-	const movers = rankMovers(quotes);
+	// Extended-session US proxy: indices never emit pre/post bars, so when the
+	// stock universe is in PRE/POST (DAY scope only — the sole scope that
+	// fetches pre/post bars) pull the near-24h index futures for the US board.
+	// Futures are MOVER_UNIVERSE-excluded, so rankMovers ignores them.
+	let boardQuotes = quotes;
+	let requested = allSymbols.length;
+	if (scope === "day") {
+		const session = deriveUniverseSession(quotes);
+		if (session === "PRE" || session === "POST") {
+			const missing = [...new Set(Object.values(US_INDEX_FUTURES_PROXY))]
+				.filter((symbol) => !quotes.some((quote) => quote.symbol === symbol));
+			if (missing.length > 0) {
+				const extra = await fetchQuotes(missing, scope, signal);
+				if (extra.length > 0) {
+					boardQuotes = [...quotes, ...extra];
+					// Count what arrived, not what was asked: a partial futures
+					// leg must not inflate the degraded-universe denominator.
+					// Rows with no proxy render STALE via proxyMissing.
+					requested += extra.length;
+				}
+			}
+		}
+	}
+	const movers = rankMovers(boardQuotes);
 	return {
-		quotes,
+		quotes: boardQuotes,
 		movers,
-		requested: allSymbols.length,
+		requested,
 		headlines: news.headlines,
 		challenge: news.challenge,
 		...(news.blockedDomains.length ? { blockedDomains: news.blockedDomains, blockedSourceCount: news.blockedSourceCount } : {}),
@@ -5296,7 +5448,11 @@ class MarketHub {
 	private entries(): Array<{ type: "quote"; quote: Quote } | { type: "headline"; headline: Headline } | { type: "event"; lane: EventLane }> {
 		const bySymbol = new Map(this.snapshot.quotes.map((quote) => [quote.symbol, quote]));
 		if (this.screen === MARKET_SCREEN.market) {
-			return MARKET_BOARDS.map((item) => bySymbol.get(item.symbol)).filter((quote): quote is Quote => Boolean(quote)).map((quote) => ({ type: "quote", quote }));
+			// In PRE/POST the US index rows resolve to their futures proxy so
+			// selection, charts, research, and watch actions all follow the
+			// live overnight feed instead of Friday's stale regular bars.
+			const session = this.snapshot.chartScope === "day" ? deriveUniverseSession(this.snapshot.quotes) : "REGULAR";
+			return MARKET_BOARDS.map((item) => resolveBoardQuote(item.symbol, this.snapshot.quotes, session).quote).filter((quote): quote is Quote => Boolean(quote)).map((quote) => ({ type: "quote", quote }));
 		}
 		if (this.screen === MARKET_SCREEN.signals) return this.snapshot.headlines.map((headline) => ({ type: "headline", headline }));
 		if (this.screen === MARKET_SCREEN.events) return EVENT_LANES.map((lane) => ({ type: "event" as const, lane }));
@@ -5770,7 +5926,7 @@ class MarketHub {
 			}
 		} else if (matchesKey(data, "backspace") || data === "\b" || data === "\x7f") {
 				this.searchQuery = this.searchQuery.slice(0, -1);
-			} else if (/^[A-Z0-9.\^-]$/.test(data.toUpperCase())) {
+			} else if (/^[A-Z0-9.\^=-]$/.test(data.toUpperCase())) {
 				this.searchQuery += data.toUpperCase();
 			}
 			this.tui.requestRender();
@@ -5967,7 +6123,12 @@ class MarketHub {
 			}
 			const entry = this.entries()[this.selected];
 			if (entry?.type === "quote") {
-				const sym = entry.quote.symbol;
+				// Board rows display the futures feed in PRE/POST, but the
+				// watchlist tracks the index: ES=F must never leak in via E.
+				const raw = entry.quote.symbol;
+				const sym = this.screen === MARKET_SCREEN.market && this.marketView !== "crypto"
+					? FUTURES_BOARD_SYMBOL[raw] ?? raw
+					: raw;
 				const idx = this.viewWatchlist.indexOf(sym);
 				if (idx >= 0) {
 					this.viewWatchlist.splice(idx, 1);
@@ -6019,8 +6180,21 @@ class MarketHub {
 			const gap = Math.max(1, width - visibleWidth(headerLead) - visibleWidth(badge));
 			header.push(fit(`${headerLead}${" ".repeat(gap)}${badge}`));
 		} else if (usQuote) {
-			const sessionMeta = marketStateMeta(usQuote.marketState);
-			const badge = `${th.fg(sessionMeta.tone, `● ${sessionMeta.label}`)} ${th.fg("dim", `DELAYED ${relativeAge(usQuote.updatedAt)}`)}`;
+			// The index quote derives REGULAR from Friday's bars even while the
+			// stock universe trades PRE/POST, so the badge follows the universe
+			// session in extended hours (the US board then shows FUT proxies).
+			// Freshness follows the displayed feed: the proxy's timestamp when
+			// proxied, otherwise the index quote's.
+			const universeSession = this.snapshot.chartScope === "day" ? deriveUniverseSession(this.snapshot.quotes) : "REGULAR";
+			const sessionMeta = universeSession === "REGULAR" ? marketStateMeta(usQuote.marketState) : marketStateMeta(universeSession);
+			let ageQuote = usQuote;
+			if (universeSession !== "REGULAR") {
+				const liveProxy = MARKET_BOARDS.filter((b) => b.group === "US")
+					.map((b) => resolveBoardQuote(b.symbol, this.snapshot.quotes, universeSession))
+					.find((resolution) => resolution.proxied && resolution.quote);
+				if (liveProxy?.quote) ageQuote = liveProxy.quote;
+			}
+			const badge = `${th.fg(sessionMeta.tone, `● ${sessionMeta.label}`)} ${th.fg("dim", `DELAYED ${relativeAge(ageQuote.updatedAt)}`)}`;
 			const gap = Math.max(1, width - visibleWidth(headerLead) - visibleWidth(badge));
 			header.push(fit(`${headerLead}${" ".repeat(gap)}${badge}`));
 		} else {
@@ -6093,14 +6267,20 @@ class MarketHub {
 	}
 
 	private boardLine(group: string, th: Theme): string {
+		const session = this.snapshot.chartScope === "day" ? deriveUniverseSession(this.snapshot.quotes) : "REGULAR";
 		const board = MARKET_BOARDS.filter((item) => item.group === group)
 			.flatMap((item) => {
-				const quote = this.snapshot.quotes.find((q) => q.symbol === item.symbol);
-				return quote ? [{ item, quote }] : [];
+				const { quote, proxied, proxyMissing } = resolveBoardQuote(item.symbol, this.snapshot.quotes, session);
+				return quote ? [{ item, quote, proxied, proxyMissing }] : [];
 			})
-			.map(({ item, quote }) => {
+			.map(({ item, quote, proxied, proxyMissing }) => {
 				const tone = (quote.change ?? 0) >= 0 ? "success" : "error";
-				return `${th.fg(tone, `${directionGlyph(quote.change)}${item.label} ${percent(quote.changePercent)}`)}`;
+				// FUT reads as part of the label ("S&P 500 FUT -0.42%"): the
+				// figure is the overnight futures move vs prior settlement,
+				// not the cash index. A missing proxy is STALE, never live.
+				if (proxyMissing) return `${th.fg(tone, `${directionGlyph(quote.change)}${item.label} ${percent(quote.changePercent)}`)}${th.fg("warning", " STALE")}`;
+				const rowLabel = proxied ? `${item.label} FUT` : item.label;
+				return th.fg(tone, `${directionGlyph(quote.change)}${rowLabel} ${percent(quote.changePercent)}`);
 			})
 			.join("   ");
 		return `${th.bold(th.fg("accent", group.padEnd(7)))} ${board || th.fg("dim", "unavailable")}`;
@@ -9448,11 +9628,12 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "market_technicals",
 		label: "Market Technicals",
-		description: "Compute deterministic technical indicators and chart blocks from public/delayed Yahoo Finance points for a selectable chart scope (day/week/month/year/max). For market scope, uses the S&P 500 (^GSPC) as the primary market proxy.",
+		description: "Compute deterministic technical indicators and chart blocks from public/delayed Yahoo Finance points for a selectable chart scope (day/week/month/year/max). For market scope, uses the S&P 500 (^GSPC) as the primary market proxy. Day-scope index TA falls back to the labeled overnight index-futures proxy when the index carries no extended feed.",
 		promptSnippet: "Compute sourced TA charts and indicators for a ticker or the broad market at a selected scope",
 		promptGuidelines: [
 			"Use market_technicals during market-terminal research so TA values and chart points are computed from fetched data rather than invented by the model.",
 			"Pass the exact research_id for background jobs. scope=market computes ^GSPC as the broad-market proxy; scope=ticker requires symbol.",
+			"Day-scope ^GSPC/^IXIC/^DJI TA resolves to the overnight index-futures proxy (ES=F/NQ=F/YM=F) when the index has no extended feed; the proxy basis is labeled in the canvas title and summary, and cache identity stays on the requested symbol.",
 			"Pass chart_scope=day|week|month|year|max to select the chart range. When omitted inside a correlated research job, the job's scope is inherited. Outside a job, defaults to day.",
 			"Treat the bullish/neutral/bearish result as a transparent heuristic, not investment advice. The returned ta-* blocks are preserved automatically; never re-submit or alter ta-* IDs through market_canvas.",
 			"Non-day scopes compute last-bar return instead of same-session 1h momentum. SMA/EMA/RSI/MACD are bar-based. Only day scope includes session markers and previous-close reference.",
@@ -9483,15 +9664,16 @@ export default function (pi: ExtensionAPI) {
 				&& params.chart_scope !== job.chartScope) {
 				throw new Error(`chart_scope=${params.chart_scope} does not match the active research job scope (${job.chartScope})`);
 			}
-			const quote = await fetchQuote(targetSymbol, chartScope, signal);
+			const { quote, taProxySymbol } = await fetchTechnicalQuote(targetSymbol, chartScope, signal);
 			if (job) requireWritableResearchJob(job);
 			const snapshot = technicalSnapshot(quote);
 			const blocks = normalizeCanvasBlocks(technicalCanvasBlocks(snapshot));
+			const proxySuffix = taProxySymbol ? ` · ${taProxySymbol} futures proxy` : "";
 			let canvas: Canvas | undefined;
 			if (job) {
 				canvas = storeCanvas({
 					symbol: canvasSymbol,
-					title: `${canvasSymbol} research · ${CHART_SCOPE_CONFIGS[chartScope].label} technical analysis`,
+					title: `${canvasSymbol} research · ${CHART_SCOPE_CONFIGS[chartScope].label} technical analysis${proxySuffix}`,
 					content: "",
 					blocks,
 					updatedAt: Date.now(),
@@ -9511,8 +9693,11 @@ export default function (pi: ExtensionAPI) {
 				});
 			}
 			const scopeLabel = CHART_SCOPE_CONFIGS[chartScope].label;
+			const basisLine = taProxySymbol
+				? `${targetSymbol} deterministic ${scopeLabel} TA via ${taProxySymbol} overnight-futures proxy (${snapshot.interval}, public/delayed)`
+				: `${targetSymbol} deterministic ${scopeLabel} TA (${snapshot.interval}, public/delayed)`;
 			const summary = [
-				`${targetSymbol} deterministic ${scopeLabel} TA (${snapshot.interval}, public/delayed)`,
+				basisLine,
 				`As of: ${quoteTimestampLabel(snapshot.asOf, snapshot.timezone)}`,
 				`Heuristic: ${snapshot.signal.toUpperCase()}`,
 				`Price: ${dollars(snapshot.price, snapshot.currency)} | SMA20: ${snapshot.sma20 === null ? "--" : dollars(snapshot.sma20, snapshot.currency)} | RSI14: ${snapshot.rsi14?.toFixed(2) ?? "--"}`,
@@ -9521,7 +9706,7 @@ export default function (pi: ExtensionAPI) {
 				`Chart scope: ${scopeLabel} (${chartScope})`,
 				"These are mechanical indicators computed from public/delayed data, not investment advice.",
 			].join("\n");
-			return { content: [{ type: "text", text: summary }], details: { scope, targetSymbol, chartScope, snapshot, blocks, canvas } };
+			return { content: [{ type: "text", text: summary }], details: { scope, targetSymbol, chartScope, taBasis: taProxySymbol ?? targetSymbol, snapshot, blocks, canvas } };
 		},
 	});
 
@@ -9585,10 +9770,9 @@ export default function (pi: ExtensionAPI) {
 			]);
 			const snapshot = snapshotResult.status === "fulfilled" ? snapshotResult.value : undefined;
 			const research = researchResult.status === "fulfilled" ? researchResult.value : undefined;
-			const board = snapshot?.quotes
-				.filter((quote) => MARKET_BOARDS.some((item) => item.symbol === quote.symbol))
-				.map((quote) => `${quote.symbol}: ${percent(quote.changePercent)}`)
-				.join(" | ") || "Scoreboard unavailable.";
+			const board = snapshot
+				? boardScoreboard(snapshot.quotes, snapshot.chartScope === "day" ? deriveUniverseSession(snapshot.quotes) : "REGULAR")
+				: "Scoreboard unavailable.";
 			const sources = (research?.headlines ?? snapshot?.headlines ?? [])
 				.map((headline) => `- ${headline.title}: ${headline.url}`)
 				.join("\n") || "No source links extracted.";
@@ -10057,10 +10241,9 @@ export default function (pi: ExtensionAPI) {
 			const searchResults = grantExtractionCandidates(job, dedupeCandidates(raw));
 			const blockedDomains = snapshot?.blockedDomains ?? [];
 			const blockedSourceCount = snapshot?.blockedSourceCount ?? 0;
-			const board = snapshot?.quotes
-				.filter((q) => MARKET_BOARDS.some((b) => b.symbol === q.symbol))
-				.map((q) => `${q.symbol}: ${percent(q.changePercent)}`)
-				.join(" | ") || "unavailable";
+			const board = snapshot
+				? boardScoreboard(snapshot.quotes, snapshot.chartScope === "day" ? deriveUniverseSession(snapshot.quotes) : "REGULAR")
+				: "unavailable";
 			const challenge = snapshot?.challenge;
 			const query = question || "overall market story, leadership, earnings, macro, Asia and crypto";
 			const text = [
