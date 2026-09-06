@@ -85,14 +85,27 @@ test("same-document unmount/remount releases startup and StrictMode does not dup
 	await expect.poll(() => sessionRequests).toBe(2);
 });
 
-test("root serves discovery without starting the authenticated broker", async ({ page }) => {
+test("browser-terminal root opens the authenticated terminal by default", async ({ page }) => {
 	let sessionRequests = 0;
 	page.on("request", (request) => {
 		if (new URL(request.url()).pathname === SESSION_PATH) sessionRequests += 1;
 	});
 
 	await page.goto("/");
+	await expect.poll(() => new URL(page.url()).pathname).toBe("/terminal/");
+	await expectConnected(page);
+	await expect.poll(() => sessionRequests).toBe(1);
+});
+
+test("discovery remains available at its explicit route", async ({ page }) => {
+	let sessionRequests = 0;
+	page.on("request", (request) => {
+		if (new URL(request.url()).pathname === SESSION_PATH) sessionRequests += 1;
+	});
+
+	await page.goto("/discover/");
 	await expect(page.locator(".browser-discovery")).toBeVisible();
 	await expect(page.getByRole("heading", { name: "See what moved. Understand why." })).toBeVisible();
+	await expect(page.locator(".discovery-primary")).toHaveAttribute("href", "/terminal/");
 	await expect.poll(() => sessionRequests).toBe(0);
 });
