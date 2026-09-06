@@ -111,8 +111,8 @@ function responseForToolCalls(messages: WireMessage[]): Array<{
 		[...messages].reverse().find((message) => message.role === "user")?.content ?? "",
 	);
 	const researchId = /research_id=([A-Za-z0-9_-]{1,160})/.exec(prompt)?.[1] ?? "job-unknown";
-	const target = /target=([A-Za-z0-9.^$-]{1,20})/.exec(prompt)?.[1]
-		?? /(?:^|\n)Research ([A-Za-z0-9.^$-]{1,20}) /.exec(prompt)?.[1]
+	const target = /target=([A-Za-z0-9.^$=-]{1,20})/.exec(prompt)?.[1]
+		?? /(?:^|\n)Research ([A-Za-z0-9.^$=-]{1,20}) /.exec(prompt)?.[1]
 		?? "MARKET";
 	const symbol = target === "MARKET" ? "MARKET" : target;
 	const marketScope = symbol === "MARKET";
@@ -344,7 +344,7 @@ test("browser alpha runs a real worker, persists the archive, and reloads the ca
 		await page.keyboard.press("j");
 		await expect(page.locator("body")).toContainText("DAY QUOTE");
 		await page.keyboard.press("j");
-		await expect(page.locator("body")).toContainText("CACHE ^GSPC");
+		await expect(page.locator("body")).toContainText("CACHE ES=F");
 		expect(modelRequests.length).toBe(modelRequestCount);
 		expect(unexpected).toEqual([]);
 	} finally {

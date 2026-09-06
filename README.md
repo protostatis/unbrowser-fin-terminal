@@ -68,8 +68,9 @@ server-side provider and MCP endpoint before using research:
 For local development with OpenRouter and the hosted public-source extractor:
 
 ```bash
-export OPENROUTER_API_KEY=sk-or-...
-export UNBROWSER_MCP_URL=https://unchainedsky.com/unbrowser-mcp
+cp .env.example .env
+# Fill in OPENROUTER_API_KEY in .env, then export the server variables.
+set -a; source .env; set +a
 npm run dev
 ```
 
