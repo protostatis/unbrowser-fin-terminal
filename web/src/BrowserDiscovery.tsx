@@ -31,8 +31,8 @@ export function BrowserDiscovery() {
               your attention next.
             </p>
             <div className="discovery-actions">
-              <a className="discovery-primary" href="/">
-                <span>Continue to Unbrowser</span>
+              <a className="discovery-primary" href={terminalHref}>
+                <span>Open the terminal</span>
                 <span aria-hidden="true">↗</span>
               </a>
               <a className="discovery-secondary" href="#workspace-capabilities">
@@ -40,7 +40,7 @@ export function BrowserDiscovery() {
               </a>
             </div>
             <p className="discovery-auth-note">
-              Sign in from Unbrowser to open the workspace. Already signed in? <a href={terminalHref}>Open your workspace</a>.
+              Sign in from Unbrowser to use your account workspace. Already signed in? <a href={terminalHref}>Open the terminal</a>.
             </p>
           </div>
 
@@ -94,7 +94,7 @@ export function BrowserDiscovery() {
 
         <section className="discovery-bottom">
           <p><span aria-hidden="true">⌁</span> Designed for keyboard, touch, and the five-minute glance between meetings.</p>
-          <a href="/">Learn more about Unbrowser <span aria-hidden="true">↗</span></a>
+          <a href="/">Continue to Unbrowser <span aria-hidden="true">↗</span></a>
         </section>
       </main>
     </div>

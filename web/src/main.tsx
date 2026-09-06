@@ -774,11 +774,23 @@ function BrowserTerminalWorkspace() {
 	return mounted ? <BrowserAlphaLazy authenticated /> : null;
 }
 
+function BrowserTerminalRedirect({ href }: { href: string }) {
+	useEffect(() => {
+		window.location.replace(href);
+	}, [href]);
+	return <div style={{ padding: 24, fontFamily: "system-ui" }}>Opening the terminal…</div>;
+}
+
 function BrowserTerminalRoot() {
 	const base = buildEnv.BASE_URL && buildEnv.BASE_URL !== "/"
 		? buildEnv.BASE_URL.replace(/\/$/, "")
 		: "";
-	const discoveryPath = base || "/";
+	const rootPath = base || "/";
+	const terminalPath = `${base}/terminal/`;
+	const discoveryPath = base ? `${base}/discover` : "/discover";
+	if (window.location.pathname === rootPath || window.location.pathname === `${rootPath}/`) {
+		return <BrowserTerminalRedirect href={terminalPath} />;
+	}
 	if (window.location.pathname === discoveryPath || window.location.pathname === `${discoveryPath}/`) {
 		return <BrowserDiscovery />;
 	}
