@@ -15,6 +15,7 @@ import {
   isWatchImportContext,
   recentResearchStatuses,
   researchActivityStatus,
+  evidenceContextAvailable,
   tabSwitchAvailable,
   type ResearchActivityStatus,
 } from "./mobile-controls";
@@ -394,7 +395,7 @@ export function App({
 
       if (e.key === "Tab") {
         const state = frameStateRef.current;
-        if (e.shiftKey || isEditableTarget(e.target) || isTerminalControl(e.target) || !tabSwitchAvailable(state)) {
+        if (e.shiftKey || e.ctrlKey || e.metaKey || e.altKey || isEditableTarget(e.target) || isTerminalControl(e.target) || !tabSwitchAvailable(state)) {
           return;
         }
         // When the overlay is open, Tab should traverse its controls, not
@@ -498,8 +499,7 @@ export function App({
   const dossier = frameStateRef.current?.dossier;
   const evidenceVisible = Boolean(
     dossier
-    && frameStateRef.current?.mode === "ticker"
-    && (frameStateRef.current.screen === "RESEARCH" || frameStateRef.current.screen === "SPLIT"),
+    && evidenceContextAvailable(frameStateRef.current),
   );
 
   useEffect(() => {
@@ -758,14 +758,7 @@ type BrowserTerminalTestControls = {
 	remount: () => void;
 };
 
-function BrowserTerminalRoot() {
-	const base = buildEnv.BASE_URL && buildEnv.BASE_URL !== "/"
-		? buildEnv.BASE_URL.replace(/\/$/, "")
-		: "";
-	const discoveryPath = base || "/";
-	if (window.location.pathname === discoveryPath || window.location.pathname === `${discoveryPath}/`) {
-		return <BrowserDiscovery />;
-	}
+function BrowserTerminalWorkspace() {
 	const [mounted, setMounted] = useState(true);
 	useEffect(() => {
 		if (buildEnv.VITE_BROWSER_TERMINAL_TEST_HARNESS !== "1") return;
@@ -779,6 +772,17 @@ function BrowserTerminalRoot() {
 		};
 	}, []);
 	return mounted ? <BrowserAlphaLazy authenticated /> : null;
+}
+
+function BrowserTerminalRoot() {
+	const base = buildEnv.BASE_URL && buildEnv.BASE_URL !== "/"
+		? buildEnv.BASE_URL.replace(/\/$/, "")
+		: "";
+	const discoveryPath = base || "/";
+	if (window.location.pathname === discoveryPath || window.location.pathname === `${discoveryPath}/`) {
+		return <BrowserDiscovery />;
+	}
+	return <BrowserTerminalWorkspace />;
 }
 
 const RootApp: React.ComponentType = REPLAY_DEMO

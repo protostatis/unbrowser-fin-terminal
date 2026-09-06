@@ -1232,6 +1232,8 @@ export function createBrowserTerminalApp(options: BrowserTerminalAppOptions = {}
 
   if (webDist) {
     app.use(express.static(webDist));
+    app.all(/^\/assets(?:\/|$)/, (_req, res) => res.status(404).end());
+    app.all("/favicon.svg", (_req, res) => res.status(404).end());
     app.get(/^(?!\/api).*/, (_req, res) => res.sendFile(path.join(webDist, "index.html")));
   }
 

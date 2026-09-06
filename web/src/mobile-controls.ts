@@ -141,6 +141,15 @@ export function tabSwitchAvailable(state?: TerminalFrameState): boolean {
   );
 }
 
+/** Whether the current screen can show the research evidence locker. */
+export function evidenceContextAvailable(state?: TerminalFrameState): boolean {
+  const screen = state?.screen?.toUpperCase();
+  return (
+    (state?.mode === "market" && (screen === "SIGNALS" || screen === "EVENTS"))
+    || (state?.mode === "ticker" && (screen === "RESEARCH" || screen === "SPLIT"))
+  );
+}
+
 export function isWatchImportContext(state?: TerminalFrameState): boolean {
   return state?.mode === "market" && state?.screen?.toUpperCase() === "WATCH";
 }

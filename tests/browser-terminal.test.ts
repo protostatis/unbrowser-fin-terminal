@@ -85,6 +85,11 @@ test("discovery shell and assets are public while the terminal API remains authe
       assert.equal(asset.status, 200);
       assert.equal(await asset.text(), "asset");
 
+      const missingAsset = await fetch(`${base}/assets/missing.js`, {
+        headers: { "x-fin-terminal-proxy-token": PROXY_TOKEN },
+      });
+      assert.equal(missingAsset.status, 404);
+
       const terminalApi = await fetch(`${base}/api/browser/v1/session`, {
         headers: { "x-fin-terminal-proxy-token": PROXY_TOKEN },
       });
