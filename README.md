@@ -110,9 +110,9 @@ remotely without authentication and TLS.
 
 The original Pi-backed `Dockerfile` / `server/index.ts` image is retained for
 local compatibility only. It is retired as a production deployment target.
-Production deployments must use the browser-owned variant below. Its public
-discovery page is at `/fin-terminal-browser/`; the signed-in workspace opens at
-`/fin-terminal-browser/terminal/`.
+Production deployments must use the browser-owned variant below. The base
+`/fin-terminal-browser/` entrypoint opens the signed-in workspace; the public
+discovery page is at `/fin-terminal-browser/discover/`.
 
 The included multi-stage image accepts `PUBLIC_BASE_PATH` at build time. For a
 subpath deployment, build with a trailing slash:

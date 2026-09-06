@@ -188,7 +188,11 @@ function principalFor(req: Request, proxyToken: string): string | undefined {
  */
 function isPublicDiscoveryAsset(req: Request): boolean {
   if (req.method !== "GET" && req.method !== "HEAD") return false;
-  return req.path === "/" || req.path === "/favicon.svg" || req.path.startsWith("/assets/");
+  return req.path === "/"
+    || req.path === "/discover"
+    || req.path === "/discover/"
+    || req.path === "/favicon.svg"
+    || req.path.startsWith("/assets/");
 }
 
 function sameOriginRequest(req: Request): boolean {
