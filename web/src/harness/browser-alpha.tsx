@@ -475,9 +475,9 @@ export function BrowserAlphaApp({ authenticated = false }: { authenticated?: boo
 			}
 			if (event.key === "Escape" && document.querySelector(".interaction-overlay[data-overlay-open]")) {
 				return;
-			}
+      }
       if (event.key === "Tab") {
-        if (isEditableTarget(event.target) || !tabSwitchAvailable(terminalState)) return;
+        if (event.shiftKey || isEditableTarget(event.target) || isTerminalControl(event.target) || !tabSwitchAvailable(terminalState)) return;
         const overlayOpen = document.querySelector(".interaction-overlay[data-overlay-open]") !== null;
         if (overlayOpen) return;
         event.preventDefault();

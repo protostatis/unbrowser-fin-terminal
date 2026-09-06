@@ -68,6 +68,17 @@ test("discovery shell and assets are public while the terminal API remains authe
       assert.equal(discovery.status, 200);
       assert.equal(await discovery.text(), "discovery shell");
 
+      const crossSiteDiscovery = await fetch(`${base}/`, {
+        headers: {
+          "x-fin-terminal-proxy-token": PROXY_TOKEN,
+          "sec-fetch-site": "cross-site",
+        },
+      });
+      assert.equal(crossSiteDiscovery.status, 200);
+
+      const missingProxyToken = await fetch(`${base}/`);
+      assert.equal(missingProxyToken.status, 403);
+
       const asset = await fetch(`${base}/assets/app.js`, {
         headers: { "x-fin-terminal-proxy-token": PROXY_TOKEN },
       });

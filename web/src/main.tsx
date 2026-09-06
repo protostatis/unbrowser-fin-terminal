@@ -25,7 +25,7 @@ import {
 } from "./InteractionOverlay";
 import { WatchlistImport } from "./WatchlistImport";
 import { SelectDialog } from "./SelectDialog";
-import { keyToData } from "./keyboard";
+import { isEditableTarget, isTerminalControl, keyToData } from "./keyboard";
 import { PUBLIC_DEMO, PUBLIC_LIVE_DEMO, REPLAY_DEMO } from "./demo-mode";
 import {
   DEMO_BUSY_CLOSE_CODE,
@@ -394,7 +394,7 @@ export function App({
 
       if (e.key === "Tab") {
         const state = frameStateRef.current;
-        if (!tabSwitchAvailable(state)) {
+        if (e.shiftKey || isEditableTarget(e.target) || isTerminalControl(e.target) || !tabSwitchAvailable(state)) {
           return;
         }
         // When the overlay is open, Tab should traverse its controls, not

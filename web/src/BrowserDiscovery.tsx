@@ -32,22 +32,22 @@ export function BrowserDiscovery() {
             </p>
             <div className="discovery-actions">
               <a className="discovery-primary" href="/">
-                <span>Sign in to open workspace</span>
+                <span>Continue to Unbrowser</span>
                 <span aria-hidden="true">↗</span>
               </a>
-              <a className="discovery-secondary" href="/fin-terminal-live-pilot/">
-                Try the public demo <span aria-hidden="true">→</span>
+              <a className="discovery-secondary" href="#workspace-capabilities">
+                See how it works <span aria-hidden="true">↓</span>
               </a>
             </div>
             <p className="discovery-auth-note">
-              New here? Explore the demo first. Already signed in? <a href={terminalHref}>Open your workspace</a>.
+              Sign in from Unbrowser to open the workspace. Already signed in? <a href={terminalHref}>Open your workspace</a>.
             </p>
           </div>
 
           <div className="discovery-terminal-preview" aria-label="Illustrated market terminal preview">
             <div className="discovery-preview-topline">
               <span>MARKET MAP</span>
-               <span className="discovery-preview-live">SAMPLE // DELAYED DATA</span>
+                <span className="discovery-preview-live">SAMPLE // DELAYED DATA</span>
             </div>
             <div className="discovery-preview-index">
               <span className="discovery-preview-label">S&amp;P 500</span>
@@ -74,7 +74,7 @@ export function BrowserDiscovery() {
           </div>
         </section>
 
-        <section className="discovery-proof" aria-label="Workspace capabilities">
+        <section id="workspace-capabilities" className="discovery-proof" aria-label="Workspace capabilities">
           <article>
             <span className="discovery-card-number">01</span>
             <h2>Start with the map</h2>

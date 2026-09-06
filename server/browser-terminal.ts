@@ -605,12 +605,12 @@ export function createBrowserTerminalApp(options: BrowserTerminalAppOptions = {}
       res.status(403).type("text").send("Forbidden");
       return;
     }
-    if (!sameOriginRequest(req)) {
-      res.status(403).type("text").send("Forbidden");
-      return;
-    }
     if (isPublicDiscoveryAsset(req)) {
       next();
+      return;
+    }
+    if (!sameOriginRequest(req)) {
+      res.status(403).type("text").send("Forbidden");
       return;
     }
     const principal = principalFor(req, proxyToken);
