@@ -46,12 +46,12 @@ The authenticated terminal starts its browser runtime automatically after
 forward authentication; reload or closing the tab is the normal way to end the
 client session. Broker and MCP expiry remain the server-side cleanup boundary.
 
-## Node/Pi runtime
+## Pi runtime
 
-The default build and signed-in live path remain Node-side. Pi owns the
-filesystem, child processes, session transcript, and the canonical extension
-execution environment. `createNodeKernelPorts()` remains the default when Pi
-loads the extension.
+The `.pi/extensions/market-terminal.ts` file remains the canonical Pi plugin.
+Pi owns the filesystem, child processes, session transcript, and extension
+execution environment when launched with `pi -e`. The retired Pi-backed web
+projection is not the default development or production path.
 
 ## Public gateway
 
