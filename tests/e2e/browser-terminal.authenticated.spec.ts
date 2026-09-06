@@ -1,6 +1,7 @@
 import { test, expect, type Page } from "@playwright/test";
 
 const SESSION_PATH = "/api/browser/v1/session";
+const TERMINAL_PATH = "/terminal/";
 
 async function expectConnected(page: Page): Promise<void> {
 	await expect(page.locator(".browser-alpha-shell")).toBeVisible();
@@ -24,7 +25,7 @@ test("authenticated mode auto-starts once through the real broker and removes se
 		if (new URL(request.url()).pathname === SESSION_PATH) sessionRequests += 1;
 	});
 
-	await page.goto("");
+	await page.goto(TERMINAL_PATH);
 
 	await expectConnected(page);
 	await expect.poll(() => sessionRequests).toBe(1);
@@ -47,7 +48,7 @@ test("authenticated startup exposes a retry after a broker failure", async ({ pa
 		await route.continue();
 	});
 
-	await page.goto("");
+	await page.goto(TERMINAL_PATH);
 	await expect(page.getByRole("button", { name: "Retry" })).toBeVisible();
 	await page.getByRole("button", { name: "Retry" }).click();
 	await expectConnected(page);
@@ -74,7 +75,7 @@ test("same-document unmount/remount releases startup and StrictMode does not dup
 		await route.continue();
 	});
 
-	await page.goto("");
+	await page.goto(TERMINAL_PATH);
 	await expect.poll(() => sessionRequests).toBe(1);
 	await browserTerminalControl(page, "unmount");
 	await expect(page.locator(".browser-alpha-shell")).toHaveCount(0);
@@ -82,4 +83,16 @@ test("same-document unmount/remount releases startup and StrictMode does not dup
 	releaseFirstSession?.();
 	await expectConnected(page);
 	await expect.poll(() => sessionRequests).toBe(2);
+});
+
+test("root serves discovery without starting the authenticated broker", async ({ page }) => {
+	let sessionRequests = 0;
+	page.on("request", (request) => {
+		if (new URL(request.url()).pathname === SESSION_PATH) sessionRequests += 1;
+	});
+
+	await page.goto("/");
+	await expect(page.locator(".browser-discovery")).toBeVisible();
+	await expect(page.getByRole("heading", { name: "See what moved. Understand why." })).toBeVisible();
+	await expect.poll(() => sessionRequests).toBe(0);
 });

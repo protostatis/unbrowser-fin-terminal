@@ -132,6 +132,24 @@ export function canRestoreTickerSplit(state?: TerminalFrameState): boolean {
     && (state.tickerLayout === "quote" || state.tickerLayout === "research");
 }
 
+/** Whether Tab is a terminal command rather than browser focus traversal. */
+export function tabSwitchAvailable(state?: TerminalFrameState): boolean {
+  const screen = state?.screen?.toUpperCase();
+  return (
+    (state?.mode === "market" && (screen === "SIGNALS" || screen === "EVENTS"))
+    || (state?.mode === "ticker" && state.tickerSplitAvailable === true)
+  );
+}
+
+/** Whether the current screen can show the research evidence locker. */
+export function evidenceContextAvailable(state?: TerminalFrameState): boolean {
+  const screen = state?.screen?.toUpperCase();
+  return (
+    (state?.mode === "market" && (screen === "SIGNALS" || screen === "EVENTS"))
+    || (state?.mode === "ticker" && (screen === "RESEARCH" || screen === "SPLIT"))
+  );
+}
+
 export function isWatchImportContext(state?: TerminalFrameState): boolean {
   return state?.mode === "market" && state?.screen?.toUpperCase() === "WATCH";
 }

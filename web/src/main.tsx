@@ -15,6 +15,8 @@ import {
   isWatchImportContext,
   recentResearchStatuses,
   researchActivityStatus,
+  evidenceContextAvailable,
+  tabSwitchAvailable,
   type ResearchActivityStatus,
 } from "./mobile-controls";
 import { EvidenceControl, EvidenceInspector } from "./EvidenceInspector";
@@ -24,7 +26,7 @@ import {
 } from "./InteractionOverlay";
 import { WatchlistImport } from "./WatchlistImport";
 import { SelectDialog } from "./SelectDialog";
-import { isTerminalControl, keyToData } from "./keyboard";
+import { isEditableTarget, isTerminalControl, keyToData } from "./keyboard";
 import { PUBLIC_DEMO, PUBLIC_LIVE_DEMO, REPLAY_DEMO } from "./demo-mode";
 import {
   DEMO_BUSY_CLOSE_CODE,
@@ -34,6 +36,7 @@ import {
 import type { FrameMessage, SelectRequestMessage } from "./socket";
 import { ReplayApp } from "./ReplayApp";
 import { PublicLiveApp } from "./PublicLiveApp";
+import { BrowserDiscovery } from "./BrowserDiscovery";
 import type { TerminalDossier } from "./dossier";
 import "./styles.css";
 
@@ -390,13 +393,9 @@ export function App({
         return;
       }
 
-      if (e.key === "Tab" && !isTerminalControl(e.target)) {
+      if (e.key === "Tab") {
         const state = frameStateRef.current;
-        const screen = state?.screen?.toUpperCase();
-        const tabMeaningful =
-          (state?.mode === "market" && (screen === "SIGNALS" || screen === "EVENTS")) ||
-          (state?.mode === "ticker" && state?.tickerSplitAvailable);
-        if (!tabMeaningful) {
+        if (e.shiftKey || e.ctrlKey || e.metaKey || e.altKey || isEditableTarget(e.target) || isTerminalControl(e.target) || !tabSwitchAvailable(state)) {
           return;
         }
         // When the overlay is open, Tab should traverse its controls, not
@@ -404,7 +403,8 @@ export function App({
         // terminal frame itself is not — allow Tab to escape to the overlay.
         const overlayOpen = document.querySelector(".interaction-overlay[data-overlay-open]") !== null;
         if (overlayOpen) return;
-      } else if (e.key === "Tab" && isTerminalControl(e.target)) {
+        e.preventDefault();
+        s.sendInput("\t");
         return;
       }
       const data = keyToData(e);
@@ -497,12 +497,16 @@ export function App({
   const hasFrame = rowsRef.current.length > 0;
   const wasReplaced = wasReplacedRef.current;
   const dossier = frameStateRef.current?.dossier;
+  const evidenceVisible = Boolean(
+    dossier
+    && evidenceContextAvailable(frameStateRef.current),
+  );
 
   useEffect(() => {
     // A new frame can replace or clear the active canvas while the locker is
     // open. Close it rather than leaving the keyboard behind an invisible dialog.
-    if (!dossier && evidenceOpen) setEvidenceOpen(false);
-  }, [dossier, evidenceOpen]);
+    if ((!dossier || !evidenceVisible) && evidenceOpen) setEvidenceOpen(false);
+  }, [dossier, evidenceOpen, evidenceVisible]);
 
   const showImporter = !PUBLIC_LIVE_DEMO && isWatchImportContext(frameStateRef.current);
   const wasImporterFocusedRef = useRef(false);
@@ -614,7 +618,7 @@ export function App({
           absolutely-positioned evidence chip; the connection/dimensions
           readout was removed as display-only noise) */}
       <div className="status-line">
-        {dossier && (
+        {evidenceVisible && dossier && (
           <EvidenceControl
             dossier={dossier}
             open={evidenceOpen}
@@ -677,7 +681,7 @@ export function App({
       )}
 
       {/* Evidence locker — the research dossier inspector */}
-      {evidenceOpen && dossier && (
+      {evidenceOpen && evidenceVisible && dossier && (
         <EvidenceInspector dossier={dossier} onClose={closeEvidence} />
       )}
 
@@ -754,7 +758,7 @@ type BrowserTerminalTestControls = {
 	remount: () => void;
 };
 
-function BrowserTerminalRoot() {
+function BrowserTerminalWorkspace() {
 	const [mounted, setMounted] = useState(true);
 	useEffect(() => {
 		if (buildEnv.VITE_BROWSER_TERMINAL_TEST_HARNESS !== "1") return;
@@ -768,6 +772,17 @@ function BrowserTerminalRoot() {
 		};
 	}, []);
 	return mounted ? <BrowserAlphaLazy authenticated /> : null;
+}
+
+function BrowserTerminalRoot() {
+	const base = buildEnv.BASE_URL && buildEnv.BASE_URL !== "/"
+		? buildEnv.BASE_URL.replace(/\/$/, "")
+		: "";
+	const discoveryPath = base || "/";
+	if (window.location.pathname === discoveryPath || window.location.pathname === `${discoveryPath}/`) {
+		return <BrowserDiscovery />;
+	}
+	return <BrowserTerminalWorkspace />;
 }
 
 const RootApp: React.ComponentType = REPLAY_DEMO

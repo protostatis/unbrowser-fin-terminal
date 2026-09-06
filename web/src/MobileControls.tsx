@@ -206,6 +206,7 @@ export function MobileControls({
               key={action.id}
               className={`mobile-key mobile-key-action mobile-key-${action.tone || "default"}`}
               disabled={disabled || action.disabled}
+              aria-label={`${action.label}, keyboard shortcut ${action.keyHint}`}
               onClick={() => activate(action)}
             >
               <span>{action.label}</span>

@@ -11,6 +11,18 @@ interface ContextHudProps {
 
 const HUD_IDLE_MS = 2500;
 
+function shortcutLabel(input: string): string {
+  switch (input) {
+    case "\t": return "Tab";
+    case "\x1b": return "Escape";
+    case "\x1b[A": return "Arrow up";
+    case "\x1b[B": return "Arrow down";
+    case "\x1b[C": return "Arrow right";
+    case "\x1b[D": return "Arrow left";
+    default: return input.length === 1 ? input.toUpperCase() : "keyboard shortcut";
+  }
+}
+
 /**
  * Touch-only contextual controls, overlaid on the terminal. Two surfaces:
  *
@@ -96,6 +108,7 @@ export function ContextHud({ state, researchStatus, disabled, onInput }: Context
               className={`context-hud-chip context-hud-chip-${chip.tone || "default"}`}
               disabled={disabled}
               tabIndex={clusterVisible ? 0 : -1}
+              aria-label={`${chip.label.replace(/^[^\w]+/, "")} (keyboard shortcut ${shortcutLabel(chip.input)})`}
               onClick={() => fire(chip)}
             >
               {chip.label}

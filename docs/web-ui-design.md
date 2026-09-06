@@ -26,10 +26,12 @@ Pi-backed WebSocket server.
 
 ## Current deployment path
 
-Deploy only the authenticated browser terminal at:
+Deploy the browser-terminal image with a public discovery shell and an
+authenticated workspace at:
 
 ```text
 https://unbrowser.unchainedsky.com/fin-terminal-browser/
+https://unbrowser.unchainedsky.com/fin-terminal-browser/terminal/
 ```
 
 Build it with `Dockerfile.browser-terminal`,

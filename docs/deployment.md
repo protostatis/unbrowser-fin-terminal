@@ -1,7 +1,8 @@
 # Production Deployment
 
-The production terminal is served at
-`https://unbrowser.unchainedsky.com/fin-terminal-browser/`. That browser-owned
+The public discovery page is served at
+`https://unbrowser.unchainedsky.com/fin-terminal-browser/`. The authenticated
+workspace opens at `/fin-terminal-browser/terminal/`. That browser-owned
 service is the only container targeted for deployment. The former Pi-backed
 singleton at `/fin-terminal/` is retired and must not be deployed or targeted.
 This repository does not deploy directly
@@ -110,8 +111,10 @@ deployment fallback for a normal terminal release.
   durable state. The service requires server-side OpenRouter and private MCP
   configuration; those values must never be included in Vite build arguments or
   browser responses.
-- The browser-owned service is served at `/fin-terminal-browser/` from the
-  infra repository's `docker-compose.browser-terminal.yml` overlay. The overlay requires an
+- The browser-owned service serves the public discovery page at
+  `/fin-terminal-browser/` and the authenticated workspace at
+  `/fin-terminal-browser/terminal/` from the infra repository's
+  `docker-compose.browser-terminal.yml` overlay. The overlay requires an
   immutable `FIN_TERMINAL_BROWSER_IMAGE` and a separate
   `FIN_TERMINAL_BROWSER_PROXY_TOKEN`; it must not reuse the retired Pi singleton or the
   workspace control-plane service. Keep `FIN_TERMINAL_BROWSER_ENABLED=false`
@@ -288,8 +291,9 @@ code to resume polling.
   service healthy and `GET /api/ready` returns HTTP 200 from inside the container.
 - Confirm the retired `/unbrowser/fin-terminal/` route is no longer mapped to a
   container and returns the edge's not-found/retired response.
-- Confirm an approved user can load the terminal and establish
-  `/fin-terminal-browser/` through Caddy.
+- Confirm the public discovery page loads at `/fin-terminal-browser/`.
+- Confirm an approved user can load the terminal at `/fin-terminal-browser/terminal/`
+  through Caddy.
 - Confirm a direct container-network request without the injected proxy token
   returns HTTP 403.
 - Confirm the demo service reports `GET /api/ready` HTTP 200.

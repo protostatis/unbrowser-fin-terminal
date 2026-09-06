@@ -8,7 +8,9 @@ import {
   normalizeSymbolInput,
   recentResearchStatuses,
   researchActivityStatus,
+  evidenceContextAvailable,
   symbolSearchInputs,
+  tabSwitchAvailable,
   TERMINAL_INPUTS,
   verticalSwipeScroll,
 } from "../web/src/mobile-controls.js";
@@ -69,6 +71,23 @@ test("mobile actions adapt to market, ticker, research, and cache states", () =>
     "refresh-cache",
     "cancel-cache",
   ]);
+});
+
+test("Tab is reserved for pane switching only when the terminal exposes panes", () => {
+  assert.equal(tabSwitchAvailable({ mode: "market", screen: "SIGNALS" }), true);
+  assert.equal(tabSwitchAvailable({ mode: "market", screen: "EVENTS" }), true);
+  assert.equal(tabSwitchAvailable({ mode: "market", screen: "MARKET" }), false);
+  assert.equal(tabSwitchAvailable({ mode: "ticker", tickerSplitAvailable: true }), true);
+  assert.equal(tabSwitchAvailable({ mode: "ticker", tickerSplitAvailable: false }), false);
+});
+
+test("evidence locker stays available on research-capable market and ticker screens", () => {
+  assert.equal(evidenceContextAvailable({ mode: "market", screen: "SIGNALS" }), true);
+  assert.equal(evidenceContextAvailable({ mode: "market", screen: "EVENTS" }), true);
+  assert.equal(evidenceContextAvailable({ mode: "market", screen: "WATCH" }), false);
+  assert.equal(evidenceContextAvailable({ mode: "ticker", screen: "RESEARCH" }), true);
+  assert.equal(evidenceContextAvailable({ mode: "ticker", screen: "SPLIT" }), true);
+  assert.equal(evidenceContextAvailable({ mode: "ticker", screen: "QUOTE" }), false);
 });
 
 test("mobile symbol entry normalizes valid stock, index, and crypto symbols", () => {
