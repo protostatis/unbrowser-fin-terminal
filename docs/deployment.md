@@ -1,8 +1,9 @@
 # Production Deployment
 
-The public discovery page is served at
-`https://unbrowser.unchainedsky.com/fin-terminal-browser/`. The authenticated
-workspace opens at `/fin-terminal-browser/terminal/`. That browser-owned
+The browser-owned entrypoint at
+`https://unbrowser.unchainedsky.com/fin-terminal-browser/` opens the
+authenticated workspace. The public discovery page is served at
+`/fin-terminal-browser/discover/`. That browser-owned
 service is the only container targeted for deployment. The former Pi-backed
 singleton at `/fin-terminal/` is retired and must not be deployed or targeted.
 This repository does not deploy directly
@@ -112,7 +113,7 @@ deployment fallback for a normal terminal release.
   configuration; those values must never be included in Vite build arguments or
   browser responses.
 - The browser-owned service serves the public discovery page at
-  `/fin-terminal-browser/` and the authenticated workspace at
+  `/fin-terminal-browser/discover/` and the authenticated workspace at
   `/fin-terminal-browser/terminal/` from the infra repository's
   `docker-compose.browser-terminal.yml` overlay. The overlay requires an
   immutable `FIN_TERMINAL_BROWSER_IMAGE` and a separate
@@ -291,7 +292,8 @@ code to resume polling.
   service healthy and `GET /api/ready` returns HTTP 200 from inside the container.
 - Confirm the retired `/unbrowser/fin-terminal/` route is no longer mapped to a
   container and returns the edge's not-found/retired response.
-- Confirm the public discovery page loads at `/fin-terminal-browser/`.
+- Confirm the browser entrypoint opens `/fin-terminal-browser/terminal/`.
+- Confirm the public discovery page loads at `/fin-terminal-browser/discover/`.
 - Confirm an approved user can load the terminal at `/fin-terminal-browser/terminal/`
   through Caddy.
 - Confirm a direct container-network request without the injected proxy token
