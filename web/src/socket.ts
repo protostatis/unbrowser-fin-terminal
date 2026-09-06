@@ -5,7 +5,9 @@ import type { TerminalWebAction } from "./web-interactions";
  * WebSocket client for the Pi market-terminal backend.
  *
  * Connects under Vite's configured BASE_URL. The dev build uses /ws, while a
- * subpath deployment can use (for example) /unbrowser/fin-terminal/ws.
+ * subpath deployments derive the `/ws` endpoint from Vite's configured base
+ * path. The browser-owned terminal itself uses an in-process runtime instead
+ * of this legacy WebSocket client.
  *
  * Uses an event-emitter pattern: call .on(type, handler) and receive parsed
  * message objects. Built-in event types mirror the server→client protocol:

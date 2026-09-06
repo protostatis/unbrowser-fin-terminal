@@ -2,7 +2,8 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import { fileURLToPath, URL } from "node:url";
 
-// Dev: the React app proxies /api and /ws to the Node backend (server/index.ts).
+// The default dev flow proxies the browser-owned UI to browser-terminal-main.
+// The retired Pi-backed server/index.ts is not part of the frontend dev path.
 const backendPort = Number(process.env.MARKET_SERVER_PORT ?? process.env.PORT ?? 8787);
 const backendHttp = `http://127.0.0.1:${backendPort}`;
 const backendWs = `ws://127.0.0.1:${backendPort}`;

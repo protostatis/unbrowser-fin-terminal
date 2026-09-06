@@ -6,9 +6,9 @@
   "type": "module",
   "scripts": {
     "postinstall": "node scripts/patch-pi-brace-expansion.mjs",
-    "dev": "concurrently -n server,web -c blue,green \"npm run dev:server\" \"npm run dev:web\"",
-    "dev:server": "tsx watch server/index.ts",
-    "dev:web": "vite",
+    "dev": "concurrently -n browser,web -c blue,green \"npm run dev:browser-terminal\" \"npm run dev:web\"",
+    "dev:browser-terminal": "tsx watch server/browser-terminal-main.ts",
+    "dev:web": "VITE_TERMINAL_BUILD_MODE=browser vite",
     "start": "node dist-server/server/index.js",
     "start:browser-terminal": "node dist-server/server/browser-terminal-main.js",
     "build": "tsc -p tsconfig.server.json && vite build",

@@ -1,9 +1,10 @@
 # Production Deployment
 
-The primary production terminal is served at
-`https://unbrowser.unchainedsky.com/fin-terminal-browser/`. The former
-Pi-backed singleton at `/fin-terminal/` is a deprecated legacy route retained
-for rollback and maintenance only. This repository does not deploy directly
+The production terminal is served at
+`https://unbrowser.unchainedsky.com/fin-terminal-browser/`. That browser-owned
+service is the only container targeted for deployment. The former Pi-backed
+singleton at `/fin-terminal/` is retired and must not be deployed or targeted.
+This repository does not deploy directly
 from a branch. Releases are pinned to immutable application commits and image
 digests in the [`unchained-infra`](https://github.com/protostatis/unchained-infra)
 Compose manifests and deployed through that repository's GitHub Actions workflows.
@@ -38,8 +39,7 @@ deployment fallback for a normal terminal release.
    `FIN_TERMINAL_BROWSER_IMAGE` with the resulting immutable GHCR digest. Never
    use a mutable tag or branch ref.
 
-   The legacy Pi route has a separate release path and should only be updated
-   for rollback or maintenance work.
+    Do not create a new release for the retired Pi route.
 
 4. Update the matching browser-image assertion in
    `unchained/test_fin_terminal.py`, then run the infrastructure checks:
@@ -61,16 +61,20 @@ deployment fallback for a normal terminal release.
 
 ## Deployment Contract
 
-- Build the authenticated live service with
-  `PUBLIC_BASE_PATH=/unbrowser/fin-terminal/`. Build the public gateway client
+- Deploy only the authenticated browser-owned service, built with
+  `Dockerfile.browser-terminal`, `PUBLIC_BASE_PATH=/fin-terminal-browser/`,
+  and `VITE_TERMINAL_BUILD_MODE=browser`. The retired Pi-backed
+  `PUBLIC_BASE_PATH=/unbrowser/fin-terminal/` singleton must not be built,
+  deployed, or targeted. Build the public gateway client
   at `/unbrowser/fin-terminal-demo/` with
   `VITE_TERMINAL_BUILD_MODE=public-live`.
-- `PUBLIC_DEMO=0` is explicit for authenticated live and `PUBLIC_DEMO=1` is
-  explicit for replay. Public admission instead uses
+- The authenticated browser-owned service uses `TERMINAL_RUNTIME_MODE=browser`
+  and does not use `PUBLIC_DEMO`. `PUBLIC_DEMO=1` remains explicit only for
+  separately deployed replay artifacts. Public admission instead uses
   `TERMINAL_RUNTIME_MODE=public-gateway` and must not set `PUBLIC_DEMO`.
-- The client build and server mode must pair. `public-gateway` requires a
-  `public-live` client; replay requires replay; authenticated live requires
-  live. The stable demo URL alone no longer determines whether the deployment
+- The client build and server mode must pair. `browser` requires a browser
+  client; `public-gateway` requires a `public-live` client; replay requires
+  replay. The stable demo URL alone no longer determines whether the deployment
   is replay or public-live. A mismatched pair is unsafe and must fail closed.
 - The public-live gateway verifies Turnstile, serializes FIFO admission through
   a Redis lease, reserves conservative per-session research budget, and proxies
@@ -98,7 +102,7 @@ deployment fallback for a normal terminal release.
 - Authenticated/worker containers listen on `8787`; the public gateway uses its
   separately configured port (the pilot overlay uses `8788`). `/api/ready` is
   the readiness check for each mode.
-- The authenticated browser-owned variant is a separate service built with
+- The authenticated browser-owned service is built with
   `Dockerfile.browser-terminal` and `VITE_TERMINAL_BUILD_MODE=browser`. It runs
   `npm run start:browser-terminal`, requires
   `TERMINAL_RUNTIME_MODE=browser`, and must not be pointed at the Pi-backed
@@ -106,11 +110,10 @@ deployment fallback for a normal terminal release.
   durable state. The service requires server-side OpenRouter and private MCP
   configuration; those values must never be included in Vite build arguments or
   browser responses.
-- The browser-owned service is commissioned first on the isolated
-  `/fin-terminal-browser/` canary route from the infra repository's
-  `docker-compose.browser-terminal.yml` overlay. The overlay requires an
+- The browser-owned service is served at `/fin-terminal-browser/` from the
+  infra repository's `docker-compose.browser-terminal.yml` overlay. The overlay requires an
   immutable `FIN_TERMINAL_BROWSER_IMAGE` and a separate
-  `FIN_TERMINAL_BROWSER_PROXY_TOKEN`; it must not reuse the Pi singleton or the
+  `FIN_TERMINAL_BROWSER_PROXY_TOKEN`; it must not reuse the retired Pi singleton or the
   workspace control-plane service. Keep `FIN_TERMINAL_BROWSER_ENABLED=false`
   until both profiled services are healthy and direct commissioning succeeds.
 - Release the browser image from a merged application revision using the
@@ -119,8 +122,7 @@ deployment fallback for a normal terminal release.
   release; never point infra at a mutable tag or a locally built image.
 - Caddy owns authenticated-terminal route authorization and injects its terminal
   proxy token. The browser-owned route uses a dedicated forward-auth policy for
-  any approved signed-in UnchainedSky account; the legacy Pi singleton keeps its
-  separate administrator/allowlist policy. For public live, Caddy must strip and overwrite `X-Real-IP`; the
+  any approved signed-in UnchainedSky account. For public live, Caddy must strip and overwrite `X-Real-IP`; the
   gateway trusts that value only when Caddy also strips and overwrites
   `X-Fin-Terminal-Edge-Token` with `PUBLIC_EDGE_PROXY_TOKEN`, and enforces both
   visitor-IP and proxy-peer admission limits. Do not expose either terminal
@@ -135,11 +137,9 @@ deployment fallback for a normal terminal release.
   Keep the reviewed limits in the browser Compose overlay and retain a matching
   provider-side spend cap; do not expose the browser route without both bounds.
 - Production research uses the Docker-internal `unbrowser-mcp` endpoint. Do
-  not substitute the shared public development endpoint.
-- The legacy Pi terminal remains a singleton per process. Approved operators
-  share its persistent research archive and should coordinate ownership of the
-  active WebSocket session; the browser-owned service is account-scoped and
-  uses the durable provider budget described above.
+  not substitute the shared public development endpoint. The browser-owned
+  service is account-scoped and uses the durable provider budget described
+  above.
 
 ## Research Cache Pre-Warming Configuration
 
@@ -201,7 +201,8 @@ Behavior to expect in production:
 - Completed canvases are archived to `$MARKET_DATA_DIR/market-research-archive.json`
   with typed quality telemetry (`quality`, `generation`), and are shared across
   sessions. One parent process writes both archive and pre-cache ledger per data
-  directory (the deployment is a singleton; public workers do not warm).
+  directory (the authenticated browser-terminal parent is the sole writer;
+  public workers do not warm).
 
 ## Market-Event Scout
 
@@ -214,7 +215,7 @@ and never falls back to a paid model.
 
 | Env | Default | Production guidance |
 |---|---|---|
-| `MARKET_SCOUT_ENABLED` | `0` | Enable only on the authenticated singleton parent while collecting shadow evidence. `1/true/on` enables; `0/false/off` disables |
+| `MARKET_SCOUT_ENABLED` | `0` | Enable only on the authenticated browser-terminal parent while collecting shadow evidence. `1/true/on` enables; `0/false/off` disables |
 | `MARKET_SCOUT_DISPATCH_ENABLED` | `0` | Enable guarded real trigger dispatch only after validating the adapter. Requires `MARKET_SCOUT_ENABLED`; public/disposable workers remain disabled |
 | `MARKET_SCOUT_MODEL_ID` | `nvidia/nemotron-3.5-lightning:free` | The only model accepted by the scout adapter; paid or alternate model IDs fail closed |
 | `MARKET_SCOUT_DISPATCH_PER_RUN` | `1` | Maximum trigger jobs accepted from one poll |
@@ -283,11 +284,12 @@ code to resume polling.
 ## Post-Deployment Verification
 
 - Confirm the GitHub Actions production job succeeded.
-- Confirm the deployment host reports `fin-terminal` healthy and
-  `GET /api/ready` returns HTTP 200 from inside the container.
-- Confirm logged-out requests to `/unbrowser/fin-terminal/` return HTTP 401.
+- Confirm the deployment host reports the browser-owned `fin-terminal-browser`
+  service healthy and `GET /api/ready` returns HTTP 200 from inside the container.
+- Confirm the retired `/unbrowser/fin-terminal/` route is no longer mapped to a
+  container and returns the edge's not-found/retired response.
 - Confirm an approved user can load the terminal and establish
-  `/unbrowser/fin-terminal/ws` through Caddy.
+  `/fin-terminal-browser/` through Caddy.
 - Confirm a direct container-network request without the injected proxy token
   returns HTTP 403.
 - Confirm the demo service reports `GET /api/ready` HTTP 200.

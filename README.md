@@ -49,17 +49,23 @@ Then use:
 /market-debug market    Open deterministic debug fixtures
 ```
 
-### Web UI
+### Local browser terminal
 
-The browser UI runs the same extension in a real in-process Pi session and
-projects its terminal frames over a local WebSocket:
+The default frontend dev flow targets the browser-owned terminal. It does not
+start the retired Pi-backed WebSocket server or make the Pi TUI plugin a
+frontend development dependency. The `.pi/extensions/market-terminal.ts`
+plugin remains available for the Pi TUI above and is used by the separate
+browser-terminal runtime where required.
 
 ```bash
 npm ci
 npm run dev
 ```
 
-To use Pi through OpenRouter with the hosted public-source extractor:
+This starts `server/browser-terminal-main.ts` and Vite. Configure the
+server-side provider and MCP endpoint before using research:
+
+For local development with OpenRouter and the hosted public-source extractor:
 
 ```bash
 export OPENROUTER_API_KEY=sk-or-...
@@ -90,45 +96,40 @@ such as `http://unbrowser-mcp:8767/mcp`. Production startup fails closed when
 
 Open the Vite URL printed in the terminal (normally
 `http://localhost:5173`). Quote browsing works immediately; agent research
-uses your local Pi model/auth configuration and may consume configured model
+uses the server-side provider configuration and may consume configured model
 resources.
 
 If port `8787` is occupied, start both processes against another backend port,
 for example `PORT=8788 npm run dev`.
 
-The bridge listens on `127.0.0.1` by default and accepts browser connections
-only from loopback origins. Do not expose it remotely without authentication
-and TLS; `ALLOWED_ORIGINS` alone is not authentication.
+The local browser broker listens on `127.0.0.1` by default. Do not expose it
+remotely without authentication and TLS.
 
 ### Container deployment
 
-The generic authenticated image below is the legacy Pi-backed singleton. It is
-kept for rollback and maintenance only. The new production target is the
-authenticated browser-owned terminal at
-`https://unbrowser.unchainedsky.com/fin-terminal-browser/`; new production
-releases must use the browser-terminal image described below.
+The original Pi-backed `Dockerfile` / `server/index.ts` image is retained for
+local compatibility only. It is retired as a production deployment target.
+Production authenticated-terminal deployments must use the browser-owned
+variant below at `/fin-terminal-browser/`.
 
 The included multi-stage image accepts `PUBLIC_BASE_PATH` at build time. For a
 subpath deployment, build with a trailing slash:
 
 ```bash
-docker build \
-  --build-arg PUBLIC_BASE_PATH=/unbrowser/fin-terminal/ \
-  -t unbrowser-fin-terminal .
+docker build -f Dockerfile.browser-terminal \
+  --build-arg PUBLIC_BASE_PATH=/fin-terminal-browser/ \
+  -t unbrowser-fin-terminal-browser .
 ```
 
-Production requires `MARKET_PROXY_TOKEN`; the trusted reverse proxy must
-overwrite `X-Fin-Terminal-Proxy-Token` on every HTTP and WebSocket request. It
-must also provide an authenticated, opaque `X-Fin-Terminal-User` value. The
-first WebSocket principal owns the singleton terminal session until the process
-restarts, preventing state transfer between users.
+The browser-owned service requires `TERMINAL_RUNTIME_MODE=browser`,
+`MARKET_PROXY_TOKEN`, server-side model credentials, and a private MCP endpoint.
+The trusted reverse proxy must overwrite `X-Fin-Terminal-Proxy-Token` and
+provide an authenticated, opaque `X-Fin-Terminal-User` value.
 
-Authenticated live production sets `PUBLIC_DEMO=0`; replay sets
-`PUBLIC_DEMO=1`; the anonymous public gateway instead sets
-`TERMINAL_RUNTIME_MODE=public-gateway` and must not set `PUBLIC_DEMO`. The
-client build and server mode must match: public-gateway pairs with an explicit
-`public-live` client build, replay pairs with replay, and authenticated live
-pairs with live.
+The authenticated browser service sets `TERMINAL_RUNTIME_MODE=browser`; replay
+artifacts set `PUBLIC_DEMO=1`; and the anonymous public gateway sets
+`TERMINAL_RUNTIME_MODE=public-gateway` without `PUBLIC_DEMO`. Each client build
+must match its runtime mode.
 
 Set `MARKET_ROOT=/app`, `MARKET_DATA_DIR=/data`, and mount `/data` as the only
 persistent volume. `/api/health` is liveness-only; use `/api/ready` for the
@@ -146,18 +147,17 @@ model policy and expose the same four model-facing tools, but the canonical
 terminal process remains the sole archive writer.
 
 Run `npm run typecheck` to validate the extension, backend, and browser client,
-or `npm run build` for a production browser bundle.
+or `npm run build:browser-terminal` for the production browser-terminal bundle.
 
 For the production release workflow, including the immutable source-SHA handoff
 to `unchained-infra` and GitHub Actions production approval, see
 [`docs/deployment.md`](docs/deployment.md).
 
-### Authenticated browser terminal (primary production target; no Pi)
+### Authenticated browser terminal (no Pi)
 
-The browser-owned variant is the primary production terminal and uses a
-separate backend entrypoint with no Pi session or WebSocket. It is served at
-`https://unbrowser.unchainedsky.com/fin-terminal-browser/`. Build it with the
-browser image and provide the broker credentials only to the server:
+The production browser-owned variant uses a separate backend entrypoint with no
+Pi session or WebSocket. Build it with the browser image and provide the broker
+credentials only to the server:
 
 ```bash
 docker build -f Dockerfile.browser-terminal \
@@ -171,12 +171,6 @@ Docker-internal `UNBROWSER_MCP_URL`. Caddy must strip client identity/auth
 headers, run `forward_auth`, copy `X-Fin-Terminal-User`, and inject the proxy
 token before forwarding to this container. Mount `/data` for the principal-
 scoped archive and watchlist records. The browser sends no provider key.
-
-Release this image from a merged application revision with the
-`Publish authenticated browser-terminal image` workflow. The resulting
-immutable digest is then pinned by `unchained-infra`. The legacy
-`/fin-terminal/` Pi route is deprecated and should not receive new production
-features.
 
 ### Public live-session pilot
 

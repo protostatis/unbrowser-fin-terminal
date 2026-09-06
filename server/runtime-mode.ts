@@ -84,8 +84,8 @@ const BUILD_MODE_RE = /<meta\s+name="x-build-mode"\s+content="(replay|live|publi
 
 function expectedBuildMode(runtimeMode: RuntimeMode): BuildMode {
   if (runtimeMode === "public-gateway") return "public-live";
-  // A private per-account workspace runtime runs the same full live client
-  // (built with PUBLIC_BASE_PATH=/fin-terminal/) as the signed-in singleton.
+  // A private per-account workspace runtime runs the same full live client as
+  // the Pi runtime, but is owned by one account rather than a shared singleton.
   return runtimeMode === "private-workspace" ? "live" : runtimeMode;
 }
 
