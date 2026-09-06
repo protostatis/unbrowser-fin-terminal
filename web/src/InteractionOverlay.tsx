@@ -159,6 +159,7 @@ export function InteractionOverlay({
                   type="button"
                   className="interaction-list-item"
                   aria-pressed={item.selected}
+                  aria-label={`${item.label}, item ${item.index + 1}${item.selected ? ", selected" : ""}`}
                   disabled={actionDisabled}
                   onClick={() =>
                     emit({
@@ -197,6 +198,7 @@ export function InteractionOverlay({
                   type="button"
                   className="interaction-pane-btn"
                   aria-pressed={pane.selected}
+                  aria-label={`Switch to ${pane.label} pane${pane.selected ? ", selected" : ""}`}
                   disabled={actionDisabled || pane.selected}
                   onClick={() => emit({ action: "focus-pane", pane: pane.id })}
                 >
@@ -264,6 +266,7 @@ export function InteractionOverlay({
                     type="button"
                     className="interaction-scroll-btn"
                     disabled={actionDisabled}
+                    aria-label={`Scroll ${ctrl.target} to previous content`}
                     onClick={() =>
                       emit({
                         action: "scroll",
@@ -279,6 +282,7 @@ export function InteractionOverlay({
                     type="button"
                     className="interaction-scroll-btn"
                     disabled={actionDisabled}
+                    aria-label={`Scroll ${ctrl.target} to next content`}
                     onClick={() =>
                       emit({
                         action: "scroll",

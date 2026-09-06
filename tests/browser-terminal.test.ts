@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
@@ -24,7 +24,7 @@ async function withServer<T>(
 	fetchImpl: typeof fetch,
 	fn: (base: string, calls: Array<{ url: string; init?: RequestInit }>) => Promise<T>,
 	now: () => number = Date.now,
-	appOptions: { providerBudget?: Partial<ProviderBudgetConfig> } = {},
+	appOptions: { providerBudget?: Partial<ProviderBudgetConfig>; webDist?: string } = {},
 ): Promise<T> {
 	const root = await mkdtemp(path.join(os.tmpdir(), "browser-terminal-test-"));
 	const calls: Array<{ url: string; init?: RequestInit }> = [];
@@ -53,6 +53,36 @@ async function withServer<T>(
 		await rm(root, { recursive: true, force: true });
 	}
 }
+
+test("discovery shell and assets are public while the terminal API remains authenticated", async () => {
+  const fakeFetch: typeof fetch = async () => new Response("upstream unavailable", { status: 503 });
+  const webDist = await mkdtemp(path.join(os.tmpdir(), "browser-discovery-test-"));
+  try {
+    await writeFile(path.join(webDist, "index.html"), "discovery shell");
+    await mkdir(path.join(webDist, "assets"));
+    await writeFile(path.join(webDist, "assets", "app.js"), "asset");
+    await withServer(fakeFetch, async (base) => {
+      const discovery = await fetch(`${base}/`, {
+        headers: { "x-fin-terminal-proxy-token": PROXY_TOKEN },
+      });
+      assert.equal(discovery.status, 200);
+      assert.equal(await discovery.text(), "discovery shell");
+
+      const asset = await fetch(`${base}/assets/app.js`, {
+        headers: { "x-fin-terminal-proxy-token": PROXY_TOKEN },
+      });
+      assert.equal(asset.status, 200);
+      assert.equal(await asset.text(), "asset");
+
+      const terminalApi = await fetch(`${base}/api/browser/v1/session`, {
+        headers: { "x-fin-terminal-proxy-token": PROXY_TOKEN },
+      });
+      assert.equal(terminalApi.status, 403);
+    }, Date.now, { webDist });
+  } finally {
+    await rm(webDist, { recursive: true, force: true });
+  }
+});
 
 test("authenticated browser broker overrides model and never forwards browser auth", async () => {
 	let openRouterBody: Record<string, unknown> | undefined;

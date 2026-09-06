@@ -9,6 +9,7 @@ import {
   recentResearchStatuses,
   researchActivityStatus,
   symbolSearchInputs,
+  tabSwitchAvailable,
   TERMINAL_INPUTS,
   verticalSwipeScroll,
 } from "../web/src/mobile-controls.js";
@@ -69,6 +70,14 @@ test("mobile actions adapt to market, ticker, research, and cache states", () =>
     "refresh-cache",
     "cancel-cache",
   ]);
+});
+
+test("Tab is reserved for pane switching only when the terminal exposes panes", () => {
+  assert.equal(tabSwitchAvailable({ mode: "market", screen: "SIGNALS" }), true);
+  assert.equal(tabSwitchAvailable({ mode: "market", screen: "EVENTS" }), true);
+  assert.equal(tabSwitchAvailable({ mode: "market", screen: "MARKET" }), false);
+  assert.equal(tabSwitchAvailable({ mode: "ticker", tickerSplitAvailable: true }), true);
+  assert.equal(tabSwitchAvailable({ mode: "ticker", tickerSplitAvailable: false }), false);
 });
 
 test("mobile symbol entry normalizes valid stock, index, and crypto symbols", () => {

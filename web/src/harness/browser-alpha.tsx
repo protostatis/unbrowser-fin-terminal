@@ -13,7 +13,7 @@ import { InteractionOverlay, type TerminalWebAction } from "../InteractionOverla
 import { MobileControls } from "../MobileControls";
 import { WatchlistImport } from "../WatchlistImport";
 import { SelectDialog } from "../SelectDialog";
-import { isWatchImportContext, researchActivityStatus, type TerminalFrameState } from "../mobile-controls";
+import { isWatchImportContext, researchActivityStatus, tabSwitchAvailable, type TerminalFrameState } from "../mobile-controls";
 import type { WatchlistImportResult } from "../socket";
 import { createWebUi, type Panel } from "../../../server/web-ui.js";
 import { resolveWebAction } from "../../../server/web-actions.js";
@@ -341,6 +341,11 @@ export function BrowserAlphaApp({ authenticated = false }: { authenticated?: boo
 	const terminalState = (panel?.debugState?.() ?? undefined) as TerminalFrameState | undefined;
 	const researchStatus = researchActivityStatus(terminalState);
 	const dossier = terminalState?.dossier;
+	const evidenceVisible = Boolean(
+		dossier
+		&& terminalState?.mode === "ticker"
+		&& (terminalState.screen === "RESEARCH" || terminalState.screen === "SPLIT"),
+	);
 
 	const handleWebAction = useCallback((action: TerminalWebAction) => {
 		if (!terminalState || evidenceOpen || selectReq || watchlistImportOpen) return;
@@ -427,6 +432,10 @@ export function BrowserAlphaApp({ authenticated = false }: { authenticated?: boo
 		focusTerminal();
 	}, [connected, focusTerminal]);
 
+	useEffect(() => {
+		if ((!dossier || !evidenceVisible) && evidenceOpen) setEvidenceOpen(false);
+	}, [dossier, evidenceOpen, evidenceVisible]);
+
 	const showImporter = !evidenceOpen && isWatchImportContext(terminalState);
 	const wasImporterFocusedRef = useRef(false);
 	useEffect(() => {
@@ -467,16 +476,15 @@ export function BrowserAlphaApp({ authenticated = false }: { authenticated?: boo
 			if (event.key === "Escape" && document.querySelector(".interaction-overlay[data-overlay-open]")) {
 				return;
 			}
-			if (isEditableTarget(event.target) || isTerminalControl(event.target)) return;
-			if (event.key === "Tab") {
-				const screen = terminalState?.screen?.toUpperCase();
-				const tabMeaningful =
-					(terminalState?.mode === "market" && (screen === "SIGNALS" || screen === "EVENTS")) ||
-					(terminalState?.mode === "ticker" && terminalState?.tickerSplitAvailable);
-				if (!tabMeaningful) return;
-				const overlayOpen = document.querySelector(".interaction-overlay[data-overlay-open]") !== null;
-				if (overlayOpen) return;
-			}
+      if (event.key === "Tab") {
+        if (isEditableTarget(event.target) || !tabSwitchAvailable(terminalState)) return;
+        const overlayOpen = document.querySelector(".interaction-overlay[data-overlay-open]") !== null;
+        if (overlayOpen) return;
+        event.preventDefault();
+        sendInput("\t");
+        return;
+      }
+      if (isEditableTarget(event.target) || isTerminalControl(event.target)) return;
 			const data = keyToData(event);
 			if (data === null) return;
 			event.preventDefault();
@@ -553,7 +561,7 @@ export function BrowserAlphaApp({ authenticated = false }: { authenticated?: boo
 				terminalRef={terminalFrameRef}
 			/>
 			<div className="status-line">
-				{dossier && (
+				{evidenceVisible && dossier && (
 					<EvidenceControl
 						dossier={dossier}
 						open={evidenceOpen}
@@ -605,7 +613,7 @@ export function BrowserAlphaApp({ authenticated = false }: { authenticated?: boo
 					onCancel={() => resolveSelect(undefined, true)}
 				/>
 			)}
-			{evidenceOpen && dossier && <EvidenceInspector dossier={dossier} onClose={() => { setEvidenceOpen(false); focusTerminal(); }} />}
+			{evidenceOpen && evidenceVisible && dossier && <EvidenceInspector dossier={dossier} onClose={() => { setEvidenceOpen(false); focusTerminal(); }} />}
 			{notice && <div className="browser-alpha-notice" role="status">{notice}</div>}
 			{error && <div className="browser-alpha-toast" role="alert">{error}</div>}
 		</div>

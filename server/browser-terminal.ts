@@ -181,6 +181,16 @@ function principalFor(req: Request, proxyToken: string): string | undefined {
   return normalizePrincipal(singleHeader(req, USER_HEADER), Boolean(proxyToken));
 }
 
+/**
+ * The discovery shell and its immutable Vite assets are intentionally public.
+ * Everything else, including the authenticated terminal entrypoint, still
+ * requires both the edge token and an account principal.
+ */
+function isPublicDiscoveryAsset(req: Request): boolean {
+  if (req.method !== "GET" && req.method !== "HEAD") return false;
+  return req.path === "/" || req.path === "/favicon.svg" || req.path.startsWith("/assets/");
+}
+
 function sameOriginRequest(req: Request): boolean {
   const fetchSite = req.header("sec-fetch-site")?.toLowerCase();
   if (fetchSite === "cross-site") return false;
@@ -597,6 +607,10 @@ export function createBrowserTerminalApp(options: BrowserTerminalAppOptions = {}
     }
     if (!sameOriginRequest(req)) {
       res.status(403).type("text").send("Forbidden");
+      return;
+    }
+    if (isPublicDiscoveryAsset(req)) {
+      next();
       return;
     }
     const principal = principalFor(req, proxyToken);

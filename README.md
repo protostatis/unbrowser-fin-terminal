@@ -109,8 +109,9 @@ remotely without authentication and TLS.
 
 The original Pi-backed `Dockerfile` / `server/index.ts` image is retained for
 local compatibility only. It is retired as a production deployment target.
-Production authenticated-terminal deployments must use the browser-owned
-variant below at `/fin-terminal-browser/`.
+Production deployments must use the browser-owned variant below. Its public
+discovery page is at `/fin-terminal-browser/`; the signed-in workspace opens at
+`/fin-terminal-browser/terminal/`.
 
 The included multi-stage image accepts `PUBLIC_BASE_PATH` at build time. For a
 subpath deployment, build with a trailing slash:
@@ -126,7 +127,8 @@ The browser-owned service requires `TERMINAL_RUNTIME_MODE=browser`,
 The trusted reverse proxy must overwrite `X-Fin-Terminal-Proxy-Token` and
 provide an authenticated, opaque `X-Fin-Terminal-User` value.
 
-The authenticated browser service sets `TERMINAL_RUNTIME_MODE=browser`; replay
+The browser discovery shell is static and unauthenticated. The authenticated
+workspace service sets `TERMINAL_RUNTIME_MODE=browser`; replay
 artifacts set `PUBLIC_DEMO=1`; and the anonymous public gateway sets
 `TERMINAL_RUNTIME_MODE=public-gateway` without `PUBLIC_DEMO`. Each client build
 must match its runtime mode.
@@ -156,7 +158,9 @@ to `unchained-infra` and GitHub Actions production approval, see
 ### Authenticated browser terminal (no Pi)
 
 The production browser-owned variant uses a separate backend entrypoint with no
-Pi session or WebSocket. Build it with the browser image and provide the broker
+Pi session or WebSocket. The public discovery shell explains the workflow
+before sign-in; the `/fin-terminal-browser/terminal/` entrypoint is the
+auth-gated workspace. Build it with the browser image and provide the broker
 credentials only to the server:
 
 ```bash
