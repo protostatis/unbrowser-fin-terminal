@@ -233,7 +233,21 @@ test("compact Crypto Pulse keeps the complete chart tail at mobile heights", asy
 		assert.ok(lines.some((line: string) => line.includes("►")), `${width}x${height} selected board row must survive chart fitting`);
 		assert.ok(!lines.some((line: string) => line.includes("TOP-20")), `${width}x${height} compact must suppress TOP-20 display-only strip`);
 		assert.ok(!lines.some((line: string) => line.includes("UNRANKED")), `${width}x${height} compact must suppress UNRANKED`);
+		const candleLegend = lines.findIndex((line: string) => line.includes("CANDLE"));
+		const volumeRow = lines.findIndex((line: string, index: number) => index > candleLegend && line.includes("VOL"));
+		assert.ok(candleLegend >= 0 && volumeRow - candleLegend >= 5, `${width}x${height} compact chart should reserve at least four price rows`);
 	}
+
+	// Expanded controls consume one body row. The chart may compress by one
+	// price row, but its tail must remain intact instead of being sliced.
+	await uiTest.execute("press", { action: "press", button: "button_help" });
+	const helpScreen = await uiTest.execute("state", { action: "state", width: 48, height: 20 });
+	const helpLines: string[] = helpScreen.details.screen;
+	const helpCandleLegend = helpLines.findIndex((line: string) => line.includes("CANDLE"));
+	const helpVolumeRow = helpLines.findIndex((line: string, index: number) => index > helpCandleLegend && line.includes("VOL"));
+	assert.ok(helpCandleLegend >= 0 && helpVolumeRow - helpCandleLegend >= 4, "expanded mobile controls must not slice the chart tail");
+	assert.ok(helpLines.some((line: string) => line.includes("UTC")), "expanded mobile controls must preserve the chart time axis");
+	assert.ok(helpLines.some((line: string) => line.includes("Range")), "expanded mobile controls must preserve the chart range");
 });
 
 test("leaving the MARKET screen resets the crypto subview to GLOBAL", async () => {
@@ -356,10 +370,14 @@ test("failed crypto chart requests render as unavailable and remain retryable", 
     await uiTest.execute("open_market", { action: "open_market" });
     await uiTest.execute("press", { action: "press", button: "button_g" });
     await waitForState(uiTest, (state: any) => state.cryptoPulse?.state === "ready");
-    const unavailable = await waitForScreen(uiTest, (lines) => lines.some((line) => line.includes("CHART UNAVAILABLE")));
-    assert.equal(unavailable.some((line) => line.includes("syncing chart")), false, "failed chart must not remain stuck syncing");
+		const unavailable = await waitForScreen(uiTest, (lines) => lines.some((line) => line.includes("CHART UNAVAILABLE")));
+		assert.equal(unavailable.some((line) => line.includes("syncing chart")), false, "failed chart must not remain stuck syncing");
+		const compactUnavailable = await uiTest.execute("state", { action: "state", width: 48, height: 20 });
+		const compactUnavailableLines: string[] = compactUnavailable.details.screen;
+		assert.ok(compactUnavailableLines.some((line: string) => line.includes("CHART UNAVAILABLE")), "compact unavailable state should stay labeled");
+		assert.ok(compactUnavailableLines.some((line: string) => line.includes("HOTTEST")), "compact unavailable state should keep the board visible");
 
-    const callsBeforeRetry = yahooCalls;
+		const callsBeforeRetry = yahooCalls;
     await uiTest.execute("press", { action: "press", button: "button_r" });
     await waitForScreen(uiTest, (lines) => yahooCalls > callsBeforeRetry && lines.some((line) => line.includes("CHART UNAVAILABLE")));
   } finally {

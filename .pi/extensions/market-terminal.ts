@@ -6443,18 +6443,32 @@ class MarketHub {
 		// first) as one windowed sequence, exactly like MOVERS. Selection index
 		// references the merged sequence (unranked stays display-only).
 		const board = rows.map((entry) => entry.row);
+		const selectedRow = rows[this.cryptoSelected]?.row;
+		const selectedCmcSymbol = selectedRow?.symbol ?? null;
+		// The chartable pair may be a numeric-suffix discovery (TRUMP35336-USD);
+		// prefer the resolved pair, fall back to the scoreboard's derivation.
+		const resolvedPair = selectedCmcSymbol ? (this.cryptoResolvedPair.get(selectedCmcSymbol) ?? selectedRow?.yahooSymbol ?? null) : null;
+		const chartQuote = resolvedPair ? this.cryptoQuotes.get(`${this.chartScope}:${resolvedPair}`) : undefined;
+		const chartUnavailable = Boolean(selectedCmcSymbol && (
+			this.cryptoQuoteUnavailable.has(`${this.chartScope}:${selectedCmcSymbol}`)
+			|| (resolvedPair && this.cryptoQuoteUnavailable.has(`${this.chartScope}:${resolvedPair}`))
+		));
+		const compactChartNeedsPlot = Boolean(chartQuote && chartQuote.points.length >= 2 && !chartUnavailable);
 		// Fill the pane vertically like MOVERS: capacity tracks available rows
 		// after the head block and the window-status line.
-		// Compact: the board gets the majority of rows and the chart takes a
-		// small fixed budget, so phones show ~8-16 tickers instead of a fixed
-		// ~3 (the old remainder formula gave the chart everything left over,
-		// pinning the board to 3 rows at any height). stretchBlocks + the fit
-		// loop below still guarantee the chart tail survives on tiny screens.
+		// Compact: keep the board scrollable, but reserve enough vertical space
+		// for a readable price plot. The chart renderer spends six rows on its
+		// legend, volume/time axes, and range line, so a budget below 10 leaves
+		// only two or three price rows and makes the candles look flat. The fit
+		// loop below gives the chart priority on the smallest screens while
+		// keeping the selected board row visible.
 		// Wide keeps the previous fill behavior.
-		const compactMinBoard = 2; // board heading + selected row
+		const compactChartMinimum = bodyRows < 15 ? 9 : 10;
 		const compactChartBudget = wideCrypto
 			? 2
-			: Math.min(9, Math.max(5, Math.floor(bodyRows * 0.35)));
+			: compactChartNeedsPlot
+				? Math.min(12, Math.max(compactChartMinimum, Math.floor(bodyRows * 0.5)))
+				: 3;
 		const boardReserve = board.length > Math.max(1, bodyRows - head.length - (wideCrypto ? 2 : compactChartBudget)) ? 1 : 0;
 		const windowCapacity = Math.max(2, Math.min(
 			board.length,
@@ -6483,16 +6497,6 @@ class MarketHub {
 		// space that previously held only the COLDEST list, and keeps the
 		// layout animated when the selection changes.
 		const chartBlock: string[] = [];
-		const selectedRow = rows[this.cryptoSelected]?.row;
-		const selectedCmcSymbol = selectedRow?.symbol ?? null;
-		// The chartable pair may be a numeric-suffix discovery (TRUMP35336-USD);
-		// prefer the resolved pair, fall back to the scoreboard's derivation.
-		const resolvedPair = selectedCmcSymbol ? (this.cryptoResolvedPair.get(selectedCmcSymbol) ?? selectedRow?.yahooSymbol ?? null) : null;
-		const chartQuote = resolvedPair ? this.cryptoQuotes.get(`${this.chartScope}:${resolvedPair}`) : undefined;
-		const chartUnavailable = Boolean(selectedCmcSymbol && (
-			this.cryptoQuoteUnavailable.has(`${this.chartScope}:${selectedCmcSymbol}`)
-			|| (resolvedPair && this.cryptoQuoteUnavailable.has(`${this.chartScope}:${resolvedPair}`))
-		));
 		if (selectedCmcSymbol && !resolvedPair) {
 			chartBlock.push(fit(th.bold(th.fg("accent", "PRICE CHART"))));
 			chartBlock.push(fit(th.fg("dim", `  ${selectedCmcSymbol} · no chartable Yahoo pair`)));
@@ -6550,7 +6554,11 @@ class MarketHub {
 			// PRICE CHART + axes + range always survive on phones.
 			let fittedRows = [...boardRows];
 			let includeBoardStatus = boardStatus !== undefined;
-			const gaps = 2;
+			// At the shortest phone heights, remove inter-block spacer rows rather
+			// than flattening the price plot. The headings and chart axes still
+			// provide enough separation, and the selected board row remains visible.
+			const compactGap = bodyRows < 22 ? 0 : 1;
+			const gaps = compactGap * 2;
 			while (head.length + 1 + fittedRows.length + (includeBoardStatus ? 1 : 0) + chartBlock.length + gaps > bodyRows && fittedRows.length > 1) {
 				// Drop the status line first, then the farthest non-selected row.
 				if (includeBoardStatus) {
@@ -6562,7 +6570,7 @@ class MarketHub {
 				fittedRows.splice(fittedRows.length - 1 - removeIndex, 1);
 			}
 			const fittedBoard = [boardHeading, ...fittedRows.map((row) => row.line), ...(includeBoardStatus && boardStatus ? [boardStatus] : [])];
-			lines.push(...stretchBlocks([head, fittedBoard, chartBlock], bodyRows, "", 1));
+			lines.push(...stretchBlocks([head, fittedBoard, chartBlock], bodyRows, "", compactGap));
 		}
 	}
 
@@ -7756,6 +7764,7 @@ const UI_TEST_BUTTONS: Record<string, string> = {
 	button_q: "q",
 	button_b: "b",
 	button_g: "g",
+	button_help: "?",
 	focus_next: "\t",
 	history_older: "[",
 	history_newer: "]",
@@ -9580,7 +9589,7 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({
 			action: StringEnum(["open_market", "open_ticker", "state", "press", "reset", "load_canvas", "advance_research", "dossier_regression"] as const),
 			scenario: Type.Optional(StringEnum(["overflow", "citation_reset", "rediscovery"] as const)),
-			button: Type.Optional(StringEnum(["dpad_left", "dpad_right", "dpad_up", "dpad_down", "button_j", "button_k", "button_e", "button_c", "button_r", "button_q", "button_b", "button_g", "focus_next", "history_older", "history_newer", "page_up", "page_down", "scope_day", "scope_week", "scope_month", "scope_year", "scope_max"] as const)),
+			button: Type.Optional(StringEnum(["dpad_left", "dpad_right", "dpad_up", "dpad_down", "button_j", "button_k", "button_e", "button_c", "button_r", "button_q", "button_b", "button_g", "button_help", "focus_next", "history_older", "history_newer", "page_up", "page_down", "scope_day", "scope_week", "scope_month", "scope_year", "scope_max"] as const)),
 			symbol: Type.Optional(Type.String({ description: "Ticker fixture for open_ticker, defaults to AAPL" })),
 			ticker_navigation: Type.Optional(Type.Object({
 				source: StringEnum(["movers", "watch"] as const),
