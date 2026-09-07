@@ -370,10 +370,14 @@ test("failed crypto chart requests render as unavailable and remain retryable", 
     await uiTest.execute("open_market", { action: "open_market" });
     await uiTest.execute("press", { action: "press", button: "button_g" });
     await waitForState(uiTest, (state: any) => state.cryptoPulse?.state === "ready");
-    const unavailable = await waitForScreen(uiTest, (lines) => lines.some((line) => line.includes("CHART UNAVAILABLE")));
-    assert.equal(unavailable.some((line) => line.includes("syncing chart")), false, "failed chart must not remain stuck syncing");
+		const unavailable = await waitForScreen(uiTest, (lines) => lines.some((line) => line.includes("CHART UNAVAILABLE")));
+		assert.equal(unavailable.some((line) => line.includes("syncing chart")), false, "failed chart must not remain stuck syncing");
+		const compactUnavailable = await uiTest.execute("state", { action: "state", width: 48, height: 20 });
+		const compactUnavailableLines: string[] = compactUnavailable.details.screen;
+		assert.ok(compactUnavailableLines.some((line: string) => line.includes("CHART UNAVAILABLE")), "compact unavailable state should stay labeled");
+		assert.ok(compactUnavailableLines.some((line: string) => line.includes("HOTTEST")), "compact unavailable state should keep the board visible");
 
-    const callsBeforeRetry = yahooCalls;
+		const callsBeforeRetry = yahooCalls;
     await uiTest.execute("press", { action: "press", button: "button_r" });
     await waitForScreen(uiTest, (lines) => yahooCalls > callsBeforeRetry && lines.some((line) => line.includes("CHART UNAVAILABLE")));
   } finally {

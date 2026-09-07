@@ -6463,7 +6463,6 @@ class MarketHub {
 		// loop below gives the chart priority on the smallest screens while
 		// keeping the selected board row visible.
 		// Wide keeps the previous fill behavior.
-		const compactMinBoard = 2; // board heading + selected row
 		const compactChartMinimum = bodyRows < 15 ? 9 : 10;
 		const compactChartBudget = wideCrypto
 			? 2
