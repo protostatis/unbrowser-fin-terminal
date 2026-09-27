@@ -9,7 +9,7 @@
  * advancement in the browser-era runtime.
  */
 
-import { copyFile, mkdir, rename, rm } from "node:fs/promises";
+import { copyFile, mkdir, readFile, rm } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import {
@@ -71,7 +71,7 @@ export function createGlobalCacheRunner(options: GlobalCacheRunnerOptions = {}) 
   const fetchImpl = options.fetchImpl ?? fetch;
 
   async function runOnce(runOptions: { force?: boolean } = {}): Promise<
-    | { ran: false; reason: "lease-held" | "lease-lost" }
+    | { ran: false; reason: "lease-held" | "lease-lost" | "superseded" }
     | { ran: true; result: MarketEventScoutRunResult }
   > {
     const lease = await store.acquireLease(owner);
@@ -85,16 +85,20 @@ export function createGlobalCacheRunner(options: GlobalCacheRunnerOptions = {}) 
     const heartbeat = setInterval(() => {
       void store.renewLease(owner, token).catch(() => {});
     }, heartbeatEveryMs);
-    // Fence the journal itself: poll against an isolated temp copy and only
-    // atomically commit it over the live journal when the lease is still
-    // held. A fenced-out leader discards its temp copy, so it can neither
-    // publish nor replace a newer journal with a stale snapshot.
+    // Fence the journal itself: poll against an isolated temp copy and commit
+    // it through the store's indivisible check-and-replace (lease + stale
+    // base verified synchronously inside one transaction). A fenced-out or
+    // superseded leader discards its temp copy, so it can neither publish
+    // nor replace a newer journal with a stale snapshot.
     const liveJournal = path.join(stateDir, "market-event-scout.json");
     const tempJournal = `${liveJournal}.tmp-${process.pid}-${randomUUID().replace(/-/g, "")}`;
     try {
       if (!mcpUrl) throw new Error("UNBROWSER_MCP_URL is required for the global cache runner");
       await mkdir(stateDir, { recursive: true });
+      let baseUpdatedAt: number | undefined;
       try {
+        const live = JSON.parse(await readFile(liveJournal, "utf8")) as { updatedAt?: unknown };
+        baseUpdatedAt = typeof live.updatedAt === "number" && Number.isInteger(live.updatedAt) ? live.updatedAt : undefined;
         await copyFile(liveJournal, tempJournal);
       } catch (error) {
         if ((error as { code?: string }).code !== "ENOENT") throw error;
@@ -105,17 +109,9 @@ export function createGlobalCacheRunner(options: GlobalCacheRunnerOptions = {}) 
           new MarketEventScout({ client: documentClient, statePath, now }));
       const scout = createScout(client, tempJournal);
       const result = await scout.run({ force: runOptions.force });
-      // Post-run fencing: if we lost the lease mid-poll, discard the temp
-      // journal and the result rather than committing either.
-      if (!(await store.checkLease(token))) {
-        await rm(tempJournal, { force: true }).catch(() => {});
-        return { ran: false, reason: "lease-lost" };
-      }
-      try {
-        await rename(tempJournal, liveJournal);
-      } catch (error) {
-        if ((error as { code?: string }).code !== "ENOENT") throw error;
-        // The poll wrote nothing (no due sources); the live journal stands.
+      const commit = await store.commitJournal(token, tempJournal, liveJournal, baseUpdatedAt);
+      if (!commit.committed) {
+        return { ran: false, reason: commit.reason === "superseded" ? "superseded" : "lease-lost" };
       }
       return { ran: true, result };
     } finally {

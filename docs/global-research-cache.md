@@ -10,11 +10,12 @@ private and are never merged into global state.
 - **Global scout journal** (`<GLOBAL_CACHE_DIR>/market-event-scout.json`):
   feed baselines, observations, decisions, dry-run candidates. Only the
   lease holder polls, with heartbeat renewal while polling. Each poll runs
-  against an isolated temp copy and commits it over the live journal by
-  atomic rename only when the lease is still held; a fenced-out leader
-  discards its temp copy, so it can neither publish nor replace a newer
-  journal with a stale snapshot. Cache publication itself stays
-  transactionally fenced on the lease token.
+  against an isolated temp copy and commits through one indivisible store
+  operation (lease check + stale-base detection + file replacement inside a
+  single transaction); a fenced-out or superseded leader discards its temp
+  copy, so it can neither publish nor replace a newer journal with a stale
+  snapshot. Cache publication itself stays transactionally fenced on the
+  lease token.
 - **Global research cache** (`<GLOBAL_CACHE_DIR>/global-research-cache.sqlite`):
   published entries keyed by exact canonical identity
   (`symbol + chartScope + researchKey + intent`); prompt/policy versions are
@@ -44,10 +45,12 @@ private and are never merged into global state.
 - Read-only endpoint (`GET /api/browser/v1/global-cache`): authenticated
   exact-identity lookup. Misses (stale, corrupt, incompatible, absent) are
   404s so callers fall back to live research. Responses cross the
-  publishable canvas projection (fetched public evidence only, every
-  citation linked, no research IDs / blocker notes / failure details) and
-  carry no trigger/job IDs, usage, or account data. The `globalCache`
-  session feature advertises the endpoint's presence, not a warm cache.
+  publishable canvas projection (per-kind key allowlists, URLs bound to
+  fetched evidence domains, every item cited, at least one read block, no
+  free-form text blocks or content prose, no research IDs / blocker notes /
+  failure details) and carry no trigger/job IDs, usage, or account data.
+  The `globalCache` session feature advertises the endpoint's presence, not
+  a warm cache.
 - Shadow runner (`server/global-cache-runner*.ts`, `Dockerfile.global-cache-runner`,
   `.github/workflows/publish-global-cache-runner.yml`):
   lease-guarded `MarketEventScout` polling with model dispatch off, heartbeat
@@ -83,7 +86,7 @@ private and are never merged into global state.
 | Env | Default | Notes |
 |---|---|---|
 | `GLOBAL_CACHE_RUNNER_ENABLED` | `0` | `1` enables the private runner. |
-| `GLOBAL_CACHE_DIR` | `<MARKET_DATA_DIR>/global-cache` | Must be absolute; exclusive single-writer volume shared with the browser service. |
+| `GLOBAL_CACHE_DIR` | `<MARKET_DATA_DIR>/global-cache` | Must be absolute; honored by both the runner and the browser default path, sharing one volume. |
 | `GLOBAL_CACHE_RUNNER_OWNER` | `global-cache-runner` | Lease owner identity. |
 | `GLOBAL_CACHE_RUNNER_INTERVAL_MS` | `60000` | Poll cadence, 30s–10min. |
 | `UNBROWSER_MCP_URL` | required when enabled | Private MCP endpoint for feed reads. |

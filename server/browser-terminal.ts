@@ -115,6 +115,20 @@ const BROKER_LANE_LIMITS: Record<BrokerLane, { rateLimit: number; globalRateLimi
 type FetchImpl = typeof fetch;
 type JsonRecord = Record<string, unknown>;
 
+/**
+ * Default shared database path, mirroring the private runner's
+ * GLOBAL_CACHE_DIR resolution so both processes open the same SQLite file
+ * without extra configuration.
+ */
+export function resolveGlobalCacheFilePath(env: NodeJS.ProcessEnv = process.env): string {
+  const override = env.GLOBAL_CACHE_DIR?.trim();
+  if (override) {
+    if (!path.isAbsolute(override)) throw new Error("GLOBAL_CACHE_DIR must be an absolute path");
+    return path.join(override, "global-research-cache.sqlite");
+  }
+  return path.resolve(env.MARKET_DATA_DIR?.trim() || "/data", "global-cache", "global-research-cache.sqlite");
+}
+
 export interface BrowserTerminalAppOptions {
   fetchImpl?: FetchImpl;
   openRouterApiKey?: string;
@@ -390,11 +404,10 @@ export function createBrowserTerminalApp(options: BrowserTerminalAppOptions = {}
   const watchlistImportUrl = options.watchlistImportUrl?.trim() || process.env.WATCHLIST_IMPORT_URL?.trim() || "";
   const mcpEndpoint = options.mcpEndpoint ?? process.env.UNBROWSER_MCP_URL?.trim();
   const storageRoot = options.storageRoot ?? path.resolve(process.env.MARKET_DATA_DIR?.trim() || "/data", "browser-sessions");
-  // Shared with the private runner's GLOBAL_CACHE_DIR default
-  // (<MARKET_DATA_DIR>/global-cache); deploy both against the same volume
-  // path or set an explicit globalCacheFilePath.
-  const globalCacheFilePath = options.globalCacheFilePath
-    ?? path.resolve(process.env.MARKET_DATA_DIR?.trim() || "/data", "global-cache", "global-research-cache.sqlite");
+  // Shared with the private runner: GLOBAL_CACHE_DIR wins when set,
+  // otherwise <MARKET_DATA_DIR>/global-cache. Deploy both against the same
+  // volume path or set an explicit globalCacheFilePath.
+  const globalCacheFilePath = options.globalCacheFilePath ?? resolveGlobalCacheFilePath(process.env);
   const globalCache = createGlobalCacheStore({ filePath: globalCacheFilePath, now: options.now ?? Date.now });
   const webDist = options.webDist ?? path.resolve(process.env.MARKET_ROOT?.trim() || process.cwd(), "dist-web");
   const now = options.now ?? Date.now;

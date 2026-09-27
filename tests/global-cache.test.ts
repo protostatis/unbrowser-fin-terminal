@@ -218,7 +218,7 @@ test("global cache canvas projection drops internal fields and requires cited ev
     }),
     undefined,
   );
-  // Free-form text blocks must cite fetched evidence too.
+  // Free-form text blocks are not publishable at all.
   assert.equal(
     sanitizeGlobalCacheCanvas({
       ...canvas(),
@@ -227,12 +227,48 @@ test("global cache canvas projection drops internal fields and requires cited ev
           kind: "text" as const,
           title: "Read",
           dossierHint: "read" as const,
-          text: "uncited prose claim",
+          text: "cited prose claim",
+          sourceIds: ["S1"],
         },
       ],
     }),
     undefined,
   );
+  // Nested extra fields on an otherwise valid item never publish.
+  assert.equal(
+    sanitizeGlobalCacheCanvas({
+      ...canvas(),
+      blocks: [
+        {
+          kind: "bullets" as const,
+          title: "Read",
+          dossierHint: "read" as const,
+          items: [{ text: "ok", sourceIds: ["S1"], researchId: "private-job" }],
+        },
+      ],
+    }),
+    undefined,
+  );
+  // One cited sibling cannot launder an uncited item in the same block.
+  assert.equal(
+    sanitizeGlobalCacheCanvas({
+      ...canvas(),
+      blocks: [
+        {
+          kind: "bullets" as const,
+          title: "Read",
+          dossierHint: "read" as const,
+          items: [
+            { text: "cited", sourceIds: ["S1"] },
+            { text: "uncited" },
+          ],
+        },
+      ],
+    }),
+    undefined,
+  );
+  // Free-form content prose never publishes, even with cited blocks.
+  assert.equal(sanitizeGlobalCacheCanvas({ ...canvas(), content: "uncited summary prose" }), undefined);
 });
 
 test("global cache builder pins versions and caps expiry by trigger validity", () => {

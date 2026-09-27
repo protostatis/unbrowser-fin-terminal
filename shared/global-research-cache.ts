@@ -172,7 +172,9 @@ const ALLOWED_PACKET_KEYS = new Set([
 ]);
 
 const ALLOWED_BLOCK_KEYS: Record<string, Set<string>> = {
-  text: new Set(["id", "kind", "title", "text", "sourceIds", "dossierHint"]),
+  // Note: free-form "text" blocks are deliberately not publishable. Prose
+  // outside cited items cannot be mechanically bound to evidence, so global
+  // briefs must carry facts in cited bullets/news/metrics/table rows.
   metrics: new Set(["id", "kind", "title", "items", "sourceIds", "dossierHint"]),
   table: new Set(["id", "kind", "title", "columns", "rows", "totalRows", "sourceIds", "dossierHint"]),
   news: new Set(["id", "kind", "title", "items", "sourceIds", "dossierHint"]),
@@ -185,6 +187,16 @@ const ALLOWED_BLOCK_KEYS: Record<string, Set<string>> = {
   ]),
 };
 
+const ALLOWED_ITEM_KEYS: Record<string, Set<string>> = {
+  bullets: new Set(["text", "role", "sourceIds"]),
+  news: new Set(["headline", "source", "url", "note", "sourceIds"]),
+  metrics: new Set(["label", "value", "delta", "note", "sourceIds"]),
+  sources: new Set(["id", "label", "url", "status"]),
+};
+
+const BULLET_ROLES = new Set(["fact", "interpretation", "risk", "catalyst"]);
+const ANNOTATION_ROLES = new Set(["support", "resistance", "signal"]);
+
 // Length caps mirror the extension's canvas block schema so oversized or
 // smuggled payloads fail closed instead of reaching another account.
 const FIELD_LENGTH_CAPS: Record<string, number> = {
@@ -193,6 +205,8 @@ const FIELD_LENGTH_CAPS: Record<string, number> = {
   note: 4_000,
   label: 160,
   value: 160,
+  source: 160,
+  delta: 160,
 };
 
 function urlHost(value: string): string | undefined {
@@ -203,51 +217,32 @@ function urlHost(value: string): string | undefined {
   }
 }
 
+function isCitedIds(value: unknown, fetchedIds: Set<string>): boolean {
+  if (!Array.isArray(value) || value.length === 0) return false;
+  return value.every((id) => typeof id === "string" && fetchedIds.has(id));
+}
+
+function isBoundedUrl(value: unknown, fetchedHosts: Set<string>): boolean {
+  if (typeof value !== "string" || sanitizePublicUrl(value) !== value || !value.startsWith("https://")) return false;
+  const host = urlHost(value);
+  return Boolean(host && fetchedHosts.has(host));
+}
+
+function isCappedString(value: unknown, field: string): boolean {
+  const cap = FIELD_LENGTH_CAPS[field];
+  return typeof value === "string" && cap !== undefined && value.length <= cap;
+}
+
 /**
- * Deep block audit against fetched public evidence. Every block kind is
- * key-allowlisted; every URL must be sanitized-public https on a fetched
- * evidence domain; every sourceIds list must be non-empty and fully
- * fetched; bounded text fields cannot smuggle oversized payloads.
+ * Deep block audit against fetched public evidence. Block kinds and every
+ * nested item shape are key-allowlisted; every item in bullets/news/metrics
+ * must carry its own fetched citation (one cited item cannot launder uncited
+ * siblings); every URL must be sanitized-public https on a fetched evidence
+ * domain; table/chart/sources blocks cite at block level.
  */
 function auditBlocks(blocks: unknown, fetchedIds: Set<string>, fetchedHosts: Set<string>): boolean {
-  if (!Array.isArray(blocks)) return false;
+  if (!Array.isArray(blocks) || blocks.length === 0) return false;
   let readBlocks = 0;
-  const auditValue = (value: unknown): boolean => {
-    if (typeof value === "string") return true;
-    if (typeof value !== "object" || value === null) return true;
-    if (Array.isArray(value)) return value.every(auditValue);
-    const record = value as Record<string, unknown>;
-    for (const [key, entry] of Object.entries(record)) {
-      if (key === "url") {
-        if (typeof entry !== "string" || sanitizePublicUrl(entry) !== entry || !entry.startsWith("https://")) return false;
-        const host = urlHost(entry);
-        if (!host || !fetchedHosts.has(host)) return false;
-      } else if (key === "sourceIds") {
-        if (!Array.isArray(entry) || entry.length === 0) return false;
-        for (const id of entry) {
-          if (typeof id !== "string" || !fetchedIds.has(id)) return false;
-        }
-      } else if (key in FIELD_LENGTH_CAPS) {
-        if (typeof entry !== "string" || entry.length > FIELD_LENGTH_CAPS[key]!) return false;
-      }
-      if (!auditValue(entry)) return false;
-    }
-    return true;
-  };
-  const collectInto = (value: unknown, into: string[]): void => {
-    if (!value || typeof value !== "object") return;
-    if (Array.isArray(value)) {
-      for (const item of value) collectInto(item, into);
-      return;
-    }
-    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-      if (key === "sourceIds" && Array.isArray(entry)) {
-        for (const id of entry) if (typeof id === "string") into.push(id);
-      } else {
-        collectInto(entry, into);
-      }
-    }
-  };
   for (const rawBlock of blocks) {
     if (!rawBlock || typeof rawBlock !== "object" || Array.isArray(rawBlock)) return false;
     const block = rawBlock as Record<string, unknown>;
@@ -257,13 +252,83 @@ function auditBlocks(blocks: unknown, fetchedIds: Set<string>, fetchedHosts: Set
     for (const key of Object.keys(block)) {
       if (!allowed.has(key)) return false;
     }
+    if (typeof block.title !== "string" || block.title.length > 160) return false;
     if (block.dossierHint === "read") readBlocks += 1;
-    // Every block is a claim vehicle: uncited blocks never publish, so one
-    // valid citation elsewhere cannot launder uncited claims.
-    const cited: string[] = [];
-    collectInto(block, cited);
-    if (cited.length === 0) return false;
-    if (!auditValue(block)) return false;
+    if (block.sourceIds !== undefined && !isCitedIds(block.sourceIds, fetchedIds)) return false;
+
+    if (block.kind === "bullets" || block.kind === "news" || block.kind === "metrics") {
+      if (!Array.isArray(block.items) || block.items.length === 0) return false;
+      const itemKeys = ALLOWED_ITEM_KEYS[block.kind]!;
+      for (const rawItem of block.items) {
+        if (!rawItem || typeof rawItem !== "object" || Array.isArray(rawItem)) return false;
+        const item = rawItem as Record<string, unknown>;
+        for (const key of Object.keys(item)) {
+          if (!itemKeys.has(key)) return false;
+        }
+        // Per-item citation: no laundering through cited siblings.
+        if (!isCitedIds(item.sourceIds, fetchedIds)) return false;
+        if (block.kind === "bullets") {
+          if (!isCappedString(item.text, "text")) return false;
+          if (item.role !== undefined && (typeof item.role !== "string" || !BULLET_ROLES.has(item.role))) return false;
+        } else if (block.kind === "news") {
+          if (!isCappedString(item.headline, "headline")) return false;
+          if (item.source !== undefined && !isCappedString(item.source, "source")) return false;
+          if (item.note !== undefined && !isCappedString(item.note, "note")) return false;
+          if (item.url !== undefined && !isBoundedUrl(item.url, fetchedHosts)) return false;
+        } else {
+          if (!isCappedString(item.label, "label")) return false;
+          if (!isCappedString(item.value, "value")) return false;
+          if (item.delta !== undefined && !isCappedString(item.delta, "delta")) return false;
+          if (item.note !== undefined && !isCappedString(item.note, "note")) return false;
+        }
+      }
+    } else if (block.kind === "table") {
+      if (!Array.isArray(block.columns) || block.columns.length < 1 || block.columns.length > 8) return false;
+      if (!block.columns.every((column) => typeof column === "string" && column.length <= 160)) return false;
+      if (!Array.isArray(block.rows) || block.rows.length > 12) return false;
+      for (const row of block.rows) {
+        if (!Array.isArray(row) || row.length > 8) return false;
+        if (!row.every((cell) => typeof cell === "string" && cell.length <= 160)) return false;
+      }
+      if (block.totalRows !== undefined && !(typeof block.totalRows === "number" && Number.isFinite(block.totalRows))) return false;
+      if (!isCitedIds(block.sourceIds, fetchedIds)) return false;
+    } else if (block.kind === "sources") {
+      if (!Array.isArray(block.items) || block.items.length === 0) return false;
+      for (const rawItem of block.items) {
+        if (!rawItem || typeof rawItem !== "object" || Array.isArray(rawItem)) return false;
+        const item = rawItem as Record<string, unknown>;
+        for (const key of Object.keys(item)) {
+          if (!ALLOWED_ITEM_KEYS.sources!.has(key)) return false;
+        }
+        // Listed sources must be the fetched evidence set, not a reopened
+        // door to unfetched origins.
+        if (typeof item.id !== "string" || !fetchedIds.has(item.id)) return false;
+        if (item.label !== undefined && (typeof item.label !== "string" || item.label.length > 160)) return false;
+        if (item.url !== undefined && !isBoundedUrl(item.url, fetchedHosts)) return false;
+        if (item.status !== undefined && item.status !== "fetched") return false;
+      }
+    } else if (block.kind === "chart") {
+      if (block.points !== undefined) {
+        if (!Array.isArray(block.points) || !block.points.every((point) => typeof point === "number" && Number.isFinite(point))) return false;
+      }
+      if (block.annotations !== undefined) {
+        if (!Array.isArray(block.annotations)) return false;
+        for (const rawAnnotation of block.annotations) {
+          if (!rawAnnotation || typeof rawAnnotation !== "object" || Array.isArray(rawAnnotation)) return false;
+          const annotation = rawAnnotation as Record<string, unknown>;
+          for (const key of Object.keys(annotation)) {
+            if (key !== "label" && key !== "value" && key !== "role") return false;
+          }
+          if (annotation.label !== undefined && (typeof annotation.label !== "string" || annotation.label.length > 160)) return false;
+          if (annotation.value !== undefined && (typeof annotation.value !== "number" || !Number.isFinite(annotation.value))) return false;
+          if (annotation.role !== undefined && (typeof annotation.role !== "string" || !ANNOTATION_ROLES.has(annotation.role))) return false;
+        }
+      }
+      for (const key of ["symbol", "interval", "timezone", "currency", "format", "chartStyle", "chartScope"] as const) {
+        if (block[key] !== undefined && typeof block[key] !== "string") return false;
+      }
+      if (!isCitedIds(block.sourceIds, fetchedIds)) return false;
+    }
   }
   // At least one read block anchors the brief to cited evidence, mirroring
   // the extension's exactly-one-read quality bar (one side enforces >= 1).
@@ -285,7 +350,9 @@ export function sanitizeGlobalCacheCanvas(raw: unknown): Canvas | undefined {
   }
   if (typeof canvas.symbol !== "string" || typeof canvas.title !== "string") return undefined;
   if (canvas.title.length < 1 || canvas.title.length > 500) return undefined;
-  if (typeof canvas.content !== "string" || canvas.content.length > 12_000) return undefined;
+  // Publishable briefs carry facts in cited blocks only; free-form content
+  // prose cannot be bound to evidence and never publishes.
+  if (canvas.content !== "") return undefined;
   if (canvas.stage !== "complete") return undefined;
   if (!validInteger(canvas.updatedAt, 1, Number.MAX_SAFE_INTEGER)) return undefined;
   if (!Array.isArray(canvas.evidencePackets) || canvas.evidencePackets.length === 0) return undefined;

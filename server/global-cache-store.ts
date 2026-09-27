@@ -11,10 +11,15 @@
  * - stale leaders cannot publish (every mutation checks token + expiry);
  * - idempotent publication per cache key (same candidate + generation);
  * - newer entries are never overwritten by older ones; equal-timestamp
- *   conflicts resolve deterministically by last writer.
+ *   conflicts resolve deterministically by last writer;
+ * - journal commits are indivisible: the lease check, stale-base detection,
+ *   and file replacement happen synchronously inside one IMMEDIATE
+ *   transaction, so a takeover between verification and replacement cannot
+ *   slip through.
  */
 
 import { mkdir } from "node:fs/promises";
+import { readFileSync, renameSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import {
@@ -312,7 +317,76 @@ export function createGlobalCacheStore(options: GlobalCacheStoreOptions) {
     return getEntry(globalCacheKey(identity));
   }
 
-  return { acquireLease, releaseLease, renewLease, checkLease, putEntry, getEntry, getEntryByIdentity };
+  function readJournalUpdatedAt(livePath: string): number | undefined {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(readFileSync(livePath, "utf8"));
+    } catch (error) {
+      if ((error as { code?: string }).code !== "ENOENT") throw error;
+      return undefined;
+    }
+    const updatedAt = (parsed as { updatedAt?: unknown }).updatedAt;
+    return typeof updatedAt === "number" && Number.isInteger(updatedAt) ? updatedAt : undefined;
+  }
+
+  /**
+   * Atomically commit a temp journal over the live journal under lease.
+   * The lease check, stale-base detection (live updatedAt must still equal
+   * the snapshot taken before polling), and file replacement execute
+   * synchronously inside one IMMEDIATE transaction: no takeover can land
+   * between verification and replacement. A superseded base fails closed
+   * with reason "superseded" instead of clobbering newer state.
+   */
+  async function commitJournal(
+    token: string,
+    tempPath: string,
+    livePath: string,
+    baseUpdatedAt: number | undefined,
+  ): Promise<{ committed: boolean; reason?: "stale-leader" | "superseded" | "nothing-to-commit" }> {
+    if (typeof token !== "string" || token.length === 0) return { committed: false, reason: "stale-leader" };
+    let tempExists = true;
+    try {
+      readFileSync(tempPath);
+    } catch (error) {
+      if ((error as { code?: string }).code === "ENOENT") tempExists = false;
+      else throw error;
+    }
+    if (!tempExists) {
+      return (await checkLease(token))
+        ? { committed: true, reason: "nothing-to-commit" }
+        : { committed: false, reason: "stale-leader" };
+    }
+    return serialized(async () => {
+      const database = await openDatabase(filePath);
+      try {
+        database.exec("BEGIN IMMEDIATE;");
+        try {
+          if (!checkLeader(database, token)) {
+            database.exec("ROLLBACK;");
+            return { committed: false, reason: "stale-leader" as const };
+          }
+          if (readJournalUpdatedAt(livePath) !== baseUpdatedAt) {
+            database.exec("ROLLBACK;");
+            return { committed: false, reason: "superseded" as const };
+          }
+          renameSync(tempPath, livePath);
+          database.exec("COMMIT;");
+          return { committed: true };
+        } catch (error) {
+          try {
+            database.exec("ROLLBACK;");
+          } catch {
+            // Ignore rollback failures.
+          }
+          throw error;
+        }
+      } finally {
+        database.close();
+      }
+    });
+  }
+
+  return { acquireLease, releaseLease, renewLease, checkLease, putEntry, getEntry, getEntryByIdentity, commitJournal };
 }
 
 export type GlobalCacheStore = ReturnType<typeof createGlobalCacheStore>;

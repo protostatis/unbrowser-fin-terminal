@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-test("global cache runner and browser default to the same shared database path", () => {
+test("global cache runner and browser default to the same shared database path", async () => {
   const previousMarket = process.env.MARKET_DATA_DIR;
   const previousDir = process.env.GLOBAL_CACHE_DIR;
   try {
@@ -23,6 +23,17 @@ test("global cache runner and browser default to the same shared database path",
     process.env.GLOBAL_CACHE_DIR = "/custom/cache";
     const override = readGlobalCacheRunnerConfig();
     assert.equal(override.stateDir, "/custom/cache");
+    const { resolveGlobalCacheFilePath } = await import("../server/browser-terminal.js");
+    assert.equal(
+      resolveGlobalCacheFilePath(process.env),
+      path.join("/custom/cache", "global-research-cache.sqlite"),
+    );
+    delete process.env.GLOBAL_CACHE_DIR;
+    process.env.MARKET_DATA_DIR = "/srv/market";
+    assert.equal(
+      resolveGlobalCacheFilePath(process.env),
+      path.join("/srv/market", "global-cache", "global-research-cache.sqlite"),
+    );
   } finally {
     if (previousMarket === undefined) delete process.env.MARKET_DATA_DIR;
     else process.env.MARKET_DATA_DIR = previousMarket;
@@ -126,6 +137,41 @@ test("global cache runner discards a fenced-out poll without touching the live j
     assert.deepEqual(outcome, { ran: false, reason: "lease-lost" });
     // The stale temp copy was discarded; no live journal was created.
     await assert.rejects(readFile(path.join(stateDir, "market-event-scout.json"), "utf8"), /ENOENT/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("global cache runner refuses to clobber a journal committed mid-poll", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "global-cache-superseded-"));
+  try {
+    const stateDir = path.join(root, "state");
+    await mkdir(stateDir, { recursive: true });
+    const liveJournal = path.join(stateDir, "market-event-scout.json");
+    await writeFile(liveJournal, JSON.stringify({ updatedAt: 100, marker: "seed" }), "utf8");
+    const runner = createGlobalCacheRunner({
+      storeFilePath: path.join(root, "cache.sqlite"),
+      owner: "runner-a",
+      stateDir,
+      mcpUrl: "https://mcp.test/mcp",
+      fetchImpl: (async () => {
+        throw new Error("must not poll upstream in this test");
+      }) as typeof fetch,
+      createScout: (_client, statePath) => ({
+        run: async () => {
+          // A newer committer lands while this poll is in flight; the stale
+          // base must fail closed instead of overwriting it.
+          await writeFile(liveJournal, JSON.stringify({ updatedAt: 200, marker: "newer" }), "utf8");
+          await writeFile(statePath, JSON.stringify({ updatedAt: 101, marker: "stale" }), "utf8");
+          return fakeResult();
+        },
+      }),
+    });
+    const outcome = await runner.runOnce();
+    assert.deepEqual(outcome, { ran: false, reason: "superseded" });
+    const live = JSON.parse(await readFile(liveJournal, "utf8")) as { updatedAt: number; marker: string };
+    assert.equal(live.updatedAt, 200);
+    assert.equal(live.marker, "newer");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
