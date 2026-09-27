@@ -1,0 +1,102 @@
+name: Publish global cache runner image
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Immutable release tag, for example global-cache-v1"
+        required: true
+        type: string
+  push:
+    tags:
+      - "global-cache-v*"
+
+permissions:
+  contents: read
+  checks: read
+  packages: write
+
+concurrency:
+  # Tag-triggered and manually dispatched releases must serialize together;
+  # checking GHCR for an existing tag is otherwise subject to a TOCTOU race.
+  group: global-cache-runner-image-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # The production canary host is arm64. Build natively so the
+    # released image cannot accidentally contain an amd64-only runtime.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - name: Checkout release revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Resolve and validate image tag
+        id: release
+        env:
+          INPUT_IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          set -eu
+          image_tag="${INPUT_IMAGE_TAG:-${GITHUB_REF_NAME}}"
+          if [[ ! "$image_tag" =~ ^[a-z0-9][a-z0-9._-]{0,127}$ ]]; then
+            echo "::error::image tag is not a safe immutable release tag"
+            exit 1
+          fi
+          echo "image_tag=$image_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Require successful CI for this source revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          if [[ "$GITHUB_REF_TYPE" != "tag" && "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::global cache runner images may only be published from a release tag or main"
+            exit 1
+          fi
+          ci_count="$(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?per_page=100" \
+            --jq '[.check_runs[] | select(.name == "test-and-build" and .head_sha == env.GITHUB_SHA and .conclusion == "success")] | length' \
+            | awk '{ total += $1 } END { print total + 0 }')"
+          if [[ "$ci_count" -lt 1 ]]; then
+            echo "::error::successful test-and-build CI was not found for $GITHUB_SHA"
+            exit 1
+          fi
+
+      - name: Log in to GHCR
+        env:
+          CR_PAT: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$CR_PAT" | docker login ghcr.io \
+            --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Build and publish digest-addressable image
+        env:
+          IMAGE_TAG: ${{ steps.release.outputs.image_tag }}
+        run: |
+          set -eu
+          image="ghcr.io/protostatis/unbrowser-fin-terminal-global-cache:${IMAGE_TAG}"
+          if docker buildx imagetools inspect "$image" >/dev/null 2>&1; then
+            echo "::error::release tag already exists in GHCR; refusing to overwrite an immutable artifact"
+            exit 1
+          fi
+          docker buildx build \
+           --platform linux/arm64 \
+            --file Dockerfile.global-cache-runner \
+            --build-arg VCS_REF="$GITHUB_SHA" \
+            --tag "$image" \
+            --push \
+            .
+          digest="$(docker buildx imagetools inspect "$image" --format '{{.Manifest.Digest}}')"
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::published image did not return a manifest digest"
+            exit 1
+          fi
+          {
+            echo "### Global cache runner image"
+            echo "- Source revision: \`${GITHUB_SHA}\`"
+            echo "- Image: \`${image}@${digest}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

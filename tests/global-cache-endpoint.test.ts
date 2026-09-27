@@ -33,6 +33,10 @@ function fixtureEntry() {
       content: "",
       stage: "complete" as const,
       updatedAt: generatedAt,
+      chartScope: "day" as const,
+      researchKey: "v1/ticker/brief",
+      intent: "brief" as const,
+      contextLabel: "AAPL BRIEF",
       blocks: [
         {
           kind: "bullets" as const,

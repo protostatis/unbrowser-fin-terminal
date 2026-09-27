@@ -171,19 +171,103 @@ const ALLOWED_PACKET_KEYS = new Set([
   "truncated",
 ]);
 
-function collectSourceIds(value: unknown, into: string[]): void {
-  if (!value || typeof value !== "object") return;
-  if (Array.isArray(value)) {
-    for (const item of value) collectSourceIds(item, into);
-    return;
+const ALLOWED_BLOCK_KEYS: Record<string, Set<string>> = {
+  text: new Set(["id", "kind", "title", "text", "sourceIds", "dossierHint"]),
+  metrics: new Set(["id", "kind", "title", "items", "sourceIds", "dossierHint"]),
+  table: new Set(["id", "kind", "title", "columns", "rows", "totalRows", "sourceIds", "dossierHint"]),
+  news: new Set(["id", "kind", "title", "items", "sourceIds", "dossierHint"]),
+  bullets: new Set(["id", "kind", "title", "items", "sourceIds", "dossierHint"]),
+  sources: new Set(["id", "kind", "title", "items", "sourceIds", "dossierHint"]),
+  chart: new Set([
+    "id", "kind", "title", "symbol", "points", "pointTimes", "pointSessions", "reference",
+    "interval", "timezone", "currency", "asOf", "format", "minValue", "maxValue", "height",
+    "chartStyle", "chartScope", "annotations", "sourceIds", "dossierHint",
+  ]),
+};
+
+// Length caps mirror the extension's canvas block schema so oversized or
+// smuggled payloads fail closed instead of reaching another account.
+const FIELD_LENGTH_CAPS: Record<string, number> = {
+  text: 4_000,
+  headline: 500,
+  note: 4_000,
+  label: 160,
+  value: 160,
+};
+
+function urlHost(value: string): string | undefined {
+  try {
+    return new URL(value).hostname.toLowerCase();
+  } catch {
+    return undefined;
   }
-  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-    if (key === "sourceIds" && Array.isArray(entry)) {
-      for (const id of entry) if (typeof id === "string") into.push(id);
-    } else {
-      collectSourceIds(entry, into);
+}
+
+/**
+ * Deep block audit against fetched public evidence. Every block kind is
+ * key-allowlisted; every URL must be sanitized-public https on a fetched
+ * evidence domain; every sourceIds list must be non-empty and fully
+ * fetched; bounded text fields cannot smuggle oversized payloads.
+ */
+function auditBlocks(blocks: unknown, fetchedIds: Set<string>, fetchedHosts: Set<string>): boolean {
+  if (!Array.isArray(blocks)) return false;
+  let readBlocks = 0;
+  const auditValue = (value: unknown): boolean => {
+    if (typeof value === "string") return true;
+    if (typeof value !== "object" || value === null) return true;
+    if (Array.isArray(value)) return value.every(auditValue);
+    const record = value as Record<string, unknown>;
+    for (const [key, entry] of Object.entries(record)) {
+      if (key === "url") {
+        if (typeof entry !== "string" || sanitizePublicUrl(entry) !== entry || !entry.startsWith("https://")) return false;
+        const host = urlHost(entry);
+        if (!host || !fetchedHosts.has(host)) return false;
+      } else if (key === "sourceIds") {
+        if (!Array.isArray(entry) || entry.length === 0) return false;
+        for (const id of entry) {
+          if (typeof id !== "string" || !fetchedIds.has(id)) return false;
+        }
+      } else if (key in FIELD_LENGTH_CAPS) {
+        if (typeof entry !== "string" || entry.length > FIELD_LENGTH_CAPS[key]!) return false;
+      }
+      if (!auditValue(entry)) return false;
     }
+    return true;
+  };
+  const collectInto = (value: unknown, into: string[]): void => {
+    if (!value || typeof value !== "object") return;
+    if (Array.isArray(value)) {
+      for (const item of value) collectInto(item, into);
+      return;
+    }
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+      if (key === "sourceIds" && Array.isArray(entry)) {
+        for (const id of entry) if (typeof id === "string") into.push(id);
+      } else {
+        collectInto(entry, into);
+      }
+    }
+  };
+  for (const rawBlock of blocks) {
+    if (!rawBlock || typeof rawBlock !== "object" || Array.isArray(rawBlock)) return false;
+    const block = rawBlock as Record<string, unknown>;
+    if (typeof block.kind !== "string") return false;
+    const allowed = ALLOWED_BLOCK_KEYS[block.kind];
+    if (!allowed) return false;
+    for (const key of Object.keys(block)) {
+      if (!allowed.has(key)) return false;
+    }
+    if (block.dossierHint === "read") readBlocks += 1;
+    // Every block is a claim vehicle: uncited blocks never publish, so one
+    // valid citation elsewhere cannot launder uncited claims.
+    const cited: string[] = [];
+    collectInto(block, cited);
+    if (cited.length === 0) return false;
+    if (!auditValue(block)) return false;
   }
+  // At least one read block anchors the brief to cited evidence, mirroring
+  // the extension's exactly-one-read quality bar (one side enforces >= 1).
+  return readBlocks >= 1;
 }
 
 /**
@@ -217,19 +301,18 @@ export function sanitizeGlobalCacheCanvas(raw: unknown): Canvas | undefined {
     packets.push(packet);
   }
   const fetchedIds = new Set(packets.map((packet) => packet.sourceId));
-  // Every claim-level citation must resolve to fetched public evidence.
-  const cited: string[] = [];
-  if (canvas.blocks !== undefined) {
-    if (!Array.isArray(canvas.blocks)) return undefined;
-    collectSourceIds(canvas.blocks, cited);
-  }
-  if (cited.length === 0) return undefined;
-  if (!cited.every((id) => fetchedIds.has(id))) return undefined;
+  const fetchedHosts = new Set(
+    packets.map((packet) => urlHost(packet.sourceUrl)).filter((host): host is string => Boolean(host)),
+  );
+  // Blocks are mandatory and fully audited: allowlisted keys, public URLs
+  // bound to fetched evidence domains, cited sourceIds, and at least one
+  // read block. Uncited prose never publishes.
+  if (canvas.blocks === undefined || !auditBlocks(canvas.blocks, fetchedIds, fetchedHosts)) return undefined;
   return {
     symbol: canvas.symbol as string,
     title: canvas.title as string,
     content: canvas.content as string,
-    ...(Array.isArray(canvas.blocks) ? { blocks: canvas.blocks as Canvas["blocks"] } : {}),
+    blocks: canvas.blocks as Canvas["blocks"],
     updatedAt: canvas.updatedAt as number,
     stage: "complete",
     ...(typeof canvas.chartScope === "string" ? { chartScope: canvas.chartScope as Canvas["chartScope"] } : {}),
@@ -259,9 +342,20 @@ export function validateGlobalCacheEntry(value: unknown): value is GlobalCacheEn
   if (!validateProvenance(raw.provenance)) return false;
   if (raw.promptContract !== GLOBAL_CACHE_PROMPT_CONTRACT) return false;
   if (raw.policyVersion !== GLOBAL_CACHE_POLICY_VERSION) return false;
+  // The stored canvas must agree with the entry identity: a mismatched
+  // symbol/scope/key/intent is a miss, never a cross-identity hit.
+  const canvas = raw.canvas as Record<string, unknown>;
+  if (canvas.symbol !== identity.symbol) return false;
+  if (canvas.chartScope !== identity.chartScope) return false;
+  if (canvas.researchKey !== identity.researchKey) return false;
+  if (canvas.intent !== identity.intent) return false;
   if (!validInteger(raw.asOf, 1, Number.MAX_SAFE_INTEGER)) return false;
   if (!validInteger(raw.generatedAt, 1, Number.MAX_SAFE_INTEGER)) return false;
   if (!validInteger(raw.expiresAt, (raw.generatedAt as number) + 1, Number.MAX_SAFE_INTEGER)) return false;
+  // Storage-level TTL ceiling: no entry may outlive the longest versioned
+  // policy window (macro/story 4h). The builder derives tighter per-kind
+  // expiries; this bound keeps hand-built writes inside the policy.
+  if ((raw.expiresAt as number) - (raw.generatedAt as number) > 4 * 60 * 60_000) return false;
   return true;
 }
 

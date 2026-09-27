@@ -25,6 +25,10 @@ function canvas(symbol = "AAPL") {
     content: "",
     stage: "complete" as const,
     updatedAt: 1_700_000_000_000,
+    chartScope: "day" as const,
+    researchKey: "v1/ticker/brief",
+    intent: "brief" as const,
+    contextLabel: "AAPL BRIEF",
     blocks: [
       {
         kind: "bullets" as const,
@@ -149,8 +153,12 @@ test("global cache canvas projection drops internal fields and requires cited ev
   assert.ok(publishable);
   assert.deepEqual(Object.keys(publishable).sort(), [
     "blocks",
+    "chartScope",
     "content",
+    "contextLabel",
     "evidencePackets",
+    "intent",
+    "researchKey",
     "stage",
     "symbol",
     "title",
@@ -169,6 +177,59 @@ test("global cache canvas projection drops internal fields and requires cited ev
     sanitizeGlobalCacheCanvas({
       ...canvas(),
       blocks: [{ kind: "bullets" as const, items: [{ text: "bad cite", sourceIds: ["S9"] }] }],
+    }),
+    undefined,
+  );
+  // Hostile nested fields and off-evidence URLs never publish.
+  assert.equal(
+    sanitizeGlobalCacheCanvas({
+      ...canvas(),
+      blocks: [
+        {
+          kind: "news" as const,
+          title: "News",
+          dossierHint: "read" as const,
+          items: [{ headline: "trap", sourceIds: ["S1"], url: "https://evil.example/phish", note: "x" }],
+        },
+      ],
+    }),
+    undefined,
+  );
+  assert.equal(
+    sanitizeGlobalCacheCanvas({
+      ...canvas(),
+      blocks: [
+        {
+          kind: "bullets" as const,
+          title: "Read",
+          dossierHint: "read" as const,
+          items: [{ text: "ok", sourceIds: ["S1"] }],
+          backdoor: "drop table",
+        } as unknown as Record<string, unknown>,
+      ],
+    }),
+    undefined,
+  );
+  // No read block means no publish, even with fetched evidence present.
+  assert.equal(
+    sanitizeGlobalCacheCanvas({
+      ...canvas(),
+      blocks: [{ kind: "metrics" as const, title: "Metrics", items: [] }],
+    }),
+    undefined,
+  );
+  // Free-form text blocks must cite fetched evidence too.
+  assert.equal(
+    sanitizeGlobalCacheCanvas({
+      ...canvas(),
+      blocks: [
+        {
+          kind: "text" as const,
+          title: "Read",
+          dossierHint: "read" as const,
+          text: "uncited prose claim",
+        },
+      ],
     }),
     undefined,
   );
@@ -211,6 +272,23 @@ test("global cache builder pins versions and caps expiry by trigger validity", (
         candidateExpiresAt: generatedAt + 60_000,
       }),
     /not usable/,
+  );
+});
+
+test("global cache entry rejects canvas identity mismatch and over-long TTL", () => {
+  const valid = entry();
+  assert.equal(validateGlobalCacheEntry(valid), true);
+  assert.equal(
+    validateGlobalCacheEntry({ ...valid, canvas: { ...valid.canvas, symbol: "MSFT" } }),
+    false,
+  );
+  assert.equal(
+    validateGlobalCacheEntry({
+      ...valid,
+      generatedAt: valid.generatedAt,
+      expiresAt: valid.generatedAt + 5 * 60 * 60_000,
+    }),
+    false,
   );
 });
 

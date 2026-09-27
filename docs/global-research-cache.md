@@ -9,15 +9,17 @@ private and are never merged into global state.
 
 - **Global scout journal** (`<GLOBAL_CACHE_DIR>/market-event-scout.json`):
   feed baselines, observations, decisions, dry-run candidates. Only the
-  lease holder polls, with heartbeat renewal and a post-run fencing check
-  that discards results when the lease was lost mid-poll. Journal merges
-  are deterministic (stable candidate IDs dedupe); cache publication itself
-  stays transactionally fenced on the lease token, so a stale leader can
-  never publish.
+  lease holder polls, with heartbeat renewal while polling. Each poll runs
+  against an isolated temp copy and commits it over the live journal by
+  atomic rename only when the lease is still held; a fenced-out leader
+  discards its temp copy, so it can neither publish nor replace a newer
+  journal with a stale snapshot. Cache publication itself stays
+  transactionally fenced on the lease token.
 - **Global research cache** (`<GLOBAL_CACHE_DIR>/global-research-cache.sqlite`):
   published entries keyed by exact canonical identity
-  (`symbol + chartScope + researchKey + intent` + prompt/policy version).
-  Only the background runner writes.
+  (`symbol + chartScope + researchKey + intent`); prompt/policy versions are
+  pinned by equality and the TTL ceiling at validation. Only the background
+  runner writes.
 - **Account archives** (`/data/browser-sessions/<principal>/...`): private per
   account. Global entries are read-only to browsers and never written back.
 
@@ -25,9 +27,14 @@ private and are never merged into global state.
 
 - Runtime-neutral contract (`shared/global-research-cache.ts`): canonical
   brief identities only, versioned prompt/policy, TTL capped by trigger
-  validity (ticker 2h, macro/story 4h), public-https evidence gate,
-  publishable canvas projection, `buildGlobalCacheEntry` constructor that
-  future publication code must use, expiry-aware reads.
+  validity (ticker 2h, macro/story 4h, 4h storage ceiling), publishable
+  canvas projection (allowlisted block/packet keys, URLs bound to fetched
+  evidence domains, every block cited, at least one read block, canvas
+  identity bound to entry identity), and the `buildGlobalCacheEntry`
+  constructor that future publication code must use. The sanitizer rejects
+  rather than strips: the publisher must deliberately construct a
+  publishable canvas (no research IDs, blocker notes, uncited prose, or
+  off-evidence URLs) or the entry misses instead of publishing.
 - Fenced SQLite store (`server/global-cache-store.ts`): single-writer lease
   with renewal/observation, fencing tokens, idempotent publication, no
   stale overwrites, deterministic last-writer-wins on equal-timestamp
@@ -41,9 +48,13 @@ private and are never merged into global state.
   citation linked, no research IDs / blocker notes / failure details) and
   carry no trigger/job IDs, usage, or account data. The `globalCache`
   session feature advertises the endpoint's presence, not a warm cache.
-- Shadow runner (`server/global-cache-runner*.ts`, `Dockerfile.global-cache-runner`):
-  lease-guarded `MarketEventScout` polling with model dispatch off. No
-  ingress, no browser session, no Pi imports in `server/browser-terminal.ts`.
+- Shadow runner (`server/global-cache-runner*.ts`, `Dockerfile.global-cache-runner`,
+  `.github/workflows/publish-global-cache-runner.yml`):
+  lease-guarded `MarketEventScout` polling with model dispatch off, heartbeat
+  renewal, and temp-copy journal commits. No ingress, no browser session, no
+  Pi imports in `server/browser-terminal.ts`. Renewal failures are silent by
+  design (the post-run fencing check is authoritative); a lost lease stops
+  the poll's effects but not the scout's in-temp work, which is discarded.
 
 ## Explicitly deferred
 
@@ -72,11 +83,26 @@ private and are never merged into global state.
 | Env | Default | Notes |
 |---|---|---|
 | `GLOBAL_CACHE_RUNNER_ENABLED` | `0` | `1` enables the private runner. |
-| `GLOBAL_CACHE_DIR` | `/data/global-cache` | Must be absolute; exclusive single-writer volume. |
+| `GLOBAL_CACHE_DIR` | `<MARKET_DATA_DIR>/global-cache` | Must be absolute; exclusive single-writer volume shared with the browser service. |
 | `GLOBAL_CACHE_RUNNER_OWNER` | `global-cache-runner` | Lease owner identity. |
 | `GLOBAL_CACHE_RUNNER_INTERVAL_MS` | `60000` | Poll cadence, 30s–10min. |
 | `UNBROWSER_MCP_URL` | required when enabled | Private MCP endpoint for feed reads. |
 
 Kill switches: unset `GLOBAL_CACHE_RUNNER_ENABLED` (runner exits 0);
-endpoint misses are fail-closed to live research. There is intentionally no
-flag that lets browsers write global state.
+endpoint misses are fail-closed to live research. A missing/unopenable store
+surfaces as 500 (not a silent miss); the deferred consumer must treat
+transport errors as misses and fall back to live research. There is
+intentionally no flag that lets browsers write global state.
+
+## Deploy prep (infra follow-up)
+
+1. Merge this PR; publish both images from the merged revision:
+   `browser-terminal-v*` via `publish-browser-terminal.yml`,
+   `global-cache-v*` via `publish-global-cache-runner.yml`.
+2. In `unchained-infra`, add a `fin-terminal-global-cache` service from the
+   runner image digest with `GLOBAL_CACHE_RUNNER_ENABLED=0`, sharing one
+   volume mounted at the browser's `<MARKET_DATA_DIR>/global-cache` path.
+3. Commission with dispatch off: all seven feeds attempted, >=4 successes
+   across >=3 hosts, persisted scheduler advancement, zero model calls.
+4. Only then consider the dispatch/publication follow-up; do not enable the
+   runner in production before the shared volume and MCP wiring are verified.
