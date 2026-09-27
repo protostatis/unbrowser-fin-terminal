@@ -41,6 +41,8 @@ import {
   providerBudgetConfigFromEnv,
   type ProviderBudgetConfig,
 } from "./provider-budget.js";
+import { createGlobalCacheStore } from "./global-cache-store.js";
+import { sanitizeGlobalCacheCanvas, validateGlobalCacheIdentity } from "../shared/global-research-cache.js";
 
 const USER_HEADER = "x-fin-terminal-user";
 const PROXY_TOKEN_HEADER = "x-fin-terminal-proxy-token";
@@ -113,6 +115,20 @@ const BROKER_LANE_LIMITS: Record<BrokerLane, { rateLimit: number; globalRateLimi
 type FetchImpl = typeof fetch;
 type JsonRecord = Record<string, unknown>;
 
+/**
+ * Default shared database path, mirroring the private runner's
+ * GLOBAL_CACHE_DIR resolution so both processes open the same SQLite file
+ * without extra configuration.
+ */
+export function resolveGlobalCacheFilePath(env: NodeJS.ProcessEnv = process.env): string {
+  const override = env.GLOBAL_CACHE_DIR?.trim();
+  if (override) {
+    if (!path.isAbsolute(override)) throw new Error("GLOBAL_CACHE_DIR must be an absolute path");
+    return path.join(override, "global-research-cache.sqlite");
+  }
+  return path.resolve(env.MARKET_DATA_DIR?.trim() || "/data", "global-cache", "global-research-cache.sqlite");
+}
+
 export interface BrowserTerminalAppOptions {
   fetchImpl?: FetchImpl;
   openRouterApiKey?: string;
@@ -126,6 +142,8 @@ export interface BrowserTerminalAppOptions {
   watchlistImportModel?: string;
   watchlistImportUrl?: string;
   providerBudget?: Partial<ProviderBudgetConfig>;
+  /** Override for tests; defaults alongside storageRoot under MARKET_DATA_DIR. */
+  globalCacheFilePath?: string;
 }
 
 type PrincipalRequestState = {
@@ -386,6 +404,11 @@ export function createBrowserTerminalApp(options: BrowserTerminalAppOptions = {}
   const watchlistImportUrl = options.watchlistImportUrl?.trim() || process.env.WATCHLIST_IMPORT_URL?.trim() || "";
   const mcpEndpoint = options.mcpEndpoint ?? process.env.UNBROWSER_MCP_URL?.trim();
   const storageRoot = options.storageRoot ?? path.resolve(process.env.MARKET_DATA_DIR?.trim() || "/data", "browser-sessions");
+  // Shared with the private runner: GLOBAL_CACHE_DIR wins when set,
+  // otherwise <MARKET_DATA_DIR>/global-cache. Deploy both against the same
+  // volume path or set an explicit globalCacheFilePath.
+  const globalCacheFilePath = options.globalCacheFilePath ?? resolveGlobalCacheFilePath(process.env);
+  const globalCache = createGlobalCacheStore({ filePath: globalCacheFilePath, now: options.now ?? Date.now });
   const webDist = options.webDist ?? path.resolve(process.env.MARKET_ROOT?.trim() || process.cwd(), "dist-web");
   const now = options.now ?? Date.now;
   const brokerRequestState = new Map<string, PrincipalRequestState>();
@@ -644,8 +667,69 @@ export function createBrowserTerminalApp(options: BrowserTerminalAppOptions = {}
     res.json({
       version: 1,
       model: openRouterModel,
-      features: { broker: true, mcp: Boolean(mcpEndpoint), quotes: true, cryptoPulse: true, persistence: true },
+      features: { broker: true, mcp: Boolean(mcpEndpoint), quotes: true, cryptoPulse: true, persistence: true, globalCache: true },
     });
+  });
+
+  // Read-only shared research cache. Exact canonical identity only; stale,
+  // corrupt, incompatible, or missing entries are 404s so the caller falls
+  // back to normal live research. No journal, job, usage, or account data.
+  app.get("/api/browser/v1/global-cache", async (req, res) => {
+    const release = acquireBrokerRequest(getPrincipal(req), "control");
+    if (!release) {
+      respondBusy(res);
+      return;
+    }
+    try {
+      const identity = {
+        symbol: String(req.query.symbol ?? ""),
+        chartScope: String(req.query.scope ?? req.query.chartScope ?? ""),
+        researchKey: String(req.query.researchKey ?? ""),
+        intent: String(req.query.intent ?? ""),
+      };
+      if (!validateGlobalCacheIdentity(identity)) {
+        res.status(400).json({ error: "Invalid global cache identity" });
+        return;
+      }
+      const entry = await globalCache.getEntryByIdentity(identity);
+      if (!entry) {
+        res.status(404).end();
+        return;
+      }
+      // Defense in depth: stored entries are already validated, but the
+      // response still crosses the publishable projection so a future
+      // writer bug cannot leak internal canvas fields to another account.
+      const canvas = sanitizeGlobalCacheCanvas(entry.canvas);
+      if (!canvas) {
+        res.status(404).end();
+        return;
+      }
+      res.json({
+        version: 1,
+        provenance: "global",
+        cacheKey: entry.cacheKey,
+        identity: entry.identity,
+        kind: entry.kind,
+        canvas,
+        quality: {
+          usable: entry.quality.usable,
+          fetchedCount: entry.quality.fetchedCount,
+          qualityVersion: entry.quality.qualityVersion,
+        },
+        asOf: entry.asOf,
+        generatedAt: entry.generatedAt,
+        expiresAt: entry.expiresAt,
+        source: {
+          title: entry.provenance.title,
+          ...(entry.provenance.sourceUrl ? { url: entry.provenance.sourceUrl } : {}),
+          ...(entry.provenance.publishedAt !== undefined ? { publishedAt: entry.provenance.publishedAt } : {}),
+        },
+      });
+    } catch {
+      safeUpstreamFailure(res, 500);
+    } finally {
+      release();
+    }
   });
 
   // Screenshot import is an authenticated browser-terminal capability. Keep
