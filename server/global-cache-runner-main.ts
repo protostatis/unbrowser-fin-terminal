@@ -56,9 +56,11 @@ async function main(): Promise<void> {
     } catch (error) {
       console.warn("[global-cache-runner] poll failed:", error instanceof Error ? error.message : String(error));
     }
+    // The cadence timer stays referenced: it is the only event-loop handle
+    // between polls, and an unref'd timer would let the runner exit after
+    // its first poll instead of shadowing continuously.
     await new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, cadence);
-      timer.unref?.();
+      setTimeout(resolve, cadence);
     });
   }
 }

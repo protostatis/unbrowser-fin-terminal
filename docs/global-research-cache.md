@@ -8,8 +8,12 @@ private and are never merged into global state.
 ## State ownership
 
 - **Global scout journal** (`<GLOBAL_CACHE_DIR>/market-event-scout.json`):
-  feed baselines, observations, decisions, dry-run candidates. Exactly one
-  writer holds the SQLite lease at a time.
+  feed baselines, observations, decisions, dry-run candidates. Only the
+  lease holder polls, with heartbeat renewal and a post-run fencing check
+  that discards results when the lease was lost mid-poll. Journal merges
+  are deterministic (stable candidate IDs dedupe); cache publication itself
+  stays transactionally fenced on the lease token, so a stale leader can
+  never publish.
 - **Global research cache** (`<GLOBAL_CACHE_DIR>/global-research-cache.sqlite`):
   published entries keyed by exact canonical identity
   (`symbol + chartScope + researchKey + intent` + prompt/policy version).
@@ -22,13 +26,21 @@ private and are never merged into global state.
 - Runtime-neutral contract (`shared/global-research-cache.ts`): canonical
   brief identities only, versioned prompt/policy, TTL capped by trigger
   validity (ticker 2h, macro/story 4h), public-https evidence gate,
-  expiry-aware reads.
-- Fenced SQLite store (`server/global-cache-store.ts`): single-writer lease,
-  fencing tokens, idempotent publication, no stale overwrites.
+  publishable canvas projection, `buildGlobalCacheEntry` constructor that
+  future publication code must use, expiry-aware reads.
+- Fenced SQLite store (`server/global-cache-store.ts`): single-writer lease
+  with renewal/observation, fencing tokens, idempotent publication, no
+  stale overwrites, deterministic last-writer-wins on equal-timestamp
+  conflicts. Browser and runner default to the same database
+  (`<MARKET_DATA_DIR>/global-cache/global-research-cache.sqlite`); deploy
+  both against the same volume path or set explicit paths.
 - Read-only endpoint (`GET /api/browser/v1/global-cache`): authenticated
   exact-identity lookup. Misses (stale, corrupt, incompatible, absent) are
-  404s so callers fall back to live research. Responses carry no trigger/job
-  IDs, usage, or account data.
+  404s so callers fall back to live research. Responses cross the
+  publishable canvas projection (fetched public evidence only, every
+  citation linked, no research IDs / blocker notes / failure details) and
+  carry no trigger/job IDs, usage, or account data. The `globalCache`
+  session feature advertises the endpoint's presence, not a warm cache.
 - Shadow runner (`server/global-cache-runner*.ts`, `Dockerfile.global-cache-runner`):
   lease-guarded `MarketEventScout` polling with model dispatch off. No
   ingress, no browser session, no Pi imports in `server/browser-terminal.ts`.

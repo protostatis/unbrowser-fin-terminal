@@ -6,10 +6,12 @@
  * exact-identity endpoint.
  *
  * Guarantees:
- * - single active writer via lease row with fencing token + expiry;
+ * - single active writer via lease row with fencing token + expiry
+ *   (renewable via renewLease; observable via checkLease);
  * - stale leaders cannot publish (every mutation checks token + expiry);
  * - idempotent publication per cache key (same candidate + generation);
- * - newer entries are never overwritten by older ones.
+ * - newer entries are never overwritten by older ones; equal-timestamp
+ *   conflicts resolve deterministically by last writer.
  */
 
 import { mkdir } from "node:fs/promises";
@@ -186,6 +188,49 @@ export function createGlobalCacheStore(options: GlobalCacheStoreOptions) {
     return true;
   }
 
+  /** Renew our own lease without stealing another owner's live lease. */
+  async function renewLease(owner: string, token: string): Promise<{ renewed: boolean; lease?: GlobalLease }> {
+    if (!validOwner(owner) || typeof token !== "string" || token.length === 0) return { renewed: false };
+    return serialized(async () => {
+      const database = await openDatabase(filePath);
+      try {
+        database.exec("BEGIN IMMEDIATE;");
+        try {
+          const current = readLeaseRow(database);
+          if (!current || current.owner !== owner || current.token !== token) {
+            database.exec("ROLLBACK;");
+            return { renewed: false };
+          }
+          const lease: GlobalLease = { owner, token, expiresAt: now() + leaseTtlMs };
+          database.prepare("UPDATE global_cache_lease SET expires_at = ? WHERE id = 1;").run(lease.expiresAt);
+          database.exec("COMMIT;");
+          return { renewed: true, lease };
+        } catch (error) {
+          try {
+            database.exec("ROLLBACK;");
+          } catch {
+            // Ignore rollback failures.
+          }
+          throw error;
+        }
+      } finally {
+        database.close();
+      }
+    });
+  }
+
+  /** Non-mutating fencing check for long operations (polling) to abort when fenced out. */
+  async function checkLease(token: string): Promise<boolean> {
+    const database = await openDatabase(filePath);
+    try {
+      const current = readLeaseRow(database);
+      if (!current || current.token !== token) return false;
+      return current.expiresAt > now();
+    } finally {
+      database.close();
+    }
+  }
+
   async function putEntry(token: string, entry: GlobalCacheEntry): Promise<{ ok: boolean; reason?: string; deduplicated?: boolean }> {
     if (typeof token !== "string" || token.length === 0) return { ok: false, reason: "missing-lease-token" };
     if (!validateGlobalCacheEntry(entry)) return { ok: false, reason: "invalid-entry" };
@@ -267,7 +312,7 @@ export function createGlobalCacheStore(options: GlobalCacheStoreOptions) {
     return getEntry(globalCacheKey(identity));
   }
 
-  return { acquireLease, releaseLease, putEntry, getEntry, getEntryByIdentity };
+  return { acquireLease, releaseLease, renewLease, checkLease, putEntry, getEntry, getEntryByIdentity };
 }
 
 export type GlobalCacheStore = ReturnType<typeof createGlobalCacheStore>;

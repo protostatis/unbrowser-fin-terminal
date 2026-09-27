@@ -40,6 +40,8 @@ export interface GlobalCacheRunnerOptions {
   mcpUrl?: string;
   fetchImpl?: typeof fetch;
   now?: () => number;
+  /** Lease TTL ms for the poll cycle; renewed by heartbeat while polling. */
+  leaseTtlMs?: number;
 }
 
 export function createGlobalCacheRunner(options: GlobalCacheRunnerOptions = {}) {
@@ -47,16 +49,26 @@ export function createGlobalCacheRunner(options: GlobalCacheRunnerOptions = {}) 
   const owner = options.owner ?? "global-cache-runner";
   const stateDir = options.stateDir ?? "/data/global-cache";
   const storeFilePath = options.storeFilePath ?? path.join(stateDir, "global-research-cache.sqlite");
-  const store = createGlobalCacheStore({ filePath: storeFilePath, now });
+  const leaseTtlMs = options.leaseTtlMs ?? 60_000;
+  const store = createGlobalCacheStore({ filePath: storeFilePath, now, leaseTtlMs });
   const mcpUrl = options.mcpUrl ?? process.env.UNBROWSER_MCP_URL?.trim() ?? "";
   const fetchImpl = options.fetchImpl ?? fetch;
 
   async function runOnce(runOptions: { force?: boolean } = {}): Promise<
-    | { ran: false; reason: "lease-held" }
+    | { ran: false; reason: "lease-held" | "lease-lost" }
     | { ran: true; result: MarketEventScoutRunResult }
   > {
     const lease = await store.acquireLease(owner);
     if (!lease.acquired || !lease.lease) return { ran: false, reason: "lease-held" };
+    const token = lease.lease.token;
+    // Heartbeat renewal keeps the 60s lease alive across slow feed polls so
+    // a replacement runner cannot start mid-poll. The journal itself is a
+    // deterministic JSON merge (stable candidate IDs dedupe), while cache
+    // publication stays transactionally fenced on the lease token.
+    const heartbeatEveryMs = Math.max(5_000, Math.floor(leaseTtlMs / 3));
+    const heartbeat = setInterval(() => {
+      void store.renewLease(owner, token).catch(() => {});
+    }, heartbeatEveryMs);
     try {
       if (!mcpUrl) throw new Error("UNBROWSER_MCP_URL is required for the global cache runner");
       const client = new UnbrowserMcpClient(mcpUrl, { fetch: fetchImpl });
@@ -66,9 +78,13 @@ export function createGlobalCacheRunner(options: GlobalCacheRunnerOptions = {}) 
         now,
       });
       const result = await scout.run({ force: runOptions.force });
+      // Post-run fencing: if we lost the lease mid-poll, discard the result
+      // rather than letting a stale leader feed publication later.
+      if (!(await store.checkLease(token))) return { ran: false, reason: "lease-lost" };
       return { ran: true, result };
     } finally {
-      await store.releaseLease(owner, lease.lease.token).catch(() => {});
+      clearInterval(heartbeat);
+      await store.releaseLease(owner, token).catch(() => {});
     }
   }
 

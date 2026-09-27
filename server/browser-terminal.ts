@@ -42,7 +42,7 @@ import {
   type ProviderBudgetConfig,
 } from "./provider-budget.js";
 import { createGlobalCacheStore } from "./global-cache-store.js";
-import { validateGlobalCacheIdentity } from "../shared/global-research-cache.js";
+import { sanitizeGlobalCacheCanvas, validateGlobalCacheIdentity } from "../shared/global-research-cache.js";
 
 const USER_HEADER = "x-fin-terminal-user";
 const PROXY_TOKEN_HEADER = "x-fin-terminal-proxy-token";
@@ -390,8 +390,11 @@ export function createBrowserTerminalApp(options: BrowserTerminalAppOptions = {}
   const watchlistImportUrl = options.watchlistImportUrl?.trim() || process.env.WATCHLIST_IMPORT_URL?.trim() || "";
   const mcpEndpoint = options.mcpEndpoint ?? process.env.UNBROWSER_MCP_URL?.trim();
   const storageRoot = options.storageRoot ?? path.resolve(process.env.MARKET_DATA_DIR?.trim() || "/data", "browser-sessions");
+  // Shared with the private runner's GLOBAL_CACHE_DIR default
+  // (<MARKET_DATA_DIR>/global-cache); deploy both against the same volume
+  // path or set an explicit globalCacheFilePath.
   const globalCacheFilePath = options.globalCacheFilePath
-    ?? path.join(path.dirname(storageRoot), "global-research-cache.sqlite");
+    ?? path.resolve(process.env.MARKET_DATA_DIR?.trim() || "/data", "global-cache", "global-research-cache.sqlite");
   const globalCache = createGlobalCacheStore({ filePath: globalCacheFilePath, now: options.now ?? Date.now });
   const webDist = options.webDist ?? path.resolve(process.env.MARKET_ROOT?.trim() || process.cwd(), "dist-web");
   const now = options.now ?? Date.now;
@@ -680,13 +683,21 @@ export function createBrowserTerminalApp(options: BrowserTerminalAppOptions = {}
         res.status(404).end();
         return;
       }
+      // Defense in depth: stored entries are already validated, but the
+      // response still crosses the publishable projection so a future
+      // writer bug cannot leak internal canvas fields to another account.
+      const canvas = sanitizeGlobalCacheCanvas(entry.canvas);
+      if (!canvas) {
+        res.status(404).end();
+        return;
+      }
       res.json({
         version: 1,
         provenance: "global",
         cacheKey: entry.cacheKey,
         identity: entry.identity,
         kind: entry.kind,
-        canvas: entry.canvas,
+        canvas,
         quality: {
           usable: entry.quality.usable,
           fetchedCount: entry.quality.fetchedCount,

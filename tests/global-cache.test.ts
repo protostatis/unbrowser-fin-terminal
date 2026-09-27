@@ -4,9 +4,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
+  buildGlobalCacheEntry,
   globalCacheKey,
   isGlobalCacheEntryEligible,
   resolveGlobalCacheExpiry,
+  sanitizeGlobalCacheCanvas,
   validateGlobalCacheEntry,
   validateGlobalCacheIdentity,
   type GlobalCacheEntry,
@@ -23,6 +25,14 @@ function canvas(symbol = "AAPL") {
     content: "",
     stage: "complete" as const,
     updatedAt: 1_700_000_000_000,
+    blocks: [
+      {
+        kind: "bullets" as const,
+        title: "Read",
+        dossierHint: "read" as const,
+        items: [{ text: "verified fact", sourceIds: ["S1"] }],
+      },
+    ],
     evidencePackets: [
       {
         sourceId: "S1",
@@ -134,10 +144,100 @@ test("global cache entry rejects non-public or incomplete evidence", () => {
   assert.equal(validateGlobalCacheEntry(wrongKey), false);
 });
 
+test("global cache canvas projection drops internal fields and requires cited evidence", () => {
+  const publishable = sanitizeGlobalCacheCanvas(canvas());
+  assert.ok(publishable);
+  assert.deepEqual(Object.keys(publishable).sort(), [
+    "blocks",
+    "content",
+    "evidencePackets",
+    "stage",
+    "symbol",
+    "title",
+    "updatedAt",
+  ]);
+  assert.equal(sanitizeGlobalCacheCanvas({ ...canvas(), researchId: "job-1" }), undefined);
+  assert.equal(sanitizeGlobalCacheCanvas({ ...canvas(), evidenceBlocker: "blocked" }), undefined);
+  assert.equal(
+    sanitizeGlobalCacheCanvas({
+      ...canvas(),
+      blocks: [{ kind: "bullets" as const, items: [{ text: "uncited claim" }] }],
+    }),
+    undefined,
+  );
+  assert.equal(
+    sanitizeGlobalCacheCanvas({
+      ...canvas(),
+      blocks: [{ kind: "bullets" as const, items: [{ text: "bad cite", sourceIds: ["S9"] }] }],
+    }),
+    undefined,
+  );
+});
+
+test("global cache builder pins versions and caps expiry by trigger validity", () => {
+  const generatedAt = 1_700_000_000_000;
+  const built = buildGlobalCacheEntry({
+    identity: { symbol: "AAPL", chartScope: "day", researchKey: "v1/ticker/brief", intent: "brief" },
+    canvas: canvas(),
+    quality: { usable: true, codes: [], fetchedCount: 1, qualityVersion: 1 },
+    provenance: {
+      candidateId: CANDIDATE,
+      decisionId: DECISION,
+      sourceId: "nasdaq-trade-halts",
+      title: "Trading halt",
+      observedAt: generatedAt,
+    },
+    generatedAt,
+    candidateExpiresAt: generatedAt + 30 * 60_000,
+  });
+  assert.equal(built.expiresAt, generatedAt + 30 * 60_000);
+  assert.equal(built.promptContract, "scout-canonical-brief/v1");
+  assert.equal(built.policyVersion, "quality-public/v1");
+  assert.equal(validateGlobalCacheEntry(built), true);
+  assert.throws(
+    () =>
+      buildGlobalCacheEntry({
+        identity: { symbol: "AAPL", chartScope: "day", researchKey: "v1/ticker/brief", intent: "brief" },
+        canvas: canvas(),
+        quality: { usable: false, codes: ["EVIDENCE_NONE"], fetchedCount: 0, qualityVersion: 1 },
+        provenance: {
+          candidateId: CANDIDATE,
+          decisionId: DECISION,
+          sourceId: "nasdaq-trade-halts",
+          title: "Trading halt",
+          observedAt: generatedAt,
+        },
+        generatedAt,
+        candidateExpiresAt: generatedAt + 60_000,
+      }),
+    /not usable/,
+  );
+});
+
 test("global cache eligibility treats expired entries as misses", () => {
   const valid = entry();
   assert.equal(isGlobalCacheEntryEligible(valid, valid.generatedAt + 1_000), true);
   assert.equal(isGlobalCacheEntryEligible(valid, valid.expiresAt), false);
+});
+
+test("global cache store resolves equal-timestamp conflicts by last writer", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "global-cache-conflict-"));
+  try {
+    const nowValue = 1_700_000_000_000 + 1_000;
+    const store = createGlobalCacheStore({ filePath: path.join(root, "cache.sqlite"), now: () => nowValue });
+    const lease = await store.acquireLease("runner-a");
+    assert.ok(lease.lease);
+    assert.equal((await store.putEntry(lease.lease.token, entry())).ok, true);
+    const rival = entry({
+      provenance: { ...entry().provenance, candidateId: `trg-${"d".repeat(32)}` },
+    });
+    // Same generation, different candidate: deterministic last-writer-wins.
+    assert.equal((await store.putEntry(lease.lease.token, rival)).ok, true);
+    const current = await store.getEntry(entry().cacheKey);
+    assert.equal(current?.provenance.candidateId, `trg-${"d".repeat(32)}`);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("global cache store enforces single-writer lease and fencing", async () => {
@@ -168,6 +268,29 @@ test("global cache store enforces single-writer lease and fencing", async () => 
     assert.equal(staleWrite.reason, "stale-leader");
     const released = await store.releaseLease("runner-b", takeover.lease.token);
     assert.equal(released, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("global cache store renews its own lease and rejects foreign tokens", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "global-cache-renew-"));
+  try {
+    let nowValue = 1_700_000_000_000;
+    const store = createGlobalCacheStore({ filePath: path.join(root, "cache.sqlite"), now: () => nowValue, leaseTtlMs: 60_000 });
+    const lease = await store.acquireLease("runner-a");
+    assert.ok(lease.lease);
+    assert.equal(await store.checkLease(lease.lease.token), true);
+    assert.equal(await store.checkLease("deadbeef"), false);
+    nowValue += 50_000;
+    const renewed = await store.renewLease("runner-a", lease.lease.token);
+    assert.equal(renewed.renewed, true);
+    assert.ok(renewed.lease);
+    assert.ok(renewed.lease.expiresAt > lease.lease.expiresAt);
+    assert.equal(await store.checkLease(lease.lease.token), true);
+    assert.equal((await store.renewLease("runner-b", lease.lease.token)).renewed, false);
+    nowValue = renewed.lease.expiresAt + 1;
+    assert.equal(await store.checkLease(lease.lease.token), false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

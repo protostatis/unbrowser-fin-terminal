@@ -3,6 +3,24 @@ import test from "node:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+
+test("global cache runner and browser default to the same shared database path", () => {
+  const previous = process.env.MARKET_DATA_DIR;
+  process.env.MARKET_DATA_DIR = "/data";
+  try {
+    const config = readGlobalCacheRunnerConfig({} as NodeJS.ProcessEnv);
+    assert.equal(config.stateDir, "/data/global-cache");
+    // Must match server/browser-terminal.ts globalCacheFilePath default:
+    // resolve(MARKET_DATA_DIR, "global-cache", "global-research-cache.sqlite").
+    assert.equal(
+      path.join(config.stateDir, "global-research-cache.sqlite"),
+      path.resolve("/data", "global-cache", "global-research-cache.sqlite"),
+    );
+  } finally {
+    if (previous === undefined) delete process.env.MARKET_DATA_DIR;
+    else process.env.MARKET_DATA_DIR = previous;
+  }
+});
 import { createGlobalCacheRunner, readGlobalCacheRunnerConfig } from "../server/global-cache-runner.js";
 import { createGlobalCacheStore } from "../server/global-cache-store.js";
 

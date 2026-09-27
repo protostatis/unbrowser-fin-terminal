@@ -33,6 +33,14 @@ function fixtureEntry() {
       content: "",
       stage: "complete" as const,
       updatedAt: generatedAt,
+      blocks: [
+        {
+          kind: "bullets" as const,
+          title: "Read",
+          dossierHint: "read" as const,
+          items: [{ text: "verified fact", sourceIds: ["S1"] }],
+        },
+      ],
       evidencePackets: [
         {
           sourceId: "S1",
