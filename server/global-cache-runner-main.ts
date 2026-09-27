@@ -2,8 +2,9 @@
  * Private global cache runner entrypoint.
  *
  * No ingress, no browser session, no account data. Polls the shared scout
- * journal on a fixed cadence with model dispatch off. Exits 0 when disabled
- * so the same image can ship while rollout stays off.
+ * journal on a fixed cadence with model dispatch off. Parks when disabled
+ * so the same image can ship (staying up, doing nothing) while rollout
+ * stays off.
  */
 
 import { createGlobalCacheRunner, readGlobalCacheRunnerConfig } from "./global-cache-runner.js";
@@ -21,7 +22,11 @@ function intervalMs(): number {
 async function main(): Promise<void> {
   const config = readGlobalCacheRunnerConfig();
   if (!config.enabled) {
-    console.log("[global-cache-runner] disabled (GLOBAL_CACHE_RUNNER_ENABLED is not 1)");
+    // Park instead of exiting: with `restart: unless-stopped` an exited
+    // container would restart-loop. The disabled runner stays up doing
+    // nothing until the release enables it.
+    console.log("[global-cache-runner] disabled (GLOBAL_CACHE_RUNNER_ENABLED is not 1); parking.");
+    await new Promise<void>(() => {});
     return;
   }
   const cadence = intervalMs();
