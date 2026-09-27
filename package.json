@@ -11,6 +11,7 @@
     "dev:web": "VITE_TERMINAL_BUILD_MODE=browser vite",
     "start": "node dist-server/server/index.js",
     "start:browser-terminal": "node dist-server/server/browser-terminal-main.js",
+    "start:global-cache-runner": "node dist-server/server/global-cache-runner-main.js",
     "build": "tsc -p tsconfig.server.json && vite build",
     "build:browser-terminal": "tsc -p tsconfig.browser-server.json && PUBLIC_BASE_PATH=\"${PUBLIC_BASE_PATH:-/fin-terminal-browser/}\" VITE_TERMINAL_BUILD_MODE=browser vite build",
     "build:browser-session": "vite build --config vite.browser-session.config.ts",

@@ -126,7 +126,7 @@ test("authenticated browser broker overrides model and never forwards browser au
 		assert.deepEqual(await session.json(), {
 			version: 1,
 			model: "server/model",
-			features: { broker: true, mcp: true, quotes: true, cryptoPulse: true, persistence: true },
+			features: { broker: true, mcp: true, quotes: true, cryptoPulse: true, persistence: true, globalCache: true },
 		});
 
 		const chat = await fetch(`${base}/api/browser/v1/chat/completions`, {
