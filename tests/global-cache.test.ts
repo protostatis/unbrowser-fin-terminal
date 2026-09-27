@@ -269,6 +269,54 @@ test("global cache canvas projection drops internal fields and requires cited ev
   );
   // Free-form content prose never publishes, even with cited blocks.
   assert.equal(sanitizeGlobalCacheCanvas({ ...canvas(), content: "uncited summary prose" }), undefined);
+  // Allowed keys with attacker-shaped values never publish: an object id on
+  // an otherwise valid cited read block.
+  assert.equal(
+    sanitizeGlobalCacheCanvas({
+      ...canvas(),
+      blocks: [
+        {
+          id: { researchId: "private-job" },
+          kind: "bullets" as const,
+          title: "Read",
+          dossierHint: "read" as const,
+          items: [{ text: "cited", sourceIds: ["S1"] }],
+        },
+      ],
+    }),
+    undefined,
+  );
+  // Rogue chart session entries never publish.
+  assert.equal(
+    sanitizeGlobalCacheCanvas({
+      ...canvas(),
+      blocks: [
+        {
+          kind: "chart" as const,
+          title: "Price",
+          points: [1, 2],
+          pointSessions: ["regular", { session: "evil" }],
+          sourceIds: ["S1"],
+        },
+      ],
+    }),
+    undefined,
+  );
+  // Unknown dossier hints never publish.
+  assert.equal(
+    sanitizeGlobalCacheCanvas({
+      ...canvas(),
+      blocks: [
+        {
+          kind: "bullets" as const,
+          title: "Read",
+          dossierHint: "exfiltrate",
+          items: [{ text: "cited", sourceIds: ["S1"] }],
+        },
+      ],
+    }),
+    undefined,
+  );
 });
 
 test("global cache builder pins versions and caps expiry by trigger validity", () => {

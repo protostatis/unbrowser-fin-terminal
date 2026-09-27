@@ -196,6 +196,18 @@ const ALLOWED_ITEM_KEYS: Record<string, Set<string>> = {
 
 const BULLET_ROLES = new Set(["fact", "interpretation", "risk", "catalyst"]);
 const ANNOTATION_ROLES = new Set(["support", "resistance", "signal"]);
+const DOSSIER_HINTS = new Set(["read", "evidence", "unknowns", "scenarios", "technical", "sources"]);
+const CHART_SESSIONS = new Set(["pre", "regular", "post", "unknown"]);
+const CHART_FORMATS = new Set(["price", "percent", "number"]);
+const CHART_STYLES = new Set(["points", "line", "histogram"]);
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function isShortString(value: unknown, max: number): value is string {
+  return typeof value === "string" && value.length <= max;
+}
 
 // Length caps mirror the extension's canvas block schema so oversized or
 // smuggled payloads fail closed instead of reaching another account.
@@ -253,7 +265,32 @@ function auditBlocks(blocks: unknown, fetchedIds: Set<string>, fetchedHosts: Set
       if (!allowed.has(key)) return false;
     }
     if (typeof block.title !== "string" || block.title.length > 160) return false;
-    if (block.dossierHint === "read") readBlocks += 1;
+    // Every allowed field is shape-checked: an allowlisted key with an
+    // attacker-shaped value (object ids, rogue sessions) never publishes.
+    if (block.id !== undefined && !isShortString(block.id, 160)) return false;
+    if (block.dossierHint !== undefined) {
+      if (typeof block.dossierHint !== "string" || !DOSSIER_HINTS.has(block.dossierHint)) return false;
+      if (block.dossierHint === "read") readBlocks += 1;
+    }
+    if (block.symbol !== undefined && !isShortString(block.symbol, 32)) return false;
+    if (block.pointTimes !== undefined) {
+      if (!Array.isArray(block.pointTimes) || !block.pointTimes.every(isFiniteNumber)) return false;
+    }
+    if (block.pointSessions !== undefined) {
+      if (!Array.isArray(block.pointSessions)) return false;
+      for (const session of block.pointSessions) {
+        if (typeof session !== "string" || !CHART_SESSIONS.has(session)) return false;
+      }
+    }
+    for (const key of ["reference", "minValue", "maxValue", "height", "asOf"] as const) {
+      if (block[key] !== undefined && !isFiniteNumber(block[key])) return false;
+    }
+    if (block.format !== undefined && (typeof block.format !== "string" || !CHART_FORMATS.has(block.format))) return false;
+    if (block.chartStyle !== undefined && (typeof block.chartStyle !== "string" || !CHART_STYLES.has(block.chartStyle))) return false;
+    if (block.chartScope !== undefined && (typeof block.chartScope !== "string" || !isValidChartScope(block.chartScope))) return false;
+    for (const key of ["interval", "timezone", "currency"] as const) {
+      if (block[key] !== undefined && !isShortString(block[key], 64)) return false;
+    }
     if (block.sourceIds !== undefined && !isCitedIds(block.sourceIds, fetchedIds)) return false;
 
     if (block.kind === "bullets" || block.kind === "news" || block.kind === "metrics") {
